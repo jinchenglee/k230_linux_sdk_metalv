@@ -62,6 +62,10 @@ _start:
 #if CONFIG_IS_ENABLED(RISCV_MMODE)
 	csrr	a0, CSR_MHARTID
 #endif
+	/* JC: Save boot hart ID to SRAM for debugging at dedicated location */
+	li t0, 0x80200800
+	sd a0, (t0)
+	
 	li t0, 0x70013
 	csrs	CSR_MCOR,t0
 	/*

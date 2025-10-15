@@ -8,7 +8,7 @@ INCLUDE = -I ./ -I ../libnncase/nncase -I ../libnncase/nncase/include -I ../libm
 
 #CXX_FLAG += -g  -mabi=lp64d -mcmodel=medany -std=c++17 -DLINUX_RUNTIME -Wno-multichar -Wno-unused-result
 CXX_FLAG +=  -march=rv64imafdcv -mabi=lp64d -mcmodel=medany -std=c++17 -DLINUX_RUNTIME -Wno-multichar -Wno-unused-result
-CXX_FLAG +=  -mcpu=c908v -mabi=lp64d  -mtune=c908  -mrvv-v0p10-compatible  -mrvv-auto-vectorize
+CXX_FLAG +=  -mcpu=c908 -mabi=lp64d  -mtune=c908
 
 all:
 	$(CXX)  $(CXX_FLAG) $(INCLUDE) $(OBJ) -o ai2d_kpu.elf  $(LIBDIR)  $(LIBS)

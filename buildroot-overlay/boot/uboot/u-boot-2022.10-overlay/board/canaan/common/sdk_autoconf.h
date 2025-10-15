@@ -13,11 +13,17 @@
 #define CONFIG_AP6212A 1
 #define CONFIG_SDCAED 1
 #define CONFIG_TOOLCHAIN_PREFIX_LINUX "riscv64-unknown-linux-gnu-"
+/* JC: removed changed to 0
 #define CONFIG_LINUX_RUN_CORE_ID 1
+*/
+#define CONFIG_LINUX_RUN_CORE_ID 0
 #define CONFIG_TOOLCHAIN_PATH_LINUX "/opt/toolchain/Xuantie-900-gcc-linux-5.10.4-glibc-x86_64-V2.6.0/bin"
 #define CONFIG_MEM_BOUNDARY_RESERVED_SIZE 0x00001000
 #define CONFIG_MEM_LINUX_SYS_SIZE 0x20000000
+/* JC: removed 
 #define CONFIG_LINUX_DEFCONFIG "k230_evb_linux_enable_vector"
+*/
+#define CONFIG_LINUX_DEFCONFIG "k230"
 #define CONFIG_TOOLCHAIN_PREFIX_RTT "riscv64-unknown-linux-musl-"
 #define CONFIG_SUPPORT_LINUX 1
 #define CONFIG_UBOOT_DEFCONFIG "k230_canmv"

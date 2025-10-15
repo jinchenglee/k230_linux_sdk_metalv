@@ -50,7 +50,17 @@
 			reg = <0>;
 			status = "okay";
 			compatible = "riscv";
-			riscv,isa = "rv64imafdcvsu";
+			riscv,isa = "rv64imafdcsu"; // JC: CPU0 no vector
+			mmu-type = "riscv,sv39";
+			clock-frequency = <800000000>;
+			u-boot,dm-pre-reloc;
+		};
+		cpu@1 {
+			device_type = "cpu";
+			reg = <1>;
+			status = "okay";
+			compatible = "riscv";
+			riscv,isa = "rv64imafdcvsu"; // JC: CPU1 has vector
 			mmu-type = "riscv,sv39";
 			clock-frequency = <800000000>;
 			u-boot,dm-pre-reloc;

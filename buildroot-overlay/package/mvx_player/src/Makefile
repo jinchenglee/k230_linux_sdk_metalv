@@ -2,8 +2,8 @@ ifeq ($(BR2_RISCV_32), y)
 CFLAGS += -march=rv32gcv_xtheadc
 LDFLAGS += -march=rv32gcv_xtheadc
 else
-CFLAGS += -mcpu=c908v -O2
-LDFLAGS += -mcpu=c908v -O2
+CFLAGS += -mcpu=c908 -O2
+LDFLAGS += -mcpu=c908 -O2
 endif
 
 PROG_1 = mvx_encoder

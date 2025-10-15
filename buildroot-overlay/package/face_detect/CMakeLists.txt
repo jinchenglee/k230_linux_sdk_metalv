@@ -12,8 +12,8 @@ set(bin face_detect.elf)
 add_executable(${bin} ${src})
 
 # ========== 设置交叉编译工具链路径 ==========
-set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS}   -mcpu=c908v -mabi=lp64d  -mtune=c908 -mrvv-v0p10-compatible  -mrvv-auto-vectorize")
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}   -mcpu=c908v -mabi=lp64d  -mtune=c908 -mrvv-v0p10-compatible  -mrvv-auto-vectorize")
+set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS}   -mcpu=c908 -mabi=lp64d  -mtune=c908")
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}   -mcpu=c908 -mabi=lp64d  -mtune=c908")
 
 if(CMAKE_TOOLCHAIN_FILE MATCHES "buildroot/toolchainfile.cmake")
     # buildroot环境编译，默认编译器为buildroot的编译器

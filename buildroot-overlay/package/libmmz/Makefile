@@ -1,4 +1,4 @@
-CFLAG := -mcpu=c908v -O2
+CFLAG := -mcpu=c908 -O2
 
 all:
 	$(CC) $(CFLAG) -c mmz.c -o mmz.o
