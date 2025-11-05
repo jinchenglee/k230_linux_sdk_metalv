@@ -18,6 +18,7 @@
 #include <sys/select.h>
 #include <display.h>
 #include <cerrno>
+#include <optional>
 #include <tuple>
 
 // base on DMA-BUF
