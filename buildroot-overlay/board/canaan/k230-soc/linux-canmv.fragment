@@ -1,0 +1,26 @@
+CONFIG_BT=m
+CONFIG_USB_USBNET=y
+CONFIG_USB_CONFIGFS=m
+CONFIG_USB_CONFIGFS_F_FS=y
+CONFIG_USB_CONFIGFS_MASS_STORAGE=y
+
+# k230_canmv: Reduced CMA for non-AI builds
+# Default is 50% (~256MB on 512MB system), but AI/KPU is disabled now
+# 
+# CMA memory budget for k230_canmv:
+#   - Camera ISP (VVCAM): ~5-10MB (1920x1080 NV12 buffers)
+#   - Display (DRM/KMS): ~9MB (1920x1080 NV12, 3 buffers)
+#   - Video codec (H264/H265): ~15-20MB
+#   - Total needed: ~32-40MB
+# 
+# Setting to 48MB provides safety margin while freeing ~208MB for applications
+# CONFIG_CMA_SIZE_SEL_PERCENTAGE is not set
+CONFIG_CMA_SIZE_SEL_MBYTES=y
+CONFIG_CMA_SIZE_MBYTES=48
+CONFIG_CMA=y
+CONFIG_DMA_CMA=y
+
+# Disable AI/KPU drivers since libnncase is not available without RVV
+# CONFIG_K230_GNNE_DRIVER is not set
+# CONFIG_K230_AI2D_DRIVER is not set
+

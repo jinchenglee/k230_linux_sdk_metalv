@@ -3,7 +3,14 @@ FACE_DETECT_SITE_METHOD = local
 FACE_DETECT_DEPENDENCIES += libmmz libnncase gsl-lite
 
 ifeq ($(BR2_PACKAGE_OPENCV4),y)
-FACE_DETECT_DEPENDENCIES += opencv4 display vvcam
+FACE_DETECT_DEPENDENCIES += opencv4
+# <<JC>> Removed display and vvcam dependencies - not needed for face_detect
+ifeq ($(BR2_PACKAGE_DISPLAY),y)
+FACE_DETECT_DEPENDENCIES += display
+endif
+ifeq ($(BR2_PACKAGE_VVCAM),y)
+FACE_DETECT_DEPENDENCIES += vvcam
+endif
 endif
 
 define FACE_DETECT_BUILD_DEB

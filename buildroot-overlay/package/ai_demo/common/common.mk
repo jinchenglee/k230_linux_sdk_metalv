@@ -18,7 +18,14 @@ ifeq ($(OS), common)
 endif
 
 ifeq ($(BR2_PACKAGE_OPENCV4), y)
-	COMMON_DEPENDENCIES += opencv4 display vvcam
+	COMMON_DEPENDENCIES += opencv4
+	# <<JC>> Removed display and vvcam dependencies - not needed for OpenCV
+	ifeq ($(BR2_PACKAGE_DISPLAY), y)
+		COMMON_DEPENDENCIES += display
+	endif
+	ifeq ($(BR2_PACKAGE_VVCAM), y)
+		COMMON_DEPENDENCIES += vvcam
+	endif
 endif
 
 

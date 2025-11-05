@@ -11,5 +11,7 @@ DISPLAY_SITE_METHOD = local
 DISPLAY_INSTALL_STAGING = YES
 DISPLAY_INSTALL_TARGET = YES
 DISPLAY_DEPENDENCIES = libdrm
+# Enable building test-display camera viewer application
+DISPLAY_CONF_OPTS = -DBUILD_TEST=ON
 
 $(eval $(cmake-package))

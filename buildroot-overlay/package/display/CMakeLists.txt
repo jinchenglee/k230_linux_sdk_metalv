@@ -30,6 +30,7 @@ target_link_libraries(${PROJECT_NAME} ${LIBDRM_LIBRARIES})
 if(${BUILD_TEST})
     add_executable(test-${PROJECT_NAME} src/test.cpp)
     target_link_libraries(test-${PROJECT_NAME} display)
+    install(TARGETS test-${PROJECT_NAME} DESTINATION bin)
 endif(${BUILD_TEST})
 
 

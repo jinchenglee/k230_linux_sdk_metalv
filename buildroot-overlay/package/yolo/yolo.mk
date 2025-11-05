@@ -19,7 +19,14 @@ YOLO_SITE_METHOD = local
 YOLO_DEPENDENCIES += libmmz libnncase gsl-lite
 
 ifeq ($(BR2_PACKAGE_OPENCV4),y)
-YOLO_DEPENDENCIES += opencv4 display vvcam
+YOLO_DEPENDENCIES += opencv4
+# <<JC>> Removed display and vvcam dependencies - not needed for YOLO
+  ifeq ($(BR2_PACKAGE_DISPLAY),y)
+  YOLO_DEPENDENCIES += display
+  endif
+  ifeq ($(BR2_PACKAGE_VVCAM),y)
+  YOLO_DEPENDENCIES += vvcam
+  endif
 endif
 
 define YOLO_BUILD_DEB
