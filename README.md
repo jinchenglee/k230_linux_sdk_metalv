@@ -1,6 +1,6 @@
 # K230 Linux SDK
 
-> **Branch `opt_linux_on_small_core`:** this fork runs Linux on the K230's RVV-less small core. See [docs/small_core_linux.md](docs/small_core_linux.md) for the supported defconfigs, V4L2 device map, camera capture recipes (CSI / USB), and corrigenda to earlier commit messages on this branch. The rest of this README is the upstream vendor documentation and may not reflect this branch exactly.
+> **Branch `opt_linux_on_small_core`:** this fork runs Linux on the K230's RVV-less small core. See [docs/small_core_linux.md](docs/small_core_linux.md) for the supported defconfigs, V4L2 device map, camera capture recipes (CSI / USB), and corrigenda to earlier commit messages on this branch. For board-specific hardware notes (CSI / USB / WiFi wiring) on the BPI-CanMV-K230D-Zero and Junroc K230D boards, see [docs/board_hardware_bpi_junroc.md](docs/board_hardware_bpi_junroc.md). For the asymmetric-multiprocessing plan to run RVV image processing on CPU1 bare-metal, see [docs/amp_bigcore_rvv_plan.md](docs/amp_bigcore_rvv_plan.md). The rest of this README is the upstream vendor documentation and may not reflect this branch exactly.
 
 >This document uses the k230d_canmv_defconfig configuration as an example. If you use other configurations, replace k230d_canmv_defconfig with correct names. All the configurations supported by this sdk,  can be found in  buildroot-overlay/configs directory.
 
