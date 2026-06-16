@@ -32,10 +32,15 @@ BR2_PACKAGE_LINUX_TOOLS_GPIO=y
 BR2_PACKAGE_BUSYBOX_CONFIG_FRAGMENT_FILES="board/canaan/k230-soc/busybox.fragment"
 BR2_PACKAGE_ALSA_UTILS_AMIXER=y
 BR2_PACKAGE_ALSA_UTILS_APLAY=y
-# <<JC>> Removed - camera VVCAM and related packages to save dram space
-# BR2_PACKAGE_VVCAM=y
-# BR2_PACKAGE_LIB_RTSPSERVER=y
-# BR2_PACKAGE_CAMERA_RTSP_DEMO=y
+# Camera ISP + RTSP streaming.
+# Default sensor is gc2093 (BPI-CanMV-K230D-Zero shipped pairing).
+# For Junroc K230D (structurally identical board, ov5647 sensor), override
+# at compile time:  make CONF=BPI-CanMV-K230D-Zero_defconfig SENSOR=ov5647
+# See docs/board_hardware_bpi_junroc.md for the full board hardware notes.
+BR2_PACKAGE_VVCAM=y
+BR2_PACKAGE_VVCAM_DEF_SENSOR="gc2093"
+BR2_PACKAGE_LIB_RTSPSERVER=y
+BR2_PACKAGE_CAMERA_RTSP_DEMO=y
 BR2_PACKAGE_MVX_PLAYER=y
 BR2_PACKAGE_AUDIO_DEMO=y
 BR2_PACKAGE_AUDIO_REC_PLAY=y
@@ -95,8 +100,8 @@ BR2_PACKAGE_LIBV4L=y
 BR2_PACKAGE_LIBV4L_UTILS=y
 BR2_PACKAGE_CJSON=y
 BR2_PACKAGE_CJSON_UTILS=y
-# <<JC>> Removed - LIVE555 used by camera RTSP streaming
-# BR2_PACKAGE_LIVE555=y
+# LIVE555 - RTSP server library used by camera_rtsp_demo
+BR2_PACKAGE_LIVE555=y
 BR2_PACKAGE_LIBCURL=y
 BR2_PACKAGE_LIBCURL_CURL=y
 BR2_PACKAGE_LIBCURL_VERBOSE=y

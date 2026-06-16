@@ -4,11 +4,18 @@ CONFIG_USB_CONFIGFS=m
 CONFIG_USB_CONFIGFS_F_FS=y
 CONFIG_USB_CONFIGFS_MASS_STORAGE=y
 
-# BPI-specific: Use fixed 16MB CMA (instead of 50% = 64MB on 128MB board)
-# This gives more memory to user applications
+# BPI/Junroc K230D have 128MB LPDDR4. Default buildroot CMA is 50% (~64MB),
+# which leaves too little for userspace. Use a fixed budget instead.
+#
+# CMA budget with vvcam ISP + camera_rtsp_demo enabled:
+#   - vvcam ISP working buffers: ~5 MiB (one 1920x1080 NV12 frame + ctrl)
+#   - V4L2 NV12 1080p frames in flight (3-4 buffers): ~9-12 MiB
+#   - mvx codec internal buffers when enabled: ~10-15 MiB extra
+#   - Headroom for fragmentation
+# 32 MiB fits comfortably and leaves ~80 MiB for userspace.
 # CONFIG_CMA_SIZE_SEL_PERCENTAGE is not set
 CONFIG_CMA_SIZE_SEL_MBYTES=y
-CONFIG_CMA_SIZE_MBYTES=16
+CONFIG_CMA_SIZE_MBYTES=32
 CONFIG_CMA=y
 CONFIG_DMA_CMA=y
 
@@ -23,8 +30,12 @@ CONFIG_VIDEOBUF2_V4L2=y
 CONFIG_VIDEOBUF2_MEMOPS=y
 CONFIG_VIDEOBUF2_VMALLOC=y
 
-# Disable all on-board camera/video/GPU/AI drivers to save memory  
-# CONFIG_VPU_CANAAN is not set
+# mvx video codec (/dev/video0) for H.264/HEVC encode used by camera_rtsp_demo
+# and decode for mvx_player. Costs ~10-15 MiB CMA at runtime.
+CONFIG_VPU_CANAAN=y
+
+# AI/NN and GPU stack stays disabled - all RVV-bound vendor blobs on the
+# small core. See docs/small_core_linux.md for the policy.
 # CONFIG_GPU_VGLITE is not set
 # CONFIG_K230_GNNE_DRIVER is not set
 # CONFIG_K230_AI2D_DRIVER is not set
