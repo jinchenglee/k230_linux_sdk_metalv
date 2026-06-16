@@ -1,5 +1,7 @@
 # K230 Linux SDK
 
+> **Branch `opt_linux_on_small_core`:** this fork runs Linux on the K230's RVV-less small core. See [docs/small_core_linux.md](docs/small_core_linux.md) for the supported defconfigs, V4L2 device map, camera capture recipes (CSI / USB), and corrigenda to earlier commit messages on this branch. The rest of this README is the upstream vendor documentation and may not reflect this branch exactly.
+
 >This document uses the k230d_canmv_defconfig configuration as an example. If you use other configurations, replace k230d_canmv_defconfig with correct names. All the configurations supported by this sdk,  can be found in  buildroot-overlay/configs directory.
 
 ## Install toolchain and dependencies
