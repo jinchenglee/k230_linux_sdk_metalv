@@ -109,5 +109,13 @@ ifeq ("$(origin CONF)", "command line")
 else
 	[ -e "$(BRW_BUILD_DIR)" ] || ( make -C $(BR_SRC_DIR) $(CONF) O=$(BRW_BUILD_DIR) ;touch $@; )
 endif
+ifeq ("$(origin SENSOR)", "command line")
+	@echo ">>> SENSOR=$(SENSOR) override: rewriting BR2_PACKAGE_VVCAM_DEF_SENSOR in .config"
+	sed -i 's|^BR2_PACKAGE_VVCAM_DEF_SENSOR=.*|BR2_PACKAGE_VVCAM_DEF_SENSOR="$(SENSOR)"|' $(BRW_BUILD_DIR)/.config
+	@if [ -d $(BRW_BUILD_DIR)/build ]; then \
+		echo ">>> SENSOR override: removing $(BRW_BUILD_DIR)/build/vvcam-* to force a rebuild"; \
+		rm -rf $(BRW_BUILD_DIR)/build/vvcam-*; \
+	fi
+endif
 
 #echo LINUX_OVERRIDE_SRCDIR=/home/wangjianxin/t/linux-xuantie-kernel >output/k230d_canmv_64kernel_32rootfs_defconfig/local.mk
