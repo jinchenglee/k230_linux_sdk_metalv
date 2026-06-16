@@ -260,6 +260,74 @@ lifetime.
 - Pull the full GSDMA register description if available; u-boot's `unzip.c`
   uses only the subset relevant to the gzip-decompress flow.
 
+## Upstream divergence (as of upstream `dev` = `fcd4fdb`)
+
+This branch deliberately stays behind the upstream `k230_linux_sdk` `dev`
+branch because two upstream commits would invalidate the DMA section above:
+
+- `faed6dd` ("add gdma rotation for vo") applies a 1415-line kernel patch
+  (`buildroot-overlay/linux/0023-add-gdma-vo-rotation.patch`) that binds
+  **GSDMA** into the Linux video-output rotation path. On upstream, GSDMA
+  is therefore owned by a Linux kernel driver; the "no DT node, no driver"
+  premise of our AMP plan no longer holds.
+- `d6a8933` ("Add nonai2d osd feature") adds
+  `buildroot-overlay/linux/0019-dts-add-nonai2d.patch` plus a Linux-side
+  driver consumer in `camera_rtsp_demo`. **nonai2d** becomes Linux-owned
+  upstream as well. `ec0412b` adds the `modprobe.d` ordering between
+  `vvcam_isp` and `nonai2d`, confirming nonai2d is loaded as part of the
+  normal runtime.
+
+Once the AMP plumbing on this branch is proven end-to-end (heartbeat ->
+frame ring -> RVV -> GSDMA offload), we can revisit the upstream merge. At
+that point the options are: revert `faed6dd` on this branch (frees GSDMA
+again, costs the VO rotation feature we do not need headless), share
+GSDMA channels with Linux's driver (the IP has 8), or move the AMP path
+to nonai2d / one of the other movers in the table above.
+
+### Small upstream fixes we do pick up on this branch
+
+These are cherry-picked even while we stay behind the GDMA/nonai2d commits,
+because they fix bugs in code we actually use or improve infrastructure
+relevant to AMP:
+
+- `7db0866` "fix memory leak for display close"
+  — `buildroot-overlay/package/display/src/display.c` (libdisplay used by
+  test-display).
+- `445ca43` "fix vvcam stop memory leak"
+  — `buildroot-overlay/package/vvcam/v4l2-drm/src/lib.c` (long-running
+  capture cleanup).
+- `06f5feb` "clk: Fix k230 clock composite parent set and rate
+  determination" — `drivers/clk/clk-k230.c` patch that preserves the gate
+  register when the composite mux is reprogrammed, and adds
+  `CLK_SET_RATE_NO_REPARENT` on composite-clock init. Relevant to AMP
+  because the Linux-side launcher will need to enable
+  `gsdma_aclk_gate` (composite on the SHRM tree) before releasing CPU1.
+  Unrelated rootfs script edits in the same upstream commit are dropped
+  during cherry-pick.
+- `5c57a36` "k230d_canmv: Add I2C4, MIPI CSI2 support and update default
+  sensor" — **hand-applied**, not formally cherry-picked. The upstream
+  commit's defconfig pre-image diverges too much from ours (upstream
+  k230d_canmv_defconfig accumulated LIBNNCASE / AI2D_KPU / RVV flags /
+  WPA / PYTHON3 / fragment-dir restructuring between our branch base
+  and `5c57a36`). Only the relevant parts were taken: the new kernel
+  patch `buildroot-overlay/linux/0018-dtc-riscv-k230d-canmv-Add-I2C4-and-
+  MIPI-CSI2-support.patch` verbatim, and the
+  `BR2_PACKAGE_VVCAM_DEF_SENSOR="gc2093"` line on
+  `k230d_canmv_defconfig`. The AI/NN packages, RVV compiler flags,
+  WiFi/Python3 additions, EXT2 size bump, and fragment-dir restructure
+  are deliberately not pulled.
+
+We also enabled `BR2_PACKAGE_LVGL=y` + `BR2_PACKAGE_LVGL_CUSTOM_VERSION=
+"8.3.7"` in `k230d_canmv_defconfig` as a separate commit (LVGL is the
+one RV64GC-safe package missing from this defconfig versus upstream).
+
+Explicitly **not** cherry-picked: the GDMA-rotation / nonai2d-OSD bundle
+above, the nncase 2.11.0 + YOLOv8/v11/v26 / llama.cpp AI stack, new
+sensors (imx335, gc2093 60fps), USB-gadget work (UVC + VPU encoder,
+cdc-acm, adb-mtp), new boards (GT6700), Python bindings
+(`k230_v4l2_drm`, `k230_display`), pinctrl-helper refactor, and all CI /
+Dockerfile / Feishu-bot housekeeping.
+
 ## First-cut implementation order
 
 1. **Quiet Linux about CPU1.** Add `maxcpus=1` to the u-boot bootargs, or set
