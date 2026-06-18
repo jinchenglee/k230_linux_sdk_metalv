@@ -166,6 +166,21 @@ static int vvcam_isp_pad_requbufs(struct v4l2_subdev *sd, void *arg)
 {
     struct vvcam_pad_reqbufs *pad_requbufs = (struct vvcam_pad_reqbufs *)arg;
     struct vvcam_isp_dev *isp_dev = v4l2_get_subdevdata(sd);
+    struct vvcam_isp_pad_data *cur_pad = &isp_dev->pad_data[pad_requbufs->pad];
+    unsigned long flags;
+
+    /*
+     * REQBUFS frees/reallocates the vb2 buffers in the video layer, so any
+     * vvcam_vb2_buffer still linked on this pad's queue from a previous
+     * (possibly unclean) streaming session now dangles into freed memory.
+     * The queue is otherwise only re-initialised on stream-off (s_stream 0)
+     * and at probe, so flush it here too. Without this the next STREAMON's
+     * list_add_tail() trips CONFIG_LIST_HARDENED ("prev->next should be next
+     * ... but was 0") and streaming fails with -EINVAL.
+     */
+    spin_lock_irqsave(&cur_pad->qlock, flags);
+    INIT_LIST_HEAD(&cur_pad->queue);
+    spin_unlock_irqrestore(&cur_pad->qlock, flags);
 
     return vvcam_isp_requebus_event(isp_dev, pad_requbufs->pad, pad_requbufs->num_buffers);
 }

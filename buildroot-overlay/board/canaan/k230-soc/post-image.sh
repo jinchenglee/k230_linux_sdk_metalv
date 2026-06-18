@@ -225,10 +225,10 @@ gen_env_bin()
 	# fi
 
 	if [ ${CONF} == "k230d_canmv_ilp32_defconfig" ] || [ ${CONF} == "BPI-CanMV-K230D-Zero_ilp32_defconfig" ]; then
-		sed -i 's/^bootcmd=.*$/bootcmd=run bnuttx;run blinuxilp32;/g' ${default_env_file}
-	elif [ ${CONF} == "k230d_canmv_defconfig" ] || [ ${CONF} == "BPI-CanMV-K230D-Zero_defconfig" ]; then
-		sed -i 's/^bootcmd=.*$/bootcmd=run bnuttx;run blinux;/g' ${default_env_file}
+		# Linux-on-small-core (CPU0): no NuttX, blinuxilp32 boots Linux directly on CPU0 via bootm
+		sed -i 's/^bootcmd=.*$/bootcmd=run blinuxilp32;/g' ${default_env_file}
 	else
+		# Linux-on-small-core (CPU0): no NuttX, blinux boots Linux directly on CPU0 via bootm
 		sed -i 's/^bootcmd=.*$/bootcmd=run blinux;/g' ${default_env_file}
 	fi
 	${mkenvimage} -s 0x10000 -o uboot/env.env  ${default_env_file}
@@ -244,7 +244,6 @@ gen_boot_ext4()
 	cd  "${BINARIES_DIR}/";
 	rm -rf boot; mkdir -p boot;
 
-	cp ${K230_SDK_ROOT}/buildroot-overlay/board/canaan/k230-soc/rootfs_overlay/boot/nuttx-7000000-uart2.bin  boot/;
 	cp Image boot/;
 	[ ! -f "Image_ilp32" ] ||  cp Image_ilp32 boot/;
 	cp *.dtb boot;

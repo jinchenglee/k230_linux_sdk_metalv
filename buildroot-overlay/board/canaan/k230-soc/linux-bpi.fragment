@@ -12,10 +12,10 @@ CONFIG_USB_CONFIGFS_MASS_STORAGE=y
 #   - V4L2 NV12 1080p frames in flight (3-4 buffers): ~9-12 MiB
 #   - mvx codec internal buffers when enabled: ~10-15 MiB extra
 #   - Headroom for fragmentation
-# 32 MiB fits comfortably and leaves ~80 MiB for userspace.
+# 48 MiB fits comfortably and leaves ~80 MiB for userspace.
 # CONFIG_CMA_SIZE_SEL_PERCENTAGE is not set
 CONFIG_CMA_SIZE_SEL_MBYTES=y
-CONFIG_CMA_SIZE_MBYTES=32
+CONFIG_CMA_SIZE_MBYTES=48
 CONFIG_CMA=y
 CONFIG_DMA_CMA=y
 

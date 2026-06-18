@@ -2,6 +2,59 @@
 bootddev=$(cat /proc/cmdline  | sed  -n  "s#root=\(\/dev\/mmcblk[0-9]\).*#\1#p" )
 
 mount ${bootddev}p1 /boot
+
+#
+# ---- Camera sensor bring-up (metalv / Linux-on-CPU0, no RT-Smart) ----------
+#
+# On the vendor dual-core SDK, RT-Smart programs the sensor master clock
+# (MCLK0) and pulses the sensor reset line before the ISP starts. This small-
+# core build has no RT-Smart, and U-Boot SPL explicitly *disables* MCLK
+# (board/canaan/common/k230_spl.c: "disable mclk" clears 0x9110006c bits 0-2).
+# Without a running MCLK and a reset pulse the sensor never responds on I2C,
+# so isp_media_server's STREAMON fails ("post event 4 return error").
+#
+# The pin-mux is already set up by U-Boot (k230d_canmv_bpi.dts):
+#   IO13 -> M_CLK (SEL=1), IO62 -> GPIO (SEL=0), IO7/IO8 -> IIC4 (/dev/i2c-0).
+# So we only need to (1) start MCLK0 and (2) pulse the GPIO62 reset line.
+#
+# Both supported sensors share GPIO62 reset + MCLK0 but want different rates
+# (mclk_cfg @ 0x9110006c: mux bits[4:3], div bits[9:5]=N-1, gate bit0, strobe
+#  bit31; see k230_sdk sysctl_media_clk.c):
+#   gc2093 : PLL1_DIV4(594M) / 25 = 23.76 MHz  -> 0x80000309
+#   ov5647 : PLL0_DIV4(400M) / 16 = 25.00 MHz  -> 0x800001F1
+# We auto-detect which sensor is wired by probing I2C after a reset pulse.
+#
+MCLK_CFG=0x9110006c          # SYSCTL media clk register (MCLK0/1/2)
+GPIO1_DR=0x9140c000          # gpio1 controller (GPIO32-63) output data
+GPIO1_DDR=0x9140c004         # gpio1 direction (1 = output)
+RST_BIT=$((1 << 30))         # GPIO62 = gpio1 line 30 = bit 30
+
+mclk_set() {                 # $1 = full mclk_cfg value
+	devmem "$MCLK_CFG" 32 "$1"
+}
+
+reset_pulse() {              # GPIO62 high->low->high, 100ms each (matches vendor ov5647_power_rest)
+	ddr=$(devmem "$GPIO1_DDR")
+	devmem "$GPIO1_DDR" 32 $(( ddr | RST_BIT ))                  # configure as output
+	dr=$(devmem "$GPIO1_DR"); devmem "$GPIO1_DR" 32 $(( dr | RST_BIT ));                  usleep 100000
+	dr=$(devmem "$GPIO1_DR"); devmem "$GPIO1_DR" 32 $(( (dr & 0xFFFFFFFF) & ~RST_BIT ));  usleep 100000
+	dr=$(devmem "$GPIO1_DR"); devmem "$GPIO1_DR" 32 $(( dr | RST_BIT ));                  usleep 100000
+}
+
+sensor_acks() {              # $1 = 7-bit i2c addr; 0 if it ACKs on /dev/i2c-0
+	i2cget -y 0 "$1" >/dev/null 2>&1
+}
+
+mclk_set 0x80000309; reset_pulse        # try gc2093 (BPI default) first
+if sensor_acks 0x37; then
+	echo "camera: gc2093 detected @0x37 (MCLK0 = 23.76 MHz)"
+elif { mclk_set 0x800001F1; reset_pulse; sensor_acks 0x36; }; then
+	echo "camera: ov5647 detected @0x36 (MCLK0 = 25 MHz)"
+else
+	echo "camera: WARNING - no sensor ACK on /dev/i2c-0 (0x37/0x36) after MCLK + reset"
+fi
+# ---------------------------------------------------------------------------
+
 modprobe vvcam_isp
 modprobe vvcam_mipi
 modprobe vvcam_vb
@@ -11,4 +64,24 @@ ISP_MEDIA_SENSOR_DRIVER=/usr/lib/libvvcam.so /usr/bin/isp_media_server > /dev/nu
 
 cat /etc/version/release_version
 
-vo_init &
+#
+# ---- Display bring-up (vo_init) — skipped on K230D ------------------------
+#
+# vo_init starts the VO/display pipeline. Its framebuffers are pinned in the
+# kernel CMA pool (~3-7 MiB) and are NOT released if vo_init is later killed,
+# so it permanently eats CMA. The K230D boards here (BPI CanMV-K230D Zero,
+# structurally-identical Junroc K230D) have no HDMI and run headless as
+# camera-over-network targets, where that CMA is needed instead by
+# isp_media_server + the mvx H.264 encoder behind camera_rtsp_demo. With the
+# 48 MiB budget already tight, the display is dead weight — skip it on K230D.
+# Other (non-D) CanMV-K230 boards with a real display keep vo_init.
+#
+# Detection: the BPI/Junroc Linux DT model is "Banana Pi CanMV K230D Zero"
+# (contains K230D); non-D boards report "Canaan CanMV-K230". Strip the trailing
+# NUL that device-tree strings carry, then glob-match.
+#
+model=$(cat /proc/device-tree/model 2>/dev/null | tr -d '\0')
+case "$model" in
+	*K230D*) echo "vo_init: skipped on K230D ($model) — DSI/headless, CMA reserved for camera streaming" ;;
+	*)       vo_init & ;;
+esac

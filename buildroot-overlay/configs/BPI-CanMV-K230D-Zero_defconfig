@@ -33,12 +33,16 @@ BR2_PACKAGE_BUSYBOX_CONFIG_FRAGMENT_FILES="board/canaan/k230-soc/busybox.fragmen
 BR2_PACKAGE_ALSA_UTILS_AMIXER=y
 BR2_PACKAGE_ALSA_UTILS_APLAY=y
 # Camera ISP + RTSP streaming.
-# Default sensor is gc2093 (BPI-CanMV-K230D-Zero shipped pairing).
-# For Junroc K230D (structurally identical board, ov5647 sensor), override
-# at compile time:  make CONF=BPI-CanMV-K230D-Zero_defconfig SENSOR=ov5647
-# See docs/board_hardware_bpi_junroc.md for the full board hardware notes.
+# Default sensor is ov5647 - the sensor verified working end-to-end on this
+# board's CSI2 camera connector (I2C 0x36 on /dev/i2c-0, ISP capture + RTSP).
+# The board's nominal shipping pairing is the gc2093 (TYS-K230-200W-V2) module;
+# to build for that instead, override at compile time:
+#     make CONF=BPI-CanMV-K230D-Zero_defconfig SENSOR=gc2093
+# Both share GPIO62 reset on /dev/i2c-0; the modules self-clock (internal MCLK),
+# so no SoC MCLK is required. See docs/board_hardware_canmv_k230_and_bpi_k230d.md
+# (camera bring-up) and docs/board_hardware_bpi_junroc.md for full hardware notes.
 BR2_PACKAGE_VVCAM=y
-BR2_PACKAGE_VVCAM_DEF_SENSOR="gc2093"
+BR2_PACKAGE_VVCAM_DEF_SENSOR="ov5647"
 BR2_PACKAGE_LIB_RTSPSERVER=y
 BR2_PACKAGE_CAMERA_RTSP_DEMO=y
 BR2_PACKAGE_MVX_PLAYER=y
