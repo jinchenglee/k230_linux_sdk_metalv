@@ -1,0 +1,33 @@
+From: JC Li <jincheng.li@gmail.com>
+Date: Thu, 18 Jun 2026 00:00:00 -0700
+Subject: [PATCH] dts: bananapi-canmv-k230d-zero: add CSI2 sensor reset-gpios (GPIO62)
+
+On the metalv small-core build (Linux on CPU0, no RT-Smart) nothing pulses
+the external camera reset before capture. The vvcam_mipi driver already
+supports a DT "reset-gpios"; wire it to the BPI K230D CSI2 connector reset
+(board net CAM0_GPIO = GPIO62 = gpio1_ports line 30, active-low). This lets
+the kernel reset the sensor at probe and replaces the userspace reset hack
+in S99canaanboot. The CSI2 modules self-clock, so no clocks/MCLK is needed.
+
+---
+diff --git a/arch/riscv/boot/dts/canaan/bananapi-canmv-k230d-zero.dts b/arch/riscv/boot/dts/canaan/bananapi-canmv-k230d-zero.dts
+index 2968402ca038..8986a123f386 100644
+--- a/arch/riscv/boot/dts/canaan/bananapi-canmv-k230d-zero.dts
++++ b/arch/riscv/boot/dts/canaan/bananapi-canmv-k230d-zero.dts
+@@ -85,4 +85,13 @@ K230_RESET_M2_REG_OFFSET
+ 			  K230_RESET_M2_TYPE
+ 			  K230_RESET_M2_DONE_BIT
+ 			  K230_RESET_M2_ASSERT_BIT>;
++	/*
++	 * External CSI2 camera reset: module RST pin / board net CAM0_GPIO =
++	 * GPIO62 (gpio1_ports line 30), active-low, 10k pull-up to 3V3.
++	 * The vvcam_mipi driver pulses this at probe. On the metalv small-core
++	 * build (no RT-Smart) this replaces the userspace reset done in
++	 * S99canaanboot. The camera modules self-clock (internal 24 MHz), so no
++	 * MCLK/clocks property is needed here.
++	 */
++	reset-gpios = <&gpio1_ports 30 GPIO_ACTIVE_LOW>;
+ };
+-- 
+2.34.1
+

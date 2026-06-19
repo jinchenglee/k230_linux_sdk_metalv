@@ -67,6 +67,7 @@
 #include "vvcam_mipi_driver.h"
 #include "k230_vi.h"
 #include <linux/gpio/consumer.h>
+#include <linux/delay.h>
 
 
 static int vvcam_mipi_open(struct inode *inode, struct file *file)
@@ -302,15 +303,27 @@ static int vvcam_mipi_probe(struct platform_device *pdev)
         dev_err(&pdev->dev, "can't get mipi sensor reset\n");
     }
 
-    mipi_dev->reset_gpio = devm_gpiod_get(&pdev->dev, "reset", GPIOD_OUT_HIGH);
+    /*
+     * External sensor reset line, from DT "reset-gpios" (e.g. GPIO62 on the
+     * BPI-CanMV-K230D-Zero CSI2 connector). On the metalv small-core build there
+     * is no RT-Smart to pulse the sensor reset before capture, so do it here at
+     * probe, before isp_media_server opens the sensor. Pulse = assert (active-low
+     * -> physical low) for 10 ms, then release. Boards/modules without a
+     * reset-gpios property (self-reset modules, other camera connectors) are
+     * skipped cleanly via devm_gpiod_get_optional().
+     */
+    mipi_dev->reset_gpio = devm_gpiod_get_optional(&pdev->dev, "reset", GPIOD_OUT_HIGH);
     if (IS_ERR(mipi_dev->reset_gpio)) {
-		printk("failed to acquire reset gpio\n");
-		// return PTR_ERR(lt9611->reset_gpio);
-	}
-
-    gpiod_set_value_cansleep(mipi_dev->reset_gpio, 1);
-
-    printk("---------------reset --- --------\n");
+        dev_warn(&pdev->dev, "failed to acquire reset gpio: %ld\n",
+                 PTR_ERR(mipi_dev->reset_gpio));
+        mipi_dev->reset_gpio = NULL;
+    }
+    if (mipi_dev->reset_gpio) {
+        msleep(10);                                         /* hold in reset   */
+        gpiod_set_value_cansleep(mipi_dev->reset_gpio, 0);  /* release         */
+        msleep(10);                                         /* let sensor boot */
+        dev_info(&pdev->dev, "sensor reset pulsed via reset-gpios\n");
+    }
 
     mutex_init(&mipi_dev->mlock);
 	platform_set_drvdata(pdev, mipi_dev);

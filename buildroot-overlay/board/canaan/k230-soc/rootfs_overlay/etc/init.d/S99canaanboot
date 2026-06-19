@@ -4,55 +4,15 @@ bootddev=$(cat /proc/cmdline  | sed  -n  "s#root=\(\/dev\/mmcblk[0-9]\).*#\1#p" 
 mount ${bootddev}p1 /boot
 
 #
-# ---- Camera sensor bring-up (metalv / Linux-on-CPU0, no RT-Smart) ----------
+# ---- Camera sensor reset (now handled in the kernel) ----------------------
 #
-# On the vendor dual-core SDK, RT-Smart programs the sensor master clock
-# (MCLK0) and pulses the sensor reset line before the ISP starts. This small-
-# core build has no RT-Smart, and U-Boot SPL explicitly *disables* MCLK
-# (board/canaan/common/k230_spl.c: "disable mclk" clears 0x9110006c bits 0-2).
-# Without a running MCLK and a reset pulse the sensor never responds on I2C,
-# so isp_media_server's STREAMON fails ("post event 4 return error").
-#
-# The pin-mux is already set up by U-Boot (k230d_canmv_bpi.dts):
-#   IO13 -> M_CLK (SEL=1), IO62 -> GPIO (SEL=0), IO7/IO8 -> IIC4 (/dev/i2c-0).
-# So we only need to (1) start MCLK0 and (2) pulse the GPIO62 reset line.
-#
-# Both supported sensors share GPIO62 reset + MCLK0 but want different rates
-# (mclk_cfg @ 0x9110006c: mux bits[4:3], div bits[9:5]=N-1, gate bit0, strobe
-#  bit31; see k230_sdk sysctl_media_clk.c):
-#   gc2093 : PLL1_DIV4(594M) / 25 = 23.76 MHz  -> 0x80000309
-#   ov5647 : PLL0_DIV4(400M) / 16 = 25.00 MHz  -> 0x800001F1
-# We auto-detect which sensor is wired by probing I2C after a reset pulse.
-#
-MCLK_CFG=0x9110006c          # SYSCTL media clk register (MCLK0/1/2)
-GPIO1_DR=0x9140c000          # gpio1 controller (GPIO32-63) output data
-GPIO1_DDR=0x9140c004         # gpio1 direction (1 = output)
-RST_BIT=$((1 << 30))         # GPIO62 = gpio1 line 30 = bit 30
-
-mclk_set() {                 # $1 = full mclk_cfg value
-	devmem "$MCLK_CFG" 32 "$1"
-}
-
-reset_pulse() {              # GPIO62 high->low->high, 100ms each (matches vendor ov5647_power_rest)
-	ddr=$(devmem "$GPIO1_DDR")
-	devmem "$GPIO1_DDR" 32 $(( ddr | RST_BIT ))                  # configure as output
-	dr=$(devmem "$GPIO1_DR"); devmem "$GPIO1_DR" 32 $(( dr | RST_BIT ));                  usleep 100000
-	dr=$(devmem "$GPIO1_DR"); devmem "$GPIO1_DR" 32 $(( (dr & 0xFFFFFFFF) & ~RST_BIT ));  usleep 100000
-	dr=$(devmem "$GPIO1_DR"); devmem "$GPIO1_DR" 32 $(( dr | RST_BIT ));                  usleep 100000
-}
-
-sensor_acks() {              # $1 = 7-bit i2c addr; 0 if it ACKs on /dev/i2c-0
-	i2cget -y 0 "$1" >/dev/null 2>&1
-}
-
-mclk_set 0x80000309; reset_pulse        # try gc2093 (BPI default) first
-if sensor_acks 0x37; then
-	echo "camera: gc2093 detected @0x37 (MCLK0 = 23.76 MHz)"
-elif { mclk_set 0x800001F1; reset_pulse; sensor_acks 0x36; }; then
-	echo "camera: ov5647 detected @0x36 (MCLK0 = 25 MHz)"
-else
-	echo "camera: WARNING - no sensor ACK on /dev/i2c-0 (0x37/0x36) after MCLK + reset"
-fi
+# The external CSI2 sensor reset (GPIO62) is pulsed by the vvcam_mipi driver at
+# probe, driven by the DT "reset-gpios" on &mipi0 (linux patch 0019 +
+# bananapi-canmv-k230d-zero.dts). The BPI K230D camera modules self-clock
+# (internal 24 MHz), and the CSI2 connector has no MCLK pin, so no SoC MCLK
+# setup is needed. This replaces the old userspace devmem MCLK0 write + GPIO62
+# reset-pulse + i2c auto-detect that used to run here on the metalv small-core
+# build (no RT-Smart). See docs/board_hardware_canmv_k230_and_bpi_k230d.md.
 # ---------------------------------------------------------------------------
 
 modprobe vvcam_isp
