@@ -1,0 +1,32 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OpenCode <opencode@example.com>
+Date: Tue, 23 Jun 2026 00:00:00 +0000
+Subject: [PATCH] riscv: dts: canaan: add Banana Pi K230D Zero CSI2 camera wiring
+
+The Banana Pi K230D Zero routes its camera on CSI2 over I2C4. Add the
+I2C alias used by the vvcam sensor drivers and the board's CSI2 sensor
+reset GPIO so the vvcam MIPI driver can reset an attached sensor.
+---
+ arch/riscv/boot/dts/canaan/bananapi-canmv-k230d-zero.dts | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/arch/riscv/boot/dts/canaan/bananapi-canmv-k230d-zero.dts b/arch/riscv/boot/dts/canaan/bananapi-canmv-k230d-zero.dts
+index fc23197db..e77891691 100755
+--- a/arch/riscv/boot/dts/canaan/bananapi-canmv-k230d-zero.dts
++++ b/arch/riscv/boot/dts/canaan/bananapi-canmv-k230d-zero.dts
+@@ -14,6 +14,7 @@ aliases {
+ 		serial2 = &uart2;
+ 		mmc0 = &mmc_sd1;
+ 		mmc1 = &mmc_sd0;
++		i2c0 = &i2c4;
+ 	};
+ 
+ 	chosen {
+@@ -93,4 +94,5 @@ K230_RESET_M2_REG_OFFSET
+ 			  K230_RESET_M2_TYPE
+ 			  K230_RESET_M2_DONE_BIT
+ 			  K230_RESET_M2_ASSERT_BIT>;
++	reset-gpios = <&gpio1_ports 30 GPIO_ACTIVE_HIGH>;
+ };
+-- 
+2.25.1
