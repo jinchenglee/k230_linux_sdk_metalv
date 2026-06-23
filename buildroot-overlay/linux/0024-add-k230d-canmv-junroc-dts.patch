@@ -1,0 +1,51 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OpenCode <opencode@example.com>
+Date: Tue, 23 Jun 2026 00:00:00 +0000
+Subject: [PATCH] riscv: dts: canaan: add k230d canmv junroc board dts
+
+Add the in-tree DTS requested by k230d_canmv_junroc_defconfig. The
+Junroc board is based on the K230D CanMV board, but routes the OV5647
+camera to CSI1 and uses GPIO0_10 for camera reset.
+---
+ arch/riscv/boot/dts/canaan/k230d-canmv-junroc.dts | 29 ++++++++++++++++++++++
+ 1 file changed, 29 insertions(+)
+ create mode 100644 arch/riscv/boot/dts/canaan/k230d-canmv-junroc.dts
+
+diff --git a/arch/riscv/boot/dts/canaan/k230d-canmv-junroc.dts b/arch/riscv/boot/dts/canaan/k230d-canmv-junroc.dts
+new file mode 100644
+index 000000000..b5a6ee164
+--- /dev/null
++++ b/arch/riscv/boot/dts/canaan/k230d-canmv-junroc.dts
+@@ -0,0 +1,29 @@
++// SPDX-License-Identifier: GPL-2.0 OR MIT
++/*
++ * Copyright (C) 2026 Junroc
++ */
++
++#include "k230d-canmv.dts"
++
++/ {
++	model = "Junroc CanMV-K230D";
++	compatible = "canaan,canmv-k230", "canaan,kendryte-k230";
++};
++
++&mipi0 {
++	// set to csi1
++	id = <1>;
++	reg = <0x0 0x9000a000 0x0 0x800>;
++	interrupts = <118 IRQ_TYPE_LEVEL_HIGH>;
++	resets = <&sysctl_reset
++			  K230_RESET_CSI1_REG_OFFSET
++			  K230_RESET_CSI1_TYPE
++			  K230_RESET_CSI1_DONE_BIT
++			  K230_RESET_CSI1_ASSERT_BIT>,
++		 <&sysctl_reset
++			  K230_RESET_M1_REG_OFFSET
++			  K230_RESET_M1_TYPE
++			  K230_RESET_M1_DONE_BIT
++			  K230_RESET_M1_ASSERT_BIT>;
++	reset-gpios = <&gpio0_ports 10 GPIO_ACTIVE_HIGH>;
++};
++
+-- 
+2.25.1
