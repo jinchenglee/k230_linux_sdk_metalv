@@ -15,12 +15,30 @@
 #define pr(fmt,...) fprintf(stderr,"[display] "fmt"\n", ##__VA_ARGS__)
 #define CKE(x,go) do{int e=(x);if(e){pr("[display] "#x" error %d(%s) at line %d",e,strerror(-e),__LINE__);goto go;}}while(0)
 
+static int drm_add_crtc_property(const struct display* display, drmModeAtomicReqPtr req, const char *name, uint64_t value);
+static int drm_add_conn_property(const struct display* display, drmModeAtomicReqPtr req, const char *name, uint64_t value);
+
 static void page_flip_handler(int fd, unsigned int sequence, unsigned int tv_sec,
                   unsigned int tv_usec, void *user_data) {
     // do nothing
 }
 
 void display_exit(struct display* display) {
+    // Free any pending atomic request first
+    if (display->req) {
+        drmModeAtomicFree(display->req);
+        display->req = NULL;
+    }
+    // Explicitly disable the CRTC and detach the connector so the next
+    // process that opens /dev/dri/card0 gets a clean "disabled" state and
+    // triggers a full modeset (including bridge re-initialization).
+    drmModeAtomicReqPtr req = drmModeAtomicAlloc();
+    if (req) {
+        drm_add_crtc_property(display, req, "ACTIVE", 0);
+        drm_add_conn_property(display, req, "CRTC_ID", 0);
+        drmModeAtomicCommit(display->fd, req, DRM_MODE_ATOMIC_ALLOW_MODESET, NULL);
+        drmModeAtomicFree(req);
+    }
     struct display_plane* p = display->planes;
     while (p != NULL) {
         display_free_plane(p);
@@ -640,6 +658,7 @@ int display_commit_buffer(const struct display_buffer* buffer, uint32_t x, uint3
     uint32_t flags = DRM_MODE_PAGE_FLIP_EVENT;
     struct display_plane* plane = buffer->plane;
     struct display* display = plane->display;
+    bool was_first = plane->first;
     drmModeAtomicReqPtr req = drmModeAtomicAlloc();
     display->req = req;
 
@@ -668,7 +687,9 @@ int display_commit_buffer(const struct display_buffer* buffer, uint32_t x, uint3
     return 0;
 
 error:
+    plane->first = was_first;
     drmModeAtomicFree(req);
+    display->req = NULL;
     return -1;
 }
 

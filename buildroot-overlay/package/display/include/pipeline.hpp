@@ -86,8 +86,23 @@ namespace pipeline {
 
         int run() {
             running.store(true);
-            for (auto [_, ep]: fdMap) {
-                ep->start();
+            // Start sources first (camera STREAMON) before sinks (DRM modeset commit).
+            // Matches v4l2-drm's proven-working ordering: STREAMON → display_commit_buffer.
+            for (auto& [fd, ep]: fdMap) {
+                if (backward.find(ep) == backward.end()) {  // source endpoint
+                    if (!ep->start()) {
+                        running.store(false);
+                        return -1;
+                    }
+                }
+            }
+            for (auto& [fd, ep]: fdMap) {
+                if (backward.find(ep) != backward.end()) {  // sink endpoint
+                    if (!ep->start()) {
+                        running.store(false);
+                        return -1;
+                    }
+                }
             }
             while (running.load()) {
                 fd_set rfds = fds;

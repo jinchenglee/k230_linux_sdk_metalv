@@ -16,8 +16,13 @@ void sighandler(int sig) {
 
 int main(void) {
     auto d = display_init(0);
-    unsigned width = 1920;
-    unsigned height = 1080;
+    if (!d) {
+        cerr << "display_init failed: no connected display found" << endl;
+        return -1;
+    }
+    // Use the negotiated CRTC mode dimensions, not a hardcoded 1920x1080
+    unsigned width = d->width;
+    unsigned height = d->height;
     auto display = Display(d);
     if (!display.createChannel(width, height, DRM_FORMAT_NV12)) {
         cerr << "create display channel error" << endl;
@@ -31,5 +36,8 @@ int main(void) {
         signal(SIGINT, sighandler);
         signal(SIGTERM, sighandler);
         main_pipe.run();
+    } else {
+        cerr << "VideoCapture::create failed" << endl;
+        return -1;
     }
 }
