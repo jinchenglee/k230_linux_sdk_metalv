@@ -44,6 +44,13 @@ install(TARGETS srtp2 ARCHIVE DESTINATION lib)
 install(DIRECTORY include/ DESTINATION include
     FILES_MATCHING PATTERN "*.h"
 )
-install(DIRECTORY crypto/include/ DESTINATION include
-    FILES_MATCHING PATTERN "*.h"
-)
+# NOTE: do NOT install crypto/include/ here. These are libsrtp's PRIVATE
+# headers (err.h, datatypes.h, cipher.h, auth.h, ...) with generic names.
+# Installing them flat into the sysroot /usr/include shadows glibc's <err.h>
+# and breaks any package that includes it (e.g. linux-tools perf's bench/*.c
+# -> "implicit declaration of err/errx/warn/warnx"). libpeer consumes these
+# via in-tree include_directories(crypto/include), so they are not needed in
+# staging. Upstream libsrtp does not install them either.
+# install(DIRECTORY crypto/include/ DESTINATION include
+#     FILES_MATCHING PATTERN "*.h"
+# )
