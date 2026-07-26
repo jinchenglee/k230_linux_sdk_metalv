@@ -1,0 +1,14 @@
+config BR2_PACKAGE_APRILTAG_DEMO
+    bool "apriltag live demo"
+    select BR2_PACKAGE_DISPLAY
+    select BR2_PACKAGE_OPENCV4
+    select BR2_PACKAGE_LIBMMZ
+    select BR2_PACKAGE_VVCAM
+    help
+        Live on-device AprilTag detection with DRM display.
+        Camera (NV12) -> apriltag-rvv detect() (libapriltag_rvv.a) ->
+        quad overlays on an ARGB OSD plane. Mirrors apriltag-rvv's
+        examples/live_demo.rs on the K230 board.
+
+        The Rust static library must be built first in the rvv-dev docker
+        image (package scripts/build_rust_lib.sh).

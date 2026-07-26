@@ -1,0 +1,7 @@
+# Prebuilt Rust staticlib — reproducible via scripts/build_rust_lib.sh
+# (built in the rvv-dev docker image); not tracked in git.
+lib/*.a
+
+# Standalone build_app.sh outputs
+out/
+k230_bin/
