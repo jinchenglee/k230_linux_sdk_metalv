@@ -1,13 +1,17 @@
 APRILTAG_DEMO_SITE = $(realpath $(TOPDIR))"/package/apriltag_demo"
 APRILTAG_DEMO_SITE_METHOD = local
 APRILTAG_DEMO_DEPENDENCIES += opencv4 display vvcam libmmz
+APRILTAG_DEMO_RVV_DIR ?= $(realpath $(TOPDIR)/../../../apriltag-rvv)
 
 # Ensure the Rust staticlib (built in the rvv-dev docker image) is present in
-# the package's lib/ before CMake configures. If it is missing, try to build it.
+# Buildroot's copied source tree before CMake configures. Local package sources
+# are rsynced into $(@D) before pre-configure hooks run, so build the library
+# there rather than in $(APRILTAG_DEMO_PKGDIR).
 define APRILTAG_DEMO_BUILD_RUST_LIB
-	if [ ! -f $(APRILTAG_DEMO_PKGDIR)/lib/libapriltag_rvv.a ]; then \
+	if [ ! -f $(@D)/lib/libapriltag_rvv.a ]; then \
 		echo "apriltag_demo: lib/libapriltag_rvv.a missing, building via docker..."; \
-		bash $(APRILTAG_DEMO_PKGDIR)/scripts/build_rust_lib.sh; \
+		APRILTAG_RVV_DIR="$(APRILTAG_DEMO_RVV_DIR)" \
+			bash $(@D)/scripts/build_rust_lib.sh; \
 	fi
 endef
 APRILTAG_DEMO_PRE_CONFIGURE_HOOKS += APRILTAG_DEMO_BUILD_RUST_LIB

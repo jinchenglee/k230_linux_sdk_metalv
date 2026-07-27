@@ -8,14 +8,16 @@
  * Structure cloned from face_detect/src/main.cc (camera + DRM + OSD), with the
  * nncase AI pipeline replaced by the apriltag C ABI (src/apriltag.h).
  *
- * Milestone 1: apriltag_detect() is a brightness-centroid skeleton, so this
- * shows a box tracking the brightest region. Milestone 2 swaps in real
- * detect() with no change to this file.
+ * With --debug, keys 1–5 replace the transparent detection overlay with live
+ * intermediate pipeline images, making on-device camera/threshold/quad/decode
+ * failures visible without writing a debug image sequence to storage.
  */
 #include <iostream>
 #include <thread>
 #include <string>
 #include <cstring>
+#include <termios.h>
+#include <sys/ioctl.h>
 
 #include "sensor_set.h"
 #include "apriltag.h"
@@ -30,8 +32,16 @@ static int    g_factor_int   = 2;     // FFI: 0=1.0 1=1.5 2=2.0
 static double g_decimate_scale = 2.0;
 static int    g_mode         = 0;     // FFI: 0=scalar 1=rvv
 static uint32_t g_min_blob   = 25;
+static bool g_debug_enabled  = false;
+static std::atomic<int> g_debug_stage(0);
+static std::atomic<int> g_input_source(0); // 0=CSI, 1=USB
+static std::atomic<int> g_denoise_mode(0);  // 0=off, 1=median3, 2=gaussian3
+static int g_usb_video       = -1;    // /dev/videoX; required before pressing 'u'
+static unsigned g_csi_width  = SENSOR_WIDTH;
+static unsigned g_csi_height = SENSOR_HEIGHT;
 
 #define MAX_DETS 64
+#define MAX_DECODE_CANDIDATES 256
 
 // ── Shared state ────────────────────────────────────────────────────────────
 static std::mutex result_mutex;
@@ -46,17 +56,75 @@ static struct display* display;
 struct display_buffer* draw_buffer;
 cv::Mat draw_frame;
 
+static const char* denoise_mode_name(int mode)
+{
+    switch (mode) {
+    case 1: return "median 3x3";
+    case 2: return "Gaussian 3x3";
+    default: return "off";
+    }
+}
+
+static void print_key_help()
+{
+    cout << "keys: c=CSI u=USB n=denoise";
+    if (g_debug_enabled) {
+        cout << " 0=camera 1=gray 2=threshold 3=clusters"
+                " 4=quads 5=detections";
+    }
+    cout << " q=quit" << endl;
+}
+
 static void print_usage(const char* name)
 {
-    cout << "Usage: " << name << " [--rvv] [--factor 1|1.5|2] [--min-blob N]" << endl
+    cout << "Usage: " << name
+         << " [--rvv] [--factor 1|1.5|2] [--min-blob N]"
+            " [--csi-size WxH] [--usb-video X] [--debug]" << endl
          << "  --rvv         use RVV kernels (default: scalar)" << endl
          << "  --factor      decimation factor 1.0/1.5/2.0 (default: 2.0)" << endl
          << "  --min-blob    minimum blob size (default: 25)" << endl
-         << "  q<enter>      quit" << endl;
+         << "  --csi-size    CSI detection stream size (default: "
+         << SENSOR_WIDTH << "x" << SENSOR_HEIGHT << ")" << endl
+         << "  --usb-video   USB camera node number X for /dev/videoX" << endl
+         << "  --debug       enable live pipeline views and decode diagnostics"
+            " (default: off)" << endl
+         << "  c             select CSI camera (default)" << endl
+         << "  u             select configured USB camera" << endl
+         << "  n             cycle luma denoise: off/median3/Gaussian3" << endl
+         << "  0..5          select pipeline view (requires --debug)" << endl
+         << "  q             quit" << endl;
 }
 
+// Read single keys immediately on a terminal, restoring its settings on exit.
+class TerminalRawMode {
+public:
+    TerminalRawMode() : active_(false)
+    {
+        if (isatty(STDIN_FILENO) && tcgetattr(STDIN_FILENO, &saved_) == 0) {
+            struct termios raw = saved_;
+            raw.c_lflag &= ~(ICANON | ECHO);
+            raw.c_cc[VMIN] = 1;
+            raw.c_cc[VTIME] = 0;
+            active_ = tcsetattr(STDIN_FILENO, TCSANOW, &raw) == 0;
+        }
+    }
+
+    ~TerminalRawMode()
+    {
+        if (active_) {
+            tcsetattr(STDIN_FILENO, TCSANOW, &saved_);
+        }
+    }
+
+private:
+    bool active_;
+    struct termios saved_;
+};
+
 // ── Detection thread ────────────────────────────────────────────────────────
-// NV12 capture; the Y-plane is fed directly to apriltag_detect() as grayscale.
+// CSI uses the NV12 Y-plane directly. USB uses OpenCV's V4L2 backend to
+// negotiate/decode the webcam format, then feeds a BGR->gray conversion to the
+// same detector and paints the BGR frame opaquely on the OSD.
 static void detect_proc(int video_device)
 {
     struct v4l2_drm_context context;
@@ -70,8 +138,8 @@ static void detect_proc(int video_device)
     v4l2_drm_default_context(&context);
     context.device = video_device;
     context.display = false;
-    context.width = SENSOR_WIDTH;
-    context.height = SENSOR_HEIGHT;
+    context.width = g_csi_width;
+    context.height = g_csi_height;
     context.video_format = V4L2_PIX_FMT_NV12;
     context.buffer_num = DETECT_BUFFER_NUM;
     if (v4l2_drm_setup(&context, 1, NULL)) {
@@ -83,50 +151,190 @@ static void detect_proc(int video_device)
         return;
     }
 
+    size_t csi_width = context.width;
+    size_t csi_height = context.height;
+    size_t csi_stride = context.width;
+    struct v4l2_format csi_format = {};
+    csi_format.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    if (ioctl(context.video_fd, VIDIOC_G_FMT, &csi_format) == 0) {
+        csi_width = csi_format.fmt.pix.width;
+        csi_height = csi_format.fmt.pix.height;
+        csi_stride = csi_format.fmt.pix.bytesperline != 0
+                   ? csi_format.fmt.pix.bytesperline : csi_width;
+    }
+    fprintf(stderr,
+            "[input] CSI requested %ux%u, negotiated %zux%zu stride=%zu\n",
+            g_csi_width, g_csi_height, csi_width, csi_height, csi_stride);
+
     void* det = apriltag_new(g_min_blob);
     if (!det) {
         cerr << "detect: apriltag_new failed" << endl;
         v4l2_drm_stop(&context);
         return;
     }
+    if (apriltag_set_debug_enabled(det, g_debug_enabled ? 1 : 0) != 0) {
+        cerr << "detect: cannot configure diagnostics" << endl;
+        apriltag_free(det);
+        v4l2_drm_stop(&context);
+        return;
+    }
     std::vector<apriltag_det_t> out(MAX_DETS);
+    std::vector<apriltag_decode_candidate_t> decode_candidates;
+    if (g_debug_enabled) {
+        decode_candidates.resize(MAX_DECODE_CANDIDATES);
+    }
+    cv::VideoCapture usb_capture;
+    cv::Mat usb_bgr;
+    cv::Mat usb_gray;
+    cv::Mat filtered_gray;
 
     while (!detect_stop) {
-        int ret = v4l2_drm_dump(&context, 1000);
-        if (ret) {
-            perror("detect: v4l2_drm_dump error");
-            continue;
+        const int selected_source = g_input_source.load();
+        const char* source_name = selected_source == 0 ? "csi" : "usb";
+        const uint8_t* gray = nullptr;
+        size_t frame_width = 0;
+        size_t frame_height = 0;
+        size_t frame_stride = 0;
+        bool csi_frame_held = false;
+
+        if (selected_source == 0) {
+            if (usb_capture.isOpened()) {
+                usb_capture.release();
+                usb_bgr.release();
+                usb_gray.release();
+                fprintf(stderr, "\n[input] switched to CSI camera\n");
+            }
+            int ret = v4l2_drm_dump(&context, 1000);
+            if (ret) {
+                perror("detect: v4l2_drm_dump error");
+                continue;
+            }
+            csi_frame_held = true;
+            gray = (const uint8_t*)context.buffers[context.vbuffer.index].mmap;
+            frame_width = csi_width;
+            frame_height = csi_height;
+            frame_stride = csi_stride;
+        } else {
+            if (g_usb_video < 0) {
+                g_input_source.store(0);
+                fprintf(stderr, "\n[input] USB camera is not configured; "
+                        "start with --usb-video X\n");
+                continue;
+            }
+            if (!usb_capture.isOpened()) {
+                fprintf(stderr, "\n[input] opening USB camera /dev/video%d ...\n",
+                        g_usb_video);
+                if (!usb_capture.open(g_usb_video, cv::CAP_V4L2)) {
+                    result_mutex.lock();
+                    draw_frame.setTo(cv::Scalar(0, 0, 0, 255));
+                    char message[96];
+                    snprintf(message, sizeof(message),
+                             "cannot open USB camera /dev/video%d", g_usb_video);
+                    cv::putText(draw_frame, message, cv::Point(18, 32),
+                                cv::FONT_HERSHEY_SIMPLEX, 0.75,
+                                cv::Scalar(0, 255, 255, 255), 2);
+                    result_mutex.unlock();
+                    usleep(500000);
+                    continue;
+                }
+                // Ask for the CSI geometry but accept whatever the webcam
+                // negotiates. A one-frame backend queue limits display lag.
+                usb_capture.set(cv::CAP_PROP_FRAME_WIDTH, SENSOR_WIDTH);
+                usb_capture.set(cv::CAP_PROP_FRAME_HEIGHT, SENSOR_HEIGHT);
+                usb_capture.set(cv::CAP_PROP_BUFFERSIZE, 1);
+                fprintf(stderr, "[input] USB /dev/video%d opened at %.0fx%.0f\n",
+                        g_usb_video,
+                        usb_capture.get(cv::CAP_PROP_FRAME_WIDTH),
+                        usb_capture.get(cv::CAP_PROP_FRAME_HEIGHT));
+            }
+            if (!usb_capture.read(usb_bgr) || usb_bgr.empty()) {
+                fprintf(stderr, "\n[input] USB read failed; reopening /dev/video%d\n",
+                        g_usb_video);
+                usb_capture.release();
+                usleep(250000);
+                continue;
+            }
+            if (usb_bgr.channels() == 3) {
+                cv::cvtColor(usb_bgr, usb_gray, cv::COLOR_BGR2GRAY);
+            } else if (usb_bgr.channels() == 4) {
+                cv::cvtColor(usb_bgr, usb_gray, cv::COLOR_BGRA2GRAY);
+                cv::Mat converted_bgr;
+                cv::cvtColor(usb_bgr, converted_bgr, cv::COLOR_BGRA2BGR);
+                usb_bgr = converted_bgr;
+            } else {
+                usb_gray = usb_bgr;
+                cv::cvtColor(usb_gray, usb_bgr, cv::COLOR_GRAY2BGR);
+            }
+            gray = usb_gray.data;
+            frame_width = usb_gray.cols;
+            frame_height = usb_gray.rows;
+            frame_stride = usb_gray.step;
         }
-        // NV12 buffer: Y-plane first, stride == width (ISP output, 1280 aligned).
-        const uint8_t* y =
-            (const uint8_t*)context.buffers[context.vbuffer.index].mmap;
+
+        // Filter only the grayscale input consumed by the detector. Keep the
+        // V4L2 mmap and USB display frame untouched, and reuse filtered_gray's
+        // allocation across frames.
+        const int selected_denoise = g_denoise_mode.load();
+        if (selected_denoise != 0 && frame_width >= 3 && frame_height >= 3) {
+            cv::Mat input_gray(static_cast<int>(frame_height),
+                               static_cast<int>(frame_width),
+                               CV_8UC1,
+                               const_cast<uint8_t*>(gray),
+                               frame_stride);
+            if (selected_denoise == 1) {
+                cv::medianBlur(input_gray, filtered_gray, 3);
+            } else {
+                cv::GaussianBlur(input_gray, filtered_gray, cv::Size(3, 3),
+                                 0.8, 0.8, cv::BORDER_REPLICATE);
+            }
+            gray = filtered_gray.data;
+            frame_stride = filtered_gray.step;
+        }
 
         // Dump the exact grayscale we feed detect() (packed width*height,
         // stride-corrected) when requested — triggered by pressing 'q' so the
         // tag is framed. Set APRILTAG_DEMO_DUMP=path to enable.
-        if (dump_request.load()) {
+        if (g_debug_enabled && dump_request.load()) {
             const char* dump_path = getenv("APRILTAG_DEMO_DUMP");
             if (dump_path) {
                 FILE* f = fopen(dump_path, "wb");
                 if (f) {
-                    for (unsigned r = 0; r < context.height; ++r) {
-                        fwrite(y + (size_t)r * context.width, 1, context.width, f);
+                    for (size_t r = 0; r < frame_height; ++r) {
+                        fwrite(gray + r * frame_stride, 1, frame_width, f);
                     }
                     fclose(f);
-                    fprintf(stderr, "\n[dump] wrote %ux%u Y-plane (%u bytes) to %s\n",
-                            context.width, context.height,
-                            context.width * context.height, dump_path);
+                    fprintf(stderr, "\n[dump] wrote %zux%zu %s grayscale "
+                            "(%zu bytes) to %s\n",
+                            frame_width, frame_height, source_name,
+                            frame_width * frame_height, dump_path);
                 }
             }
             dump_request.store(false);
         }
-        int n = apriltag_detect(det, y, context.width, context.height,
-                                context.width, g_factor_int, g_mode,
+        const int selected_debug_stage =
+            g_debug_enabled ? g_debug_stage.load() : 0;
+        if (g_debug_enabled) {
+            apriltag_set_debug_stage(det, selected_debug_stage);
+        }
+        int n = apriltag_detect(det, gray, frame_width, frame_height,
+                                frame_stride, g_factor_int, g_mode,
                                 out.data(), MAX_DETS);
+        apriltag_decode_stats_t decode_stats = {};
+        bool have_decode_stats = false;
+        int decode_candidate_count = 0;
+        if (g_debug_enabled) {
+            have_decode_stats =
+                apriltag_get_decode_stats(det, &decode_stats) == 1;
+            decode_candidate_count = apriltag_get_decode_candidates(
+                det, decode_candidates.data(), MAX_DECODE_CANDIDATES);
+            if (decode_candidate_count < 0) {
+                decode_candidate_count = 0;
+            }
+        }
 
         // ── Diagnostics (throttled ~1/s): distinguish panic (-1) from
         //    "no detections" (0) from "detected but not drawn" (>0). ──
-        {
+        if (g_debug_enabled) {
             static struct timeval dtv = {0, 0};
             static int frames = 0, max_n = 0, panics = 0;
             struct timeval now; gettimeofday(&now, NULL);
@@ -136,13 +344,50 @@ static void detect_proc(int video_device)
             if (n > max_n) max_n = n;
             uint64_t us = 1000000ULL * (now.tv_sec - dtv.tv_sec) + now.tv_usec - dtv.tv_usec;
             if (us >= 1000000) {
-                fprintf(stderr, "\n[detect] frames=%d max_dets=%d panics=%d last_n=%d",
+                fprintf(stderr, "\n[detect] source=%s denoise=%s %zux%zu stride=%zu frames=%d "
+                        "max_dets=%d panics=%d last_n=%d",
+                        source_name, denoise_mode_name(selected_denoise),
+                        frame_width, frame_height, frame_stride,
                         frames, max_n, panics, n);
                 if (n > 0) {
                     fprintf(stderr, "  det0: id=%llu m=%.1f center=(%.0f,%.0f) c0=(%.0f,%.0f)",
                             (unsigned long long)out[0].id, out[0].margin,
                             out[0].center[0], out[0].center[1],
                             out[0].corners[0], out[0].corners[1]);
+                }
+                if (have_decode_stats) {
+                    fprintf(stderr,
+                            "  decode: q=%zu hom=%zu pol=%zu code=%zu ok=%zu",
+                            decode_stats.quads,
+                            decode_stats.homography_rejects,
+                            decode_stats.polarity_rejects,
+                            decode_stats.codeword_rejects,
+                            decode_stats.detections);
+                    if (decode_stats.best_hamming >= 0) {
+                        fprintf(stderr, " best_h=%d raw=%09llx",
+                                decode_stats.best_hamming,
+                                (unsigned long long)decode_stats.best_raw_code);
+                    }
+                    const apriltag_decode_candidate_t* largest_code = nullptr;
+                    for (int i = 0; i < decode_candidate_count; ++i) {
+                        const auto& candidate = decode_candidates[i];
+                        if (candidate.status == 3 &&
+                            (!largest_code ||
+                             candidate.area > largest_code->area)) {
+                            largest_code = &candidate;
+                        }
+                    }
+                    if (largest_code) {
+                        fprintf(stderr,
+                                " large_code: id=%llu h=%d center=(%.0f,%.0f)"
+                                " area=%.0f raw=%09llx",
+                                (unsigned long long)largest_code->nearest_id,
+                                largest_code->hamming,
+                                largest_code->center[0],
+                                largest_code->center[1],
+                                largest_code->area,
+                                (unsigned long long)largest_code->raw_code);
+                    }
                 }
                 fprintf(stderr, "\n");
                 dtv = now; frames = 0; max_n = 0; panics = 0;
@@ -155,14 +400,40 @@ static void detect_proc(int video_device)
             detections.assign(out.begin(), out.begin() + n);
         }
         draw_frame.setTo(cv::Scalar(0, 0, 0, 0));
-        draw_detections(draw_frame, detections, g_decimate_scale,
-                        SENSOR_WIDTH, SENSOR_HEIGHT);
+        if (selected_debug_stage == 0) {
+            if (selected_source == 1) {
+                draw_camera_frame(draw_frame, usb_bgr);
+            }
+            draw_detections(draw_frame, detections, g_decimate_scale,
+                            frame_width, frame_height);
+        } else {
+            apriltag_debug_image_t debug_image = {};
+            if (apriltag_get_debug_image(det, &debug_image) == 1 &&
+                debug_image.stage == (uint32_t)selected_debug_stage) {
+                // This copies the borrowed Rust image into draw_frame before
+                // the next apriltag_detect() call can reuse its storage.
+                draw_debug_image(draw_frame, debug_image);
+                if (selected_debug_stage == 4) {
+                    draw_decode_candidates(
+                        draw_frame, debug_image, decode_candidates.data(),
+                        (size_t)decode_candidate_count);
+                }
+            } else {
+                draw_frame.setTo(cv::Scalar(0, 0, 0, 255));
+                cv::putText(draw_frame, "waiting for pipeline debug image",
+                            cv::Point(18, 32), cv::FONT_HERSHEY_SIMPLEX,
+                            0.75, cv::Scalar(0, 255, 255, 255), 2);
+            }
+        }
         result_mutex.unlock();
 
         detect_frame_count += 1;
-        v4l2_drm_dump_release(&context);
+        if (csi_frame_held) {
+            v4l2_drm_dump_release(&context);
+        }
     }
 
+    usb_capture.release();
     apriltag_free(det);
     v4l2_drm_stop(&context);
 }
@@ -272,7 +543,7 @@ void display_proc(int video_device)
         draw_frame = cv::Mat(draw_buffer->width, draw_buffer->height, CV_8UC4, cv::Scalar(0, 0, 0, 0));
     }
 
-    cout << "press 'q'<enter> to exit" << endl;
+    print_key_help();
     gettimeofday(&tv, NULL);
     v4l2_drm_run(&context, 1, frame_handler);
 
@@ -288,6 +559,8 @@ static void parse_args(int argc, char* argv[])
         std::string a = argv[i];
         if (a == "--rvv") {
             g_mode = 1;
+        } else if (a == "--debug") {
+            g_debug_enabled = true;
         } else if (a == "--factor" && i + 1 < argc) {
             std::string f = argv[++i];
             if (f == "1" || f == "1.0")      { g_factor_int = 0; g_decimate_scale = 1.0; }
@@ -295,6 +568,29 @@ static void parse_args(int argc, char* argv[])
             else                             { g_factor_int = 2; g_decimate_scale = 2.0; }
         } else if (a == "--min-blob" && i + 1 < argc) {
             g_min_blob = (uint32_t)atoi(argv[++i]);
+        } else if (a == "--csi-size" && i + 1 < argc) {
+            unsigned width = 0, height = 0;
+            char trailing = '\0';
+            const char* size = argv[++i];
+            int fields = sscanf(size, "%ux%u%c", &width, &height, &trailing);
+            if (fields != 2) {
+                fields = sscanf(size, "%uX%u%c", &width, &height, &trailing);
+            }
+            if (fields != 2 || width < 16 || height < 16 ||
+                (width & 1) != 0 || (height & 1) != 0) {
+                cerr << "--csi-size must be an even WxH, for example 640x480"
+                     << endl;
+                exit(2);
+            }
+            g_csi_width = width;
+            g_csi_height = height;
+        } else if (a == "--usb-video" && i + 1 < argc) {
+            g_usb_video = atoi(argv[++i]);
+            if (g_usb_video < 0) {
+                cerr << "--usb-video must be a non-negative /dev/videoX number"
+                     << endl;
+                exit(2);
+            }
         } else if (a == "-h" || a == "--help") {
             print_usage(argv[0]);
             exit(0);
@@ -308,7 +604,14 @@ int main(int argc, char* argv[])
     parse_args(argc, argv);
     cout << "mode=" << (g_mode ? "rvv" : "scalar")
          << " factor=" << g_decimate_scale
-         << " min_blob=" << g_min_blob << endl;
+         << " min_blob=" << g_min_blob
+         << " debug=" << (g_debug_enabled ? "on" : "off")
+         << " input=CSI"
+         << " csi_request=" << g_csi_width << "x" << g_csi_height;
+    if (g_usb_video >= 0) {
+        cout << " usb=/dev/video" << g_usb_video;
+    }
+    cout << endl;
 
     display = display_init(0);
     if (!display) {
@@ -322,14 +625,19 @@ int main(int argc, char* argv[])
     std::thread detect_thread(detect_proc, kd_mpi_get_vvcam_video00() + 1);
     std::thread display_thread(display_proc, kd_mpi_get_vvcam_video00());
 
-    cout << "type 'q'<enter> to quit" << endl;
-    std::string input;
+    print_key_help();
+    TerminalRawMode terminal_mode;
     while (true) {
-        std::getline(std::cin, input);
-        if (input == "q") {
+        char key = '\0';
+        ssize_t got = read(STDIN_FILENO, &key, 1);
+        if (got <= 0) {
+            usleep(100000);
+            continue;
+        }
+        if (key == 'q' || key == 'Q') {
             // If dumping is enabled, capture the currently-framed frame before
             // tearing down (wait up to ~1s for the detect thread to write it).
-            if (getenv("APRILTAG_DEMO_DUMP")) {
+            if (g_debug_enabled && getenv("APRILTAG_DEMO_DUMP")) {
                 dump_request.store(true);
                 for (int i = 0; i < 20 && dump_request.load(); ++i) {
                     usleep(50000);
@@ -339,8 +647,31 @@ int main(int argc, char* argv[])
             usleep(100000);
             detect_stop.store(true);
             break;
-        } else {
-            usleep(100000);
+        } else if (key >= '0' && key <= '5') {
+            if (!g_debug_enabled) {
+                cerr << "\npipeline views are disabled; restart with --debug"
+                     << endl;
+            } else {
+                int stage = key - '0';
+                g_debug_stage.store(stage);
+                cout << "\nview " << stage << ": "
+                     << apriltag_debug_stage_name(stage) << endl;
+            }
+        } else if (key == 'c' || key == 'C') {
+            g_input_source.store(0);
+            cout << "\ninput: CSI camera" << endl;
+        } else if (key == 'u' || key == 'U') {
+            if (g_usb_video < 0) {
+                cerr << "\nUSB camera not configured; restart with "
+                        "--usb-video X" << endl;
+            } else {
+                g_input_source.store(1);
+                cout << "\ninput: USB /dev/video" << g_usb_video << endl;
+            }
+        } else if (key == 'n' || key == 'N') {
+            const int next_mode = (g_denoise_mode.load() + 1) % 3;
+            g_denoise_mode.store(next_mode);
+            cout << "\nluma denoise: " << denoise_mode_name(next_mode) << endl;
         }
     }
 

@@ -10,12 +10,22 @@
 #   scripts/build_rust_lib.sh            # with RVV (+v, default)
 #   scripts/build_rust_lib.sh --no-rvv   # scalar fallback
 #
-# Override the apriltag-rvv location or docker image with env vars:
+# The source-tree invocation auto-detects a sibling apriltag-rvv repository.
+# Buildroot passes that path explicitly because its copied package has no .git.
+# Override the location or docker image with env vars:
 #   APRILTAG_RVV_DIR=/path/to/apriltag-rvv  RVV_DOCKER_IMAGE=rvv-dev:latest
 set -euo pipefail
 
 PKG_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-APRILTAG_RVV_DIR="${APRILTAG_RVV_DIR:-/work/git_repo/apriltag-rvv}"
+if [ -z "${APRILTAG_RVV_DIR:-}" ]; then
+    REPO_ROOT="$(git -C "$PKG_DIR" rev-parse --show-toplevel 2>/dev/null || true)"
+    if [ -n "$REPO_ROOT" ] &&
+       [ -d "$(dirname "$REPO_ROOT")/apriltag-rvv" ]; then
+        APRILTAG_RVV_DIR="$(dirname "$REPO_ROOT")/apriltag-rvv"
+    else
+        APRILTAG_RVV_DIR="/work/git_repo/apriltag-rvv"
+    fi
+fi
 RVV_DOCKER_IMAGE="${RVV_DOCKER_IMAGE:-rvv-dev:latest}"
 RVV_ARG="${1:-}"
 

@@ -49,6 +49,8 @@ set(APRILTAG_RVV_LIB ${CMAKE_CURRENT_SOURCE_DIR}/lib/libapriltag_rvv.a)
 target_link_libraries(${bin}
     -Wl,--start-group
     ${APRILTAG_RVV_LIB}
+    opencv_videoio
+    opencv_imgcodecs
     opencv_imgproc
     opencv_core
     v4l2-drm

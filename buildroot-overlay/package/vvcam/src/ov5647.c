@@ -259,7 +259,7 @@ static struct ov5647_mode modes[] = {
             .height = 1080,
             .lanes = VVCAM_SENSOR_2LANE,
             .freq = VVCAM_SENSOR_800M,
-            .bayer = VVCAM_BAYER_PAT_BGGR,
+            .bayer = VVCAM_BAYER_PAT_GBRG,
             .bit_width = 10,
             .ae_info = {
                 .frame_length = 1199,
@@ -374,19 +374,35 @@ static int ov5647_apply_orient_regs(struct ov5647_ctx *sensor, bool hflip, bool 
         return -1;
     }
 
-    r3820 &= (uint8_t)~OV5647_TIMING_VFLIP_BIT;
-    r3821 &= (uint8_t)~OV5647_TIMING_HMIRROR_BIT;
-
+    /*
+     * Orientation is relative to the sensor mode's known-good register
+     * values.  In particular, the OV5647 1080p mode uses 0x3821 = 0x02
+     * for its normal GBRG output.  Toggle that bit for V4L2 HFLIP instead
+     * of treating a clear bit as the absolute "not mirrored" state.
+     * get_hflip()/get_vflip() use the same XOR-relative convention.
+     */
     if (vflip) {
-        r3820 |= OV5647_TIMING_VFLIP_BIT;
+        r3820 ^= OV5647_TIMING_VFLIP_BIT;
     }
 
     if (hflip) {
-        r3821 |= OV5647_TIMING_HMIRROR_BIT;
+        r3821 ^= OV5647_TIMING_HMIRROR_BIT;
     }
 
     CHECK_ERROR(write_reg(sensor, OV5647_REG_TIMING_CTRL_VFLIP, r3820));
     CHECK_ERROR(write_reg(sensor, OV5647_REG_TIMING_CTRL_HMIRROR, r3821));
+    const char *debug = getenv("VVCAM_SENSOR_DEBUG");
+    if (debug && debug[0] != '\0' && strcmp(debug, "0") != 0) {
+        uint8_t actual_3820 = 0;
+        uint8_t actual_3821 = 0;
+
+        CHECK_ERROR(read_reg(sensor, OV5647_REG_TIMING_CTRL_VFLIP, &actual_3820));
+        CHECK_ERROR(read_reg(sensor, OV5647_REG_TIMING_CTRL_HMIRROR, &actual_3821));
+        fprintf(stderr,
+                "ov5647: orientation hflip=%d vflip=%d "
+                "reg3820=0x%02x reg3821=0x%02x\n",
+                hflip, vflip, actual_3820, actual_3821);
+    }
 
     return 0;
 }
