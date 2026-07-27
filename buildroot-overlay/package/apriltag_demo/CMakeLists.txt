@@ -4,10 +4,22 @@ project(apriltag_demo)
 
 message("CMAKE_TOOLCHAIN_FILE:" ${CMAKE_TOOLCHAIN_FILE})
 
-file(GLOB src CONFIGURE_DEPENDS src/*.cc)
-set(bin apriltag_demo.elf)
+set(common_src
+    src/main.cc
+    src/apriltag_draw.cc
+)
+set(rvv_bin apriltag_demo.elf)
+set(c_bin apriltag_c_demo.elf)
 
-add_executable(${bin} ${src})
+add_executable(${rvv_bin} ${common_src})
+add_executable(${c_bin}
+    ${common_src}
+    src/apriltag_c_adapter.cc
+)
+target_compile_definitions(${c_bin} PRIVATE
+    APRILTAG_C_BACKEND
+    APRILTAG_C_VERSION="3.4.5"
+)
 
 set(CMAKE_C_FLAGS   "${CMAKE_C_FLAGS}   -mcpu=c908v -mabi=lp64d -mtune=c908 -mrvv-v0p10-compatible -mrvv-auto-vectorize")
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -mcpu=c908v -mabi=lp64d -mtune=c908 -mrvv-v0p10-compatible -mrvv-auto-vectorize")
@@ -34,19 +46,22 @@ include_directories(
     ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
 
-target_link_directories(${bin} PRIVATE
-    ${usr_root}/lib
-    ${CMAKE_SYSROOT}
-    ${CMAKE_SYSROOT}/usr/lib64/lp64d
-)
+foreach(bin IN ITEMS ${rvv_bin} ${c_bin})
+    target_link_directories(${bin} PRIVATE
+        ${usr_root}/lib
+        ${CMAKE_SYSROOT}
+        ${CMAKE_SYSROOT}/usr/lib64/lp64d
+    )
+endforeach()
 
 # Prebuilt Rust static library (built in the rvv-dev docker image; see
 # scripts/build_rust_lib.sh). Contains the apriltag_* C ABI + RVV kernels.
 set(APRILTAG_RVV_LIB ${CMAKE_CURRENT_SOURCE_DIR}/lib/libapriltag_rvv.a)
+set(APRILTAG_C_LIB ${usr_root}/lib/libapriltag.a)
 
 # --start-group/--end-group resolves the mutual deps between the OpenCV/K230
 # static libs and the rust-std symbols pulled by libapriltag_rvv.a.
-target_link_libraries(${bin}
+target_link_libraries(${rvv_bin}
     -Wl,--start-group
     ${APRILTAG_RVV_LIB}
     opencv_videoio
@@ -64,11 +79,31 @@ target_link_libraries(${bin}
     -Wl,--end-group
 )
 
+target_link_libraries(${c_bin}
+    -Wl,--start-group
+    ${APRILTAG_C_LIB}
+    opencv_videoio
+    opencv_imgcodecs
+    opencv_imgproc
+    opencv_core
+    v4l2-drm
+    drm
+    display
+    mmz
+    pthread
+    dl
+    m
+    rt
+    -Wl,--end-group
+)
+
 if(CMAKE_TOOLCHAIN_FILE MATCHES "buildroot/toolchainfile.cmake")
-    message(STATUS "Buildroot build -> /root/app/apriltag_demo/")
-    install(TARGETS ${bin} DESTINATION /root/app/apriltag_demo)
+    message(STATUS "Buildroot build -> /root/app/apriltag_demo and apriltag_c_demo")
+    install(TARGETS ${rvv_bin} DESTINATION /root/app/apriltag_demo)
     install(DIRECTORY utils/ DESTINATION /root/app/apriltag_demo USE_SOURCE_PERMISSIONS)
+    install(TARGETS ${c_bin} DESTINATION /root/app/apriltag_c_demo)
+    install(DIRECTORY utils_c/ DESTINATION /root/app/apriltag_c_demo USE_SOURCE_PERMISSIONS)
 else()
     message(STATUS "Standalone build -> ./bin/")
-    install(TARGETS ${bin} DESTINATION bin)
+    install(TARGETS ${rvv_bin} ${c_bin} DESTINATION bin)
 endif()

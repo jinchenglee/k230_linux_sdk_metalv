@@ -38,6 +38,9 @@ popd
 if [ -f out/bin/apriltag_demo.elf ]; then
     cp out/bin/apriltag_demo.elf k230_bin/
 fi
+if [ -f out/bin/apriltag_c_demo.elf ]; then
+    cp out/bin/apriltag_c_demo.elf k230_bin/
+fi
 cp -r utils/* k230_bin/ 2>/dev/null || true
 rm -rf out
-echo "Done: k230_bin/apriltag_demo.elf"
+echo "Done: k230_bin/apriltag_demo.elf and apriltag_c_demo.elf"

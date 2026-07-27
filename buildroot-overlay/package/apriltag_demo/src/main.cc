@@ -22,6 +22,9 @@
 #include "sensor_set.h"
 #include "apriltag.h"
 #include "apriltag_draw.h"
+#ifdef APRILTAG_C_BACKEND
+#include "apriltag_c_adapter.h"
+#endif
 
 using std::cerr;
 using std::cout;
@@ -39,6 +42,12 @@ static std::atomic<int> g_denoise_mode(0);  // 0=off, 1=median3, 2=gaussian3
 static int g_usb_video       = -1;    // /dev/videoX; required before pressing 'u'
 static unsigned g_csi_width  = SENSOR_WIDTH;
 static unsigned g_csi_height = SENSOR_HEIGHT;
+#ifdef APRILTAG_C_BACKEND
+static int g_c_threads = 1;
+static int g_c_bits_corrected = 0;
+static int g_c_refine_edges = 0;
+static double g_c_decode_sharpening = 0.0;
+#endif
 
 #define MAX_DETS 64
 #define MAX_DECODE_CANDIDATES 256
@@ -68,31 +77,55 @@ static const char* denoise_mode_name(int mode)
 static void print_key_help()
 {
     cout << "keys: c=CSI u=USB n=denoise";
+#ifndef APRILTAG_C_BACKEND
     if (g_debug_enabled) {
         cout << " 0=camera 1=gray 2=threshold 3=clusters"
                 " 4=quads 5=detections";
     }
+#endif
     cout << " q=quit" << endl;
 }
 
 static void print_usage(const char* name)
 {
-    cout << "Usage: " << name
-         << " [--rvv] [--factor 1|1.5|2] [--min-blob N]"
-            " [--csi-size WxH] [--usb-video X] [--debug]" << endl
-         << "  --rvv         use RVV kernels (default: scalar)" << endl
-         << "  --factor      decimation factor 1.0/1.5/2.0 (default: 2.0)" << endl
-         << "  --min-blob    minimum blob size (default: 25)" << endl
-         << "  --csi-size    CSI detection stream size (default: "
-         << SENSOR_WIDTH << "x" << SENSOR_HEIGHT << ")" << endl
-         << "  --usb-video   USB camera node number X for /dev/videoX" << endl
-         << "  --debug       enable live pipeline views and decode diagnostics"
-            " (default: off)" << endl
-         << "  c             select CSI camera (default)" << endl
-         << "  u             select configured USB camera" << endl
-         << "  n             cycle luma denoise: off/median3/Gaussian3" << endl
-         << "  0..5          select pipeline view (requires --debug)" << endl
-         << "  q             quit" << endl;
+    cout << "Usage: " << name;
+#ifndef APRILTAG_C_BACKEND
+    cout << " [--rvv]";
+#endif
+    cout << " [--factor 1|1.5|2] [--min-blob N]"
+            " [--csi-size WxH] [--usb-video X] [--debug]" << endl;
+#ifndef APRILTAG_C_BACKEND
+    cout << "  --rvv         use RVV kernels (default: scalar)" << endl;
+#else
+    cout << "  --threads N   C detector worker threads (default: 1)" << endl;
+    cout << "  --bits-corrected N  accepted bit errors, 0..2 (default: 0)"
+         << endl;
+    cout << "  --refine-edges  enable upstream edge refinement" << endl;
+    cout << "  --decode-sharpening X  payload sharpening (default: 0)"
+         << endl;
+    cout << "  --upstream-defaults  use C defaults: blob=5, bits=2,"
+            " refine on, sharpening=0.25" << endl;
+#endif
+    cout << "  --factor      decimation factor 1.0/1.5/2.0 (default: 2.0)"
+         << endl;
+    cout << "  --min-blob    minimum blob size (default: 25)" << endl;
+    cout << "  --csi-size    CSI detection stream size (default: "
+         << SENSOR_WIDTH << "x" << SENSOR_HEIGHT << ")" << endl;
+    cout << "  --usb-video   USB camera node number X for /dev/videoX" << endl;
+#ifndef APRILTAG_C_BACKEND
+    cout << "  --debug       enable live pipeline views and decode diagnostics"
+            " (default: off)" << endl;
+#else
+    cout << "  --debug       dump one set of upstream debug images and enable"
+            " detection logs" << endl;
+#endif
+    cout << "  c             select CSI camera (default)" << endl;
+    cout << "  u             select configured USB camera" << endl;
+    cout << "  n             cycle luma denoise: off/median3/Gaussian3" << endl;
+#ifndef APRILTAG_C_BACKEND
+    cout << "  0..5          select pipeline view (requires --debug)" << endl;
+#endif
+    cout << "  q             quit" << endl;
 }
 
 // Read single keys immediately on a terminal, restoring its settings on exit.
@@ -172,6 +205,16 @@ static void detect_proc(int video_device)
         v4l2_drm_stop(&context);
         return;
     }
+#ifdef APRILTAG_C_BACKEND
+    if (apriltag_c_configure(det, g_c_threads, g_c_bits_corrected,
+                             g_c_refine_edges,
+                             g_c_decode_sharpening) != 0) {
+        cerr << "detect: cannot configure official C detector" << endl;
+        apriltag_free(det);
+        v4l2_drm_stop(&context);
+        return;
+    }
+#endif
     if (apriltag_set_debug_enabled(det, g_debug_enabled ? 1 : 0) != 0) {
         cerr << "detect: cannot configure diagnostics" << endl;
         apriltag_free(det);
@@ -558,9 +601,43 @@ static void parse_args(int argc, char* argv[])
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         if (a == "--rvv") {
+#ifdef APRILTAG_C_BACKEND
+            cerr << "--rvv is only valid for apriltag_demo; "
+                    "apriltag_c_demo uses the upstream C detector" << endl;
+            exit(2);
+#else
             g_mode = 1;
+#endif
         } else if (a == "--debug") {
             g_debug_enabled = true;
+#ifdef APRILTAG_C_BACKEND
+        } else if (a == "--threads" && i + 1 < argc) {
+            g_c_threads = atoi(argv[++i]);
+            if (g_c_threads < 1) {
+                cerr << "--threads must be at least 1" << endl;
+                exit(2);
+            }
+        } else if (a == "--bits-corrected" && i + 1 < argc) {
+            g_c_bits_corrected = atoi(argv[++i]);
+            if (g_c_bits_corrected < 0 || g_c_bits_corrected > 2) {
+                cerr << "--bits-corrected must be 0, 1, or 2" << endl;
+                exit(2);
+            }
+        } else if (a == "--refine-edges") {
+            g_c_refine_edges = 1;
+        } else if (a == "--decode-sharpening" && i + 1 < argc) {
+            char* end = nullptr;
+            g_c_decode_sharpening = strtod(argv[++i], &end);
+            if (!end || *end != '\0') {
+                cerr << "--decode-sharpening must be numeric" << endl;
+                exit(2);
+            }
+        } else if (a == "--upstream-defaults") {
+            g_min_blob = 5;
+            g_c_bits_corrected = 2;
+            g_c_refine_edges = 1;
+            g_c_decode_sharpening = 0.25;
+#endif
         } else if (a == "--factor" && i + 1 < argc) {
             std::string f = argv[++i];
             if (f == "1" || f == "1.0")      { g_factor_int = 0; g_decimate_scale = 1.0; }
@@ -600,9 +677,22 @@ static void parse_args(int argc, char* argv[])
 
 int main(int argc, char* argv[])
 {
+#ifdef APRILTAG_C_BACKEND
+    cout << "apriltag_c_demo (AprilTag C " APRILTAG_C_VERSION
+            ") built at " << __DATE__ << " " << __TIME__ << endl;
+#else
     cout << "apriltag_demo built at " << __DATE__ << " " << __TIME__ << endl;
+#endif
     parse_args(argc, argv);
+#ifdef APRILTAG_C_BACKEND
+    cout << "backend=official-c"
+         << " threads=" << g_c_threads
+         << " bits_corrected=" << g_c_bits_corrected
+         << " refine_edges=" << (g_c_refine_edges ? "on" : "off")
+         << " decode_sharpening=" << g_c_decode_sharpening
+#else
     cout << "mode=" << (g_mode ? "rvv" : "scalar")
+#endif
          << " factor=" << g_decimate_scale
          << " min_blob=" << g_min_blob
          << " debug=" << (g_debug_enabled ? "on" : "off")
@@ -648,6 +738,10 @@ int main(int argc, char* argv[])
             detect_stop.store(true);
             break;
         } else if (key >= '0' && key <= '5') {
+#ifdef APRILTAG_C_BACKEND
+            cerr << "\nlive pipeline views are available in apriltag_demo; "
+                    "use --debug to dump one set of upstream C images" << endl;
+#else
             if (!g_debug_enabled) {
                 cerr << "\npipeline views are disabled; restart with --debug"
                      << endl;
@@ -657,6 +751,7 @@ int main(int argc, char* argv[])
                 cout << "\nview " << stage << ": "
                      << apriltag_debug_stage_name(stage) << endl;
             }
+#endif
         } else if (key == 'c' || key == 'C') {
             g_input_source.store(0);
             cout << "\ninput: CSI camera" << endl;
