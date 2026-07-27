@@ -38,6 +38,7 @@ static std::mutex result_mutex;
 static std::vector<apriltag_det_t> detections;
 std::atomic<bool> detect_stop(false);
 std::atomic<bool> display_stop(false);
+std::atomic<bool> dump_request(false);  // set on 'q' to dump the current frame
 static volatile unsigned detect_frame_count = 0;
 
 static struct timeval tv, tv2;
@@ -99,9 +100,54 @@ static void detect_proc(int video_device)
         // NV12 buffer: Y-plane first, stride == width (ISP output, 1280 aligned).
         const uint8_t* y =
             (const uint8_t*)context.buffers[context.vbuffer.index].mmap;
+
+        // Dump the exact grayscale we feed detect() (packed width*height,
+        // stride-corrected) when requested — triggered by pressing 'q' so the
+        // tag is framed. Set APRILTAG_DEMO_DUMP=path to enable.
+        if (dump_request.load()) {
+            const char* dump_path = getenv("APRILTAG_DEMO_DUMP");
+            if (dump_path) {
+                FILE* f = fopen(dump_path, "wb");
+                if (f) {
+                    for (unsigned r = 0; r < context.height; ++r) {
+                        fwrite(y + (size_t)r * context.width, 1, context.width, f);
+                    }
+                    fclose(f);
+                    fprintf(stderr, "\n[dump] wrote %ux%u Y-plane (%u bytes) to %s\n",
+                            context.width, context.height,
+                            context.width * context.height, dump_path);
+                }
+            }
+            dump_request.store(false);
+        }
         int n = apriltag_detect(det, y, context.width, context.height,
                                 context.width, g_factor_int, g_mode,
                                 out.data(), MAX_DETS);
+
+        // ── Diagnostics (throttled ~1/s): distinguish panic (-1) from
+        //    "no detections" (0) from "detected but not drawn" (>0). ──
+        {
+            static struct timeval dtv = {0, 0};
+            static int frames = 0, max_n = 0, panics = 0;
+            struct timeval now; gettimeofday(&now, NULL);
+            if (dtv.tv_sec == 0) dtv = now;
+            frames++;
+            if (n < 0) panics++;
+            if (n > max_n) max_n = n;
+            uint64_t us = 1000000ULL * (now.tv_sec - dtv.tv_sec) + now.tv_usec - dtv.tv_usec;
+            if (us >= 1000000) {
+                fprintf(stderr, "\n[detect] frames=%d max_dets=%d panics=%d last_n=%d",
+                        frames, max_n, panics, n);
+                if (n > 0) {
+                    fprintf(stderr, "  det0: id=%llu m=%.1f center=(%.0f,%.0f) c0=(%.0f,%.0f)",
+                            (unsigned long long)out[0].id, out[0].margin,
+                            out[0].center[0], out[0].center[1],
+                            out[0].corners[0], out[0].corners[1]);
+                }
+                fprintf(stderr, "\n");
+                dtv = now; frames = 0; max_n = 0; panics = 0;
+            }
+        }
 
         result_mutex.lock();
         detections.clear();
@@ -281,6 +327,14 @@ int main(int argc, char* argv[])
     while (true) {
         std::getline(std::cin, input);
         if (input == "q") {
+            // If dumping is enabled, capture the currently-framed frame before
+            // tearing down (wait up to ~1s for the detect thread to write it).
+            if (getenv("APRILTAG_DEMO_DUMP")) {
+                dump_request.store(true);
+                for (int i = 0; i < 20 && dump_request.load(); ++i) {
+                    usleep(50000);
+                }
+            }
             display_stop.store(true);
             usleep(100000);
             detect_stop.store(true);
