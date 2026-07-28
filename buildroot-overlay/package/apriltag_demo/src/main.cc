@@ -16,6 +16,7 @@
 #include <thread>
 #include <string>
 #include <cstring>
+#include <pthread.h>
 #include <termios.h>
 #include <sys/ioctl.h>
 
@@ -39,6 +40,10 @@ static bool g_debug_enabled  = false;
 static std::atomic<int> g_debug_stage(0);
 static std::atomic<int> g_input_source(0); // 0=CSI, 1=USB
 static std::atomic<int> g_denoise_mode(0);  // 0=off, 1=median3, 2=gaussian3
+// Incremented only after draw_frame contains a complete new overlay. The DRM
+// thread uses this to avoid copying the same full-screen ARGB image again on
+// every camera/display event.
+static std::atomic<uint64_t> g_overlay_generation(0);
 static int g_usb_video       = -1;    // /dev/videoX; required before pressing 'u'
 static unsigned g_csi_width  = SENSOR_WIDTH;
 static unsigned g_csi_height = SENSOR_HEIGHT;
@@ -160,6 +165,8 @@ private:
 // same detector and paints the BGR frame opaquely on the OSD.
 static void detect_proc(int video_device)
 {
+    pthread_setname_np(pthread_self(), "apriltag-detect");
+
     struct v4l2_drm_context context;
     #define DETECT_BUFFER_NUM 3
 
@@ -198,6 +205,15 @@ static void detect_proc(int video_device)
     fprintf(stderr,
             "[input] CSI requested %ux%u, negotiated %zux%zu stride=%zu\n",
             g_csi_width, g_csi_height, csi_width, csi_height, csi_stride);
+    struct v4l2_streamparm csi_parm = {};
+    csi_parm.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    if (ioctl(context.video_fd, VIDIOC_G_PARM, &csi_parm) == 0 &&
+        csi_parm.parm.capture.timeperframe.numerator != 0) {
+        const auto& tpf = csi_parm.parm.capture.timeperframe;
+        fprintf(stderr, "[input] CSI detection interval=%u/%u s (%.2f fps)\n",
+                tpf.numerator, tpf.denominator,
+                static_cast<double>(tpf.denominator) / tpf.numerator);
+    }
 
     void* det = apriltag_new(g_min_blob);
     if (!det) {
@@ -253,6 +269,11 @@ static void detect_proc(int video_device)
                 continue;
             }
             csi_frame_held = true;
+            // detect() is synchronous and reads this mmap directly, so this
+            // V4L2 buffer remains dequeued through all pipeline stages. A
+            // future split Stage-0 API should decimate Y into detector-owned
+            // storage here and requeue immediately; that preserves zero-extra-
+            // copy factor-2 processing without capture-queue back-pressure.
             gray = (const uint8_t*)context.buffers[context.vbuffer.index].mmap;
             frame_width = csi_width;
             frame_height = csi_height;
@@ -468,6 +489,7 @@ static void detect_proc(int video_device)
                             0.75, cv::Scalar(0, 255, 255, 255), 2);
             }
         }
+        g_overlay_generation.fetch_add(1, std::memory_order_release);
         result_mutex.unlock();
 
         detect_frame_count += 1;
@@ -482,7 +504,9 @@ static void detect_proc(int video_device)
 }
 
 // ── DRM display heartbeat (per displayed frame) ─────────────────────────────
-// Copies the annotated OSD into the display buffer. Cloned from face_detect.
+// Copies a newly produced overlay into the DRM buffer once. Camera and DRM
+// events can arrive faster than detection, so copying on every callback wastes
+// substantial memory bandwidth on an unchanged 1920x1080x4 image.
 int frame_handler(struct v4l2_drm_context* context, bool displayed)
 {
     static bool first_frame = true;
@@ -495,29 +519,31 @@ int frame_handler(struct v4l2_drm_context* context, bool displayed)
     response += 1;
     if (displayed) {
         if (context[0].buffer_hold[context[0].wp] >= 0) {
-            static struct display_buffer* last_drawed_buffer = nullptr;
-            auto buffer =
-                context[0].display_buffers[context[0].buffer_hold[context[0].wp]];
-            if (buffer != last_drawed_buffer) {
+            static uint64_t displayed_overlay_generation = UINT64_MAX;
+            uint64_t generation =
+                g_overlay_generation.load(std::memory_order_acquire);
+            if (generation != displayed_overlay_generation) {
                 if (draw_buffer->width > draw_buffer->height) {
-                    // Landscape.
-                    cv::Mat temp_img(draw_buffer->height, draw_buffer->width, CV_8UC4);
-                    temp_img.setTo(cv::Scalar(0, 0, 0, 0));
+                    // Landscape dimensions already match. Copy directly while
+                    // holding the producer mutex; the old temp Mat added a
+                    // second full-frame copy plus a full-frame clear.
                     result_mutex.lock();
-                    draw_frame.copyTo(temp_img);
+                    memcpy(draw_buffer->map, draw_frame.data, draw_buffer->size);
+                    displayed_overlay_generation =
+                        g_overlay_generation.load(std::memory_order_relaxed);
                     result_mutex.unlock();
-                    memcpy(draw_buffer->map, temp_img.data, draw_buffer->size);
                 } else {
                     // Portrait (e.g. ST7701): draw landscape, then rotate.
                     cv::Mat temp_img(draw_buffer->width, draw_buffer->height, CV_8UC4);
                     temp_img.setTo(cv::Scalar(0, 0, 0, 0));
                     result_mutex.lock();
                     draw_frame.copyTo(temp_img);
+                    displayed_overlay_generation =
+                        g_overlay_generation.load(std::memory_order_relaxed);
                     result_mutex.unlock();
                     cv::rotate(temp_img, temp_img, cv::ROTATE_90_CLOCKWISE);
                     memcpy(draw_buffer->map, temp_img.data, draw_buffer->size);
                 }
-                last_drawed_buffer = buffer;
                 thead_csi_dcache_clean_invalid_range(draw_buffer->map, draw_buffer->size);
                 display_update_buffer(draw_buffer, 0, 0);
             }
@@ -553,6 +579,8 @@ int frame_handler(struct v4l2_drm_context* context, bool displayed)
 // ── Display thread ──────────────────────────────────────────────────────────
 void display_proc(int video_device)
 {
+    pthread_setname_np(pthread_self(), "apriltag-disp");
+
     struct v4l2_drm_context context;
     v4l2_drm_default_context(&context);
     context.device = video_device;
@@ -574,6 +602,15 @@ void display_proc(int video_device)
     if (v4l2_drm_setup(&context, 1, &display)) {
         cerr << "display: v4l2_drm_setup error" << endl;
         return;
+    }
+    struct v4l2_streamparm display_parm = {};
+    display_parm.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    if (ioctl(context.video_fd, VIDIOC_G_PARM, &display_parm) == 0 &&
+        display_parm.parm.capture.timeperframe.numerator != 0) {
+        const auto& tpf = display_parm.parm.capture.timeperframe;
+        fprintf(stderr, "[input] CSI display interval=%u/%u s (%.2f fps)\n",
+                tpf.numerator, tpf.denominator,
+                static_cast<double>(tpf.denominator) / tpf.numerator);
     }
 
     struct display_plane* plane = display_get_plane(display, DRM_FORMAT_ARGB8888);
@@ -708,6 +745,8 @@ int main(int argc, char* argv[])
         cerr << "display_init error, exit" << endl;
         return -1;
     }
+    fprintf(stderr, "[display] selected mode %ux%u@%u\n",
+            display->width, display->height, display->mode.vrefresh);
 
     // Hold until the first displayed frame unlocks detect_proc.
     result_mutex.lock();

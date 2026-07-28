@@ -27,7 +27,14 @@ if [ -z "${APRILTAG_RVV_DIR:-}" ]; then
     fi
 fi
 RVV_DOCKER_IMAGE="${RVV_DOCKER_IMAGE:-rvv-dev:latest}"
-RVV_ARG="${1:-}"
+RVV_ARGS=("$@")
+for arg in "${RVV_ARGS[@]}"; do
+    case "$arg" in
+        --no-rvv) ;;
+        *) echo "error: unknown Rust build argument: $arg" >&2; exit 2 ;;
+    esac
+done
+RVV_ARG_STRING="${RVV_ARGS[*]}"
 
 if [ ! -d "$APRILTAG_RVV_DIR" ]; then
     echo "error: apriltag-rvv not found at $APRILTAG_RVV_DIR" >&2
@@ -48,7 +55,7 @@ docker run --rm \
     bash -lc "
         set -e
         rustup target add riscv64gc-unknown-linux-gnu >/dev/null 2>&1 || true
-        bash scripts/build-capi.sh ${RVV_ARG}
+        bash scripts/build-capi.sh ${RVV_ARG_STRING}
         chown -R ${UID_HOST}:${GID_HOST} target
     "
 

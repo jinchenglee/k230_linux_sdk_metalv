@@ -98,11 +98,12 @@ target_link_libraries(${c_bin}
 )
 
 if(CMAKE_TOOLCHAIN_FILE MATCHES "buildroot/toolchainfile.cmake")
-    message(STATUS "Buildroot build -> /root/app/apriltag_demo and apriltag_c_demo")
+    message(STATUS "Buildroot build -> /root/app/apriltag_demo, apriltag_c_demo, and apriltag_profile")
     install(TARGETS ${rvv_bin} DESTINATION /root/app/apriltag_demo)
     install(DIRECTORY utils/ DESTINATION /root/app/apriltag_demo USE_SOURCE_PERMISSIONS)
     install(TARGETS ${c_bin} DESTINATION /root/app/apriltag_c_demo)
     install(DIRECTORY utils_c/ DESTINATION /root/app/apriltag_c_demo USE_SOURCE_PERMISSIONS)
+    install(DIRECTORY utils_profile/ DESTINATION /root/app/apriltag_profile USE_SOURCE_PERMISSIONS)
 else()
     message(STATUS "Standalone build -> ./bin/")
     install(TARGETS ${rvv_bin} ${c_bin} DESTINATION bin)

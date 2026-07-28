@@ -1,17 +1,26 @@
 config BR2_PACKAGE_APRILTAG_DEMO
     bool "apriltag live demo"
     depends on BR2_TOOLCHAIN_HAS_THREADS
+    depends on BR2_TOOLCHAIN_HAS_SYNC_4
+    depends on !BR2_STATIC_LIBS
+    depends on BR2_USE_WCHAR
     select BR2_PACKAGE_DISPLAY
     select BR2_PACKAGE_OPENCV4
     select BR2_PACKAGE_LIBMMZ
     select BR2_PACKAGE_VVCAM
     select BR2_PACKAGE_APRILTAG
+    select BR2_PACKAGE_LINUX_TOOLS_PERF
+    select BR2_PACKAGE_BINUTILS
+    select BR2_PACKAGE_BINUTILS_TARGET
     help
         Two live on-device AprilTag applications with identical camera,
         grayscale preprocessing, and DRM display paths:
 
         - apriltag_demo: the apriltag-rvv Rust detector
         - apriltag_c_demo: the official AprilRobotics C detector
+
+        Target perf, objdump, and comparison/annotation scripts are installed
+        alongside the applications for on-device profiling.
 
         The Rust static library must be built first in the rvv-dev docker
         image (package scripts/build_rust_lib.sh).
