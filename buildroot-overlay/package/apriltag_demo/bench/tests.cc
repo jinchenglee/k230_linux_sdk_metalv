@@ -4,11 +4,18 @@
 #include <climits>
 #include <cstdio>
 #include <fstream>
+#include <filesystem>
 #include <iostream>
 #include <memory>
 #include <sstream>
 #include <string>
 #include <vector>
+
+#include <unistd.h>
+
+#ifndef APRILTAG_BENCH_NO_OPENCV
+#include <opencv2/imgcodecs.hpp>
+#endif
 
 using namespace apriltag_bench;
 
@@ -19,6 +26,36 @@ using namespace apriltag_bench;
 namespace {
 
 int failures = 0;
+
+class TemporaryDirectory {
+public:
+    TemporaryDirectory()
+    {
+        const std::filesystem::path base =
+            std::filesystem::temp_directory_path() /
+            ("apriltag-bench-visual-test-" + std::to_string(getpid()) + "-");
+        for (std::uintmax_t counter = 0;; ++counter) {
+            path_ = base.string() + std::to_string(counter);
+            std::error_code error;
+            if (std::filesystem::create_directory(path_, error)) return;
+            if (error) {
+                throw std::filesystem::filesystem_error(
+                    "cannot create temporary test directory", path_, error);
+            }
+        }
+    }
+
+    ~TemporaryDirectory()
+    {
+        std::error_code error;
+        std::filesystem::remove_all(path_, error);
+    }
+
+    const std::filesystem::path& path() const { return path_; }
+
+private:
+    std::filesystem::path path_;
+};
 
 #define CHECK(condition)                                                       \
     do {                                                                       \
@@ -51,6 +88,13 @@ void test_parser()
     CHECK(defaults.size.native);
     CHECK(defaults.backends.size() == 3);
     CHECK(defaults.factor == 2 && defaults.factor_value == 2.0);
+    CHECK(defaults.dump_dir.empty());
+
+    CHECK(parse({"bench", "--dump-dir", "output"}).dump_dir == "output");
+    CHECK(parse({"bench", "--dump-dir", "first", "--no-dump"})
+              .dump_dir.empty());
+    CHECK(parse({"bench", "--no-dump", "--dump-dir", "last"}).dump_dir ==
+          "last");
 
     CHECK(parse({"bench", "--input", "x.jpg"}).size.native);
     const auto sized = parse({"bench", "--input", "x.jpg", "--size",
@@ -80,6 +124,7 @@ void test_parser()
     expect_parse_error({"bench", "--min-blob", "2147483648"});
     expect_parse_error({"bench", "--unknown"});
     expect_parse_error({"bench", "--input"});
+    expect_parse_error({"bench", "--dump-dir"});
     expect_parse_error({"bench", "extra"});
     expect_parse_error({"bench", "--format", "raw", "--size", "native"});
 }
@@ -209,19 +254,39 @@ void test_detection_count_limit()
     CHECK(threw);
 }
 
+struct FakeBackendState {
+    int captured_calls = 0;
+    std::vector<bool> capture_changes;
+};
+
 class FakeBackend final : public Backend {
 public:
     explicit FakeBackend(BackendKind kind, bool unstable = false,
-                          std::uint64_t checksum = 1234, int fail_call = 0)
+                           std::uint64_t checksum = 1234, int fail_call = 0,
+                           std::shared_ptr<FakeBackendState> state = {})
         : kind_(kind), unstable_(unstable), checksum_(checksum),
-          fail_call_(fail_call) {}
+          fail_call_(fail_call), state_(std::move(state)) {}
     BackendKind kind() const override { return kind_; }
     const char* name() const override { return backend_name(kind_); }
+    void set_capture_detections(bool capture) override
+    {
+        capture_ = capture;
+        if (state_) state_->capture_changes.push_back(capture);
+    }
     DetectionResult detect(const PreparedImage&) override
     {
         ++calls_;
         if (calls_ == fail_call_) throw std::runtime_error("detect failed");
+        if (capture_) {
+            detections_ = {sample_detection()};
+            detections_[0].id = static_cast<std::uint64_t>(calls_);
+            if (state_) ++state_->captured_calls;
+        }
         return {2, unstable_ ? static_cast<std::uint64_t>(calls_) : checksum_};
+    }
+    const std::vector<Detection>& detections() const override
+    {
+        return detections_;
     }
 private:
     BackendKind kind_;
@@ -229,7 +294,84 @@ private:
     std::uint64_t checksum_;
     int fail_call_;
     int calls_ = 0;
+    bool capture_ = false;
+    std::shared_ptr<FakeBackendState> state_;
+    std::vector<Detection> detections_;
 };
+
+void test_latest_detections()
+{
+    auto state = std::make_shared<FakeBackendState>();
+    FakeBackend backend(BackendKind::RustRvv, false, 1234, 0, state);
+    PreparedImage image{1, 1, 1, {0}};
+    (void)backend.detect(image);
+    CHECK(backend.detections().empty());
+    backend.set_capture_detections(true);
+    (void)backend.detect(image);
+    CHECK(backend.detections().size() == 1);
+    CHECK(backend.detections()[0].id == 2);
+    backend.set_capture_detections(false);
+    (void)backend.detect(image);
+    CHECK(backend.detections()[0].id == 2);
+    CHECK(state->captured_calls == 1);
+}
+
+#ifndef APRILTAG_BENCH_NO_OPENCV
+void test_visual_dumps()
+{
+    TemporaryDirectory temporary_directory;
+    const std::string directory = temporary_directory.path().string();
+    const std::string empty_directory = directory + "/empty";
+    const std::string failed_path = directory + "/not-a-directory";
+    const std::string failed_write_directory = directory + "/write-failure";
+
+    PreparedImage image{160, 100, 160,
+                        std::vector<std::uint8_t>(16000, 80)};
+    Detection detection = sample_detection();
+    detection.center[0] = 80;
+    detection.center[1] = 55;
+    const double corners[] = {40, 30, 120, 30, 120, 80, 40, 80};
+    std::copy(std::begin(corners), std::end(corners), detection.corners);
+    write_visual_dumps(directory, image,
+                       {{BackendKind::RustRvv, {detection}}});
+
+    const cv::Mat input = cv::imread(directory + "/input.png",
+                                     cv::IMREAD_UNCHANGED);
+    const cv::Mat overlay = cv::imread(
+        directory + "/rust-rvv-detections.png", cv::IMREAD_UNCHANGED);
+    CHECK(input.rows == 100 && input.cols == 160 && input.channels() == 1);
+    CHECK(overlay.rows == 100 && overlay.cols == 160 && overlay.channels() == 3);
+    CHECK(cv::countNonZero(overlay.reshape(1) != 80) > 0);
+
+    write_visual_dumps(empty_directory, image,
+                       {{BackendKind::CReference, {}}});
+    const cv::Mat empty = cv::imread(
+        empty_directory + "/c-reference-detections.png",
+        cv::IMREAD_UNCHANGED);
+    CHECK(empty.rows == 100 && empty.cols == 160 && empty.channels() == 3);
+    CHECK(cv::countNonZero(empty(cv::Rect(0, 24, 150, 45)).reshape(1) != 80) >
+          0);
+
+    {
+        std::ofstream file(failed_path);
+        file << "file";
+    }
+    bool threw = false;
+    try {
+        write_visual_dumps(failed_path, image,
+                           {{BackendKind::RustScalar, {}}});
+    } catch (const std::runtime_error&) { threw = true; }
+    CHECK(threw);
+
+    std::filesystem::create_directories(failed_write_directory + "/input.png");
+    threw = false;
+    try {
+        write_visual_dumps(failed_write_directory, image,
+                           {{BackendKind::RustScalar, {}}});
+    } catch (const std::runtime_error&) { threw = true; }
+    CHECK(threw);
+}
+#endif
 
 void test_schedule_and_stability()
 {
@@ -244,10 +386,14 @@ void test_schedule_and_stability()
     config.batches = 2;
     PreparedImage image{1, 1, 1, {0}};
     std::vector<std::unique_ptr<Backend>> stable;
-    stable.emplace_back(new FakeBackend(BackendKind::RustRvv));
+    auto capture_state = std::make_shared<FakeBackendState>();
+    stable.emplace_back(new FakeBackend(BackendKind::RustRvv, false, 1234, 0,
+                                        capture_state));
     stable.emplace_back(new FakeBackend(BackendKind::CReference));
     std::ostringstream output;
     CHECK(run_benchmark(config, std::move(stable), image, output) == 0);
+    CHECK(capture_state->captured_calls == 1);
+    CHECK(capture_state->capture_changes == std::vector<bool>({true, false}));
     CHECK(output.str().find("RESULT backend=rust-rvv") != std::string::npos);
     CHECK(output.str().find("RESULT backend=c-reference") != std::string::npos);
     CHECK(output.str().find(std::string("Build       : ") +
@@ -345,9 +491,15 @@ void test_persistent_backends()
                                    BackendKind::CReference}) {
         std::unique_ptr<Backend> backend = kind == BackendKind::CReference
             ? make_c_backend(config) : make_rust_backend(config, kind);
+        backend->set_capture_detections(true);
         const DetectionResult first = backend->detect(image);
         const DetectionResult second = backend->detect(image);
         CHECK(first.count >= 0);
+        CHECK(backend->detections().size() ==
+              static_cast<std::size_t>(second.count));
+        CHECK(checksum_detections(backend->detections().data(),
+                                  backend->detections().size()) ==
+              second.checksum);
         CHECK(first.count == second.count);
         CHECK(first.checksum == second.checksum);
     }
@@ -362,6 +514,10 @@ int main()
     test_raw_and_geometry();
     test_statistics_and_checksums();
     test_detection_count_limit();
+    test_latest_detections();
+#ifndef APRILTAG_BENCH_NO_OPENCV
+    test_visual_dumps();
+#endif
     test_schedule_and_stability();
 #ifdef APRILTAG_BENCH_BACKEND_TESTS
     test_jpeg_preparation();

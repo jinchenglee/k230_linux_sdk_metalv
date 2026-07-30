@@ -276,6 +276,48 @@ RESULT backend=rust-rvv calls=1000 min_ms=18.21 median_ms=18.37 mean_ms=18.39 p9
 RESULT backend=c-reference calls=1000 min_ms=31.42 median_ms=31.70 mean_ms=31.76 p95_ms=32.20 max_ms=32.83 stddev_ms=0.31 mean_fps=31.49 median_fps=31.55 detections=8 checksum=a7c2...
 ```
 
+## 9.1 Visual Validation Dumps
+
+The benchmark can write one visual validation image per selected backend from
+the untimed validation call:
+
+```text
+<dump-dir>/input.png
+<dump-dir>/rust-rvv-detections.png
+<dump-dir>/rust-scalar-detections.png
+<dump-dir>/c-reference-detections.png
+```
+
+Every backend image uses the identical prepared grayscale input and overlays:
+
+- color-coded quadrilateral edges;
+- a center marker;
+- tag ID and decision margin;
+- backend name; and
+- detection count.
+
+An image with no detections is still written and labeled `No detections`.
+These files are generated after validation and before warmup. Color conversion,
+drawing, text rendering, and image encoding are outside every timed detector
+invocation.
+
+Runtime controls:
+
+```text
+--dump-dir PATH       write input and backend overlay images
+--no-dump             disable visual dumps
+```
+
+The executable does not dump unless `--dump-dir` is supplied. The packaged
+wrapper enables dumps by default under its timestamped result directory:
+
+```text
+results/<timestamp>/images/
+```
+
+Failure to create the requested directory or write any requested image aborts
+before measurement so a run cannot silently omit its validation artifacts.
+
 ## 10. Runtime Interface
 
 ```text
@@ -290,6 +332,8 @@ k230_apriltag_bench [options]
 --warmup N            untimed calls per backend
 --iterations N        calls per measured batch
 --batches N           measured batches
+--dump-dir PATH       write visual validation images
+--no-dump             disable visual validation images
 --help                 print usage
 ```
 
@@ -364,6 +408,89 @@ then rebuilt with the generated RISC-V static archive.
 The wrapper accepts additional benchmark arguments and permits replacing the
 input path. It does not hide benchmark failures.
 
+## 13.1 Detector-Only Profiling Suite
+
+The packaged benchmark includes a one-command profiler:
+
+```text
+/root/app/apriltag_bench/profile_detector.sh
+```
+
+It accepts two modes followed by normal benchmark input/configuration options:
+
+```sh
+./profile_detector.sh fast [benchmark options]
+./profile_detector.sh full [benchmark options]
+```
+
+The target Linux configuration exposes one application CPU, so the profiler
+does not require or attempt CPU affinity control. It records online CPUs and
+frequency/governor state for reproducibility.
+
+### Fast mode
+
+- runs one all-backend benchmark comparison with visual dumps;
+- runs Rust RVV, Rust scalar, and C reference separately under `perf stat`;
+- records one flat sampled profile per backend;
+- generates top-symbol reports; and
+- writes a consolidated summary.
+
+### Full mode
+
+Includes fast mode plus:
+
+- repeated `perf stat` runs;
+- frame-pointer callgraph profiles and caller/children reports;
+- Rust coarse-stage annotation reports;
+- available C detector annotation reports; and
+- a more detailed consolidated stage summary.
+
+The profiler probes event support before measurement. Unsupported events are
+removed with warnings. Sampling prefers `cycles:u` and falls back to
+`cpu-clock` if hardware sampling is unavailable. The chosen event and all
+omissions are recorded.
+
+Default Rust annotation targets are:
+
+```text
+apriltag_rvv::pipeline::detect
+apriltag_rvv::pipeline::ccl_and_boundary_extract
+apriltag_rvv::pipeline::filter_and_sort_clusters_impl
+apriltag_rvv::pipeline::sort_by_angle
+apriltag_rvv::pipeline::compute_errors_into
+apriltag_rvv::pipeline::precompute_peak_pair_stats
+apriltag_rvv::pipeline::search_peak_quad
+apriltag_rvv::pipeline::fit_quad_from_cluster_with_scratch
+apriltag_rvv::pipeline::decode_quad_detailed
+apriltag_rvv::pipeline::deduplicate_detections
+```
+
+Each backend runs in a separate single-threaded process. Repeated profiling
+runs disable image dumps after the initial visual validation comparison.
+
+Output is stored under a timestamped directory containing environment data,
+comparison logs, images, per-backend stat/data/report files, optional
+callgraphs and annotations, and `summary.txt`. An explicit
+`APRILTAG_PROFILE_OUTPUT` is an output root: each invocation creates a unique
+`run-<timestamp>-<pid>` child and never deletes existing content.
+
+Environment controls:
+
+```text
+APRILTAG_PROFILE_EVENTS
+APRILTAG_PROFILE_REPEATS
+APRILTAG_PROFILE_FREQUENCY
+APRILTAG_PROFILE_OUTPUT
+APRILTAG_PROFILE_WARMUP
+APRILTAG_PROFILE_ITERATIONS
+APRILTAG_PROFILE_BATCHES
+```
+
+The consolidated summary reports internal mean/median latency, supported
+cycles and instructions per call, IPC when valid, top symbols, approximate
+milliseconds per sampled symbol, Rust RVV versus scalar improvement, and Rust
+RVV versus C gap. Approximate sampled stage times are labeled as estimates.
+
 ## 14. Error Handling
 
 - Input loading or decode failure exits before detector construction.
@@ -389,6 +516,7 @@ Host/build verification:
 - checksum stability tests;
 - backend configuration tests;
 - a short benchmark smoke run for all backends;
+- visual dump tests for overlays, no-detection labels, and write failures;
 - Buildroot cross-build of benchmark and both existing demos;
 - ELF architecture and symbol checks; and
 - `git diff --check` in both repositories.
@@ -401,6 +529,7 @@ On-device verification:
 - representative 640x360, 1280x720, and 1920x1080 runs complete;
 - Rust RVV, Rust scalar, and C reference all complete;
 - live batch rows and final tables remain readable;
+- input and backend overlay images are written before measurement;
 - `RESULT` lines parse with `grep '^RESULT '`;
 - `perf stat` records counters for each backend;
 - repeated runs at idle produce bounded variance; and

@@ -208,6 +208,10 @@ BenchmarkConfig parse_args(int argc, const char* const argv[])
         } else if (option == "--batches") {
             config.batches = parse_integer<int>(
                 require_value(argc, argv, i), "--batches", 1);
+        } else if (option == "--dump-dir") {
+            config.dump_dir = require_value(argc, argv, i);
+        } else if (option == "--no-dump") {
+            config.dump_dir.clear();
         } else if (option == "--help" || option == "-h") {
             config.help = true;
             return config;
@@ -433,8 +437,20 @@ int run_benchmark(const BenchmarkConfig& config,
     std::vector<std::vector<double>> batch_means(
         static_cast<std::size_t>(config.batches),
         std::vector<double>(backends.size()));
+    for (const auto& backend : backends) backend->set_capture_detections(true);
     for (std::size_t i = 0; i < backends.size(); ++i) {
         expected[i] = detect_with_context(*backends[i], image, "validation call 1");
+    }
+    for (const auto& backend : backends) backend->set_capture_detections(false);
+    if (!config.dump_dir.empty()) {
+        std::vector<VisualDump> dumps;
+        dumps.reserve(backends.size());
+        for (const auto& backend : backends) {
+            dumps.push_back({backend->kind(), backend->detections()});
+        }
+        write_visual_dumps(config.dump_dir, image, dumps);
+    }
+    for (std::size_t i = 0; i < backends.size(); ++i) {
         out << "Warming up " << backends[i]->name() << " ... " << std::flush;
         for (int call = 0; call < config.warmup; ++call) {
             const DetectionResult result = detect_with_context(
@@ -610,6 +626,8 @@ void print_usage(std::ostream& out, const char* program)
         << "  --warmup N            untimed calls per backend\n"
         << "  --iterations N        calls per measured batch\n"
         << "  --batches N           measured batches\n"
+        << "  --dump-dir PATH       write visual validation images\n"
+        << "  --no-dump             disable visual validation images\n"
         << "  --help                 print this help\n";
 }
 

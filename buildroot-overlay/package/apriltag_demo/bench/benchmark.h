@@ -39,6 +39,7 @@ struct BenchmarkConfig {
     int warmup = 10;
     int iterations = 100;
     int batches = 10;
+    std::string dump_dir;
     bool help = false;
 };
 
@@ -59,6 +60,11 @@ struct Detection {
 struct DetectionResult {
     int count = 0;
     std::uint64_t checksum = 0;
+};
+
+struct VisualDump {
+    BackendKind kind;
+    std::vector<Detection> detections;
 };
 
 struct Statistics {
@@ -99,7 +105,9 @@ public:
     virtual ~Backend() = default;
     virtual BackendKind kind() const = 0;
     virtual const char* name() const = 0;
+    virtual void set_capture_detections(bool capture) = 0;
     virtual DetectionResult detect(const PreparedImage& image) = 0;
+    virtual const std::vector<Detection>& detections() const = 0;
 };
 
 BenchmarkConfig parse_args(int argc, const char* const argv[]);
@@ -125,6 +133,17 @@ int benchmark_main(int argc, const char* const argv[], std::ostream& out,
 void print_usage(std::ostream& out, const char* program);
 const char* backend_key(BackendKind kind);
 const char* backend_name(BackendKind kind);
+void write_visual_dumps(const std::string& directory,
+                        const PreparedImage& image,
+                        const std::vector<VisualDump>& dumps);
+
+#ifdef APRILTAG_BENCH_NO_OPENCV
+inline void write_visual_dumps(const std::string&, const PreparedImage&,
+                               const std::vector<VisualDump>&)
+{
+    throw std::runtime_error("visual dumps are unavailable in this build");
+}
+#endif
 
 }  // namespace apriltag_bench
 

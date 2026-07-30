@@ -24,15 +24,18 @@ add_executable(${c_bin}
 add_executable(${bench_bin}
     bench/main.cc
     bench/benchmark.cc
+    bench/visual_dump.cc
     bench/rust_backend.cc
     bench/c_backend.cc
 )
 add_executable(${bench_test_bin}
     bench/tests.cc
     bench/benchmark.cc
+    bench/visual_dump.cc
     bench/rust_backend.cc
     bench/c_backend.cc
 )
+target_compile_options(${bench_bin} PRIVATE -fno-omit-frame-pointer)
 target_compile_definitions(${bench_test_bin} PRIVATE
     APRILTAG_BENCH_BACKEND_TESTS
     APRILTAG_BENCH_FIXTURE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/bench/fixture.jpg"

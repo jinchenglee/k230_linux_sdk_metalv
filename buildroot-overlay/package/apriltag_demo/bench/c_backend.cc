@@ -5,6 +5,7 @@
 
 #include <climits>
 #include <stdexcept>
+#include <vector>
 
 namespace apriltag_bench {
 namespace {
@@ -28,6 +29,7 @@ public:
         detector_->refine_edges = false;
         detector_->decode_sharpening = 0.0;
         apriltag_detector_add_family_bits(detector_, family_, 0);
+        normalized_.reserve(kMaxDetections);
     }
 
     ~CBackend() override { cleanup(); }
@@ -36,6 +38,11 @@ public:
 
     BackendKind kind() const override { return BackendKind::CReference; }
     const char* name() const override { return backend_name(kind()); }
+    void set_capture_detections(bool capture) override { capture_ = capture; }
+    const std::vector<Detection>& detections() const override
+    {
+        return normalized_;
+    }
 
     DetectionResult detect(const PreparedImage& image) override
     {
@@ -55,6 +62,7 @@ public:
             apriltag_detections_destroy(detections);
             (void)validate_detection_count(count);
         }
+        if (capture_) normalized_.clear();
         DetectionChecksum checksum(static_cast<std::size_t>(count));
         for (int i = 0; i < count; ++i) {
             apriltag_detection_t* detection = nullptr;
@@ -69,6 +77,7 @@ public:
                 normalized.corners[corner * 2 + 1] = detection->p[corner][1];
             }
             checksum.add(normalized);
+            if (capture_) normalized_.push_back(normalized);
         }
         apriltag_detections_destroy(detections);
         return {count, checksum.value()};
@@ -85,6 +94,8 @@ private:
 
     apriltag_detector_t* detector_;
     apriltag_family_t* family_;
+    bool capture_ = false;
+    std::vector<Detection> normalized_;
 };
 
 }  // namespace

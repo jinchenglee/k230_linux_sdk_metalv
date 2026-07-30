@@ -1,5 +1,6 @@
 #!/bin/sh
 set -eu
+export LC_ALL=C
 
 APP_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 BENCH="$APP_DIR/k230_apriltag_bench"
@@ -42,15 +43,11 @@ run_logged()
 
     tee "$log_file" <"$ACTIVE_FIFO" &
     ACTIVE_TEE_PID=$!
-    set +e
-    "$@" >"$ACTIVE_FIFO" 2>&1
-    command_rc=$?
-    wait "$ACTIVE_TEE_PID"
-    tee_rc=$?
+    if "$@" >"$ACTIVE_FIFO" 2>&1; then command_rc=0; else command_rc=$?; fi
+    if wait "$ACTIVE_TEE_PID"; then tee_rc=0; else tee_rc=$?; fi
     ACTIVE_TEE_PID=
     rm -f "$ACTIVE_FIFO"
     ACTIVE_FIFO=
-    set -e
     if [ "$command_rc" -ne 0 ]; then
         return "$command_rc"
     fi
@@ -136,11 +133,13 @@ mkdir -p "$RESULT_DIR"
 
 echo "Writing results to $RESULT_DIR"
 run_logged "$RESULT_DIR/comparison.log" \
-    "$BENCH" --input "$FIXTURE" --size 1280x720 "$@" --backend all
+    "$BENCH" --input "$FIXTURE" --size 1280x720 --dump-dir "$RESULT_DIR/images" \
+    "$@" --backend all
 
 for backend in rust-rvv c; do
     echo "Running perf stat for $backend"
     run_logged "$RESULT_DIR/perf-$backend.log" perf stat \
         -e task-clock,cycles,instructions,branches,branch-misses,cache-references,cache-misses \
-        "$BENCH" --input "$FIXTURE" --size 1280x720 "$@" --backend "$backend"
+        "$BENCH" --input "$FIXTURE" --size 1280x720 "$@" \
+        --backend "$backend" --no-dump
 done

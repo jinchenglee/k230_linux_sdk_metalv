@@ -95,6 +95,17 @@ machine-readable records with `grep '^RESULT '`. If backend checksums differ,
 the reported numbers remain production API throughput comparisons but are not
 equivalent-output speedups.
 
+The wrapper writes visual validation artifacts to the timestamped result
+directory under `images/`: `input.png`, `rust-rvv-detections.png`,
+`rust-scalar-detections.png`, and `c-reference-detections.png`. Each selected
+backend image overlays its validation-call quadrilaterals, centers, IDs,
+decision margins, and detection count on the identical prepared grayscale
+input. Empty results are labeled `No detections`. Image conversion, drawing,
+and PNG encoding happen after all validation calls and before warmup, outside
+detector timing. Direct runs enable this with `--dump-dir PATH`; `--no-dump`
+disables it, and the last dump option wins. The wrapper's separate perf runs
+always use `--no-dump`.
+
 The benchmark supports complete result sets of 0 through 4095 detections per
 image. It rejects 4096 or more detections because the Rust C ABI cannot report
 whether a result count equal to its output capacity was truncated; the same
@@ -104,6 +115,72 @@ limit is enforced for the C reference backend to keep comparisons equivalent.
 quads to the input image coordinate system and perform homography construction,
 border sampling, and payload sampling on the original-resolution image.
 Returned centers and corners therefore do not need a decimation multiplier.
+
+### Detector-only profile suite
+
+The benchmark directory also contains fast and full profiling workflows. They
+run each backend in its own single-threaded process and do not use `taskset`,
+because the target exposes one application CPU.
+
+```sh
+cd /root/app/apriltag_bench
+./profile_detector.sh fast
+./profile_detector.sh full --input /root/frame.y8 --format raw --size 640x360
+```
+
+User benchmark options follow the wrapper defaults, while the wrapper appends
+the required backend and dump setting last. Fast mode creates an all-backend
+visual comparison, separate Rust RVV, Rust scalar, and C `perf stat` runs, flat
+sample profiles, reports, and `summary.txt`. Full mode additionally repeats
+statistics, records frame-pointer callgraphs, and annotates available Rust
+stage and C detector symbols. Missing callchains or annotation symbols produce
+warnings; benchmark, stat, flat-record, tee, and flat-report failures remain
+fatal.
+
+Each invocation creates a timestamped directory under `results/`. When
+`APRILTAG_PROFILE_OUTPUT` is set, it is treated as a root and a unique
+`run-<timestamp>-<pid>` child is created without deleting existing contents.
+It contains `environment.txt`, `comparison.log`, `images/`, per-backend
+`.stat`, `.data`, `.report`, optional callgraph/annotation files, and
+`summary.txt`.
+
+The defaults are 20 warmup calls, 50 iterations in each of 10 batches, sampling
+at 199 Hz, and 7 repeated stat runs in full mode. Configure them with:
+
+```text
+APRILTAG_PROFILE_EVENTS       comma-separated candidate perf events
+APRILTAG_PROFILE_REPEATS      full-mode stat repetitions
+APRILTAG_PROFILE_FREQUENCY    perf record sampling frequency
+APRILTAG_PROFILE_OUTPUT       root for a unique per-run output directory
+APRILTAG_PROFILE_WARMUP       benchmark warmup calls
+APRILTAG_PROFILE_ITERATIONS   calls per batch
+APRILTAG_PROFILE_BATCHES      measurement batches
+```
+
+Every candidate stat event is probed separately and unsupported events are
+omitted with warnings. At least one timing event must work. Sampling first tries
+`cycles:u`, then `cpu-clock`; the profile cannot proceed if neither works. The
+environment file records the selected events, kernel, CPU and frequency state,
+PMUs, `perf list`, benchmark help, build/input command, and online CPUs.
+
+Summary latency, detections, checksum, input hash, and build identity come from
+benchmark `RESULT` records. Perf uses semicolon-delimited records and reports
+count/unit/event fields, including the unit attached to `task-clock`. Counter
+values are whole-process totals normalized over every detector call made by the
+profiled benchmark: measured calls + warmup calls + one validation call. Setup
+and teardown remain included in those totals, so the normalized values are not
+detector-only hardware counters. IPC is reported only when both cycles and
+instructions exist. Symbol percentages are sample attribution; their displayed
+milliseconds are explicitly approximate statistical estimates, not independently
+timed detector stages. A checksum mismatch warning means speed ratios are not
+equivalent-output comparisons.
+
+For direct annotation, pass a profile and exact symbol (or add
+`--interactive`):
+
+```sh
+./annotate_benchmark.sh rust-rvv.data 'apriltag_rvv::pipeline::detect'
+```
 
 ## On-device profiling
 
