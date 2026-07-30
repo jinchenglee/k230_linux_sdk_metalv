@@ -77,6 +77,115 @@ communicating over a small C ABI:
 Each unit is independently testable: the Rust lib on host/QEMU (as it already
 is), the C++ app against a stub detector.
 
+### 3.1 As-built buffer and thread topology
+
+Recorded 2026-07-29 against `b94660a`. Two things differ from the plan above:
+the app runs **three** threads, not two, and the **detect thread draws the
+overlay** — step 3's display thread only copies the finished ARGB image into
+the DRM buffer. Sizes assume the defaults `--csi-size 1280x720`, `--factor 2`,
+and a 1920x1080 HDMI mode.
+
+```
+                     OV5647 / GC2093  ──►  MIPI CSI-2  ──►  VICAP + ISP
+                                                                │
+                     ┌──────────────────────────────────────────┴───────────────────┐
+                     │   TWO INDEPENDENT V4L2 CAPTURE CHANNELS off the same ISP     │
+                     ▼                                                              ▼
+   /dev/video<N+1>  "detect" channel                       /dev/video<N>  "display" channel
+   V4L2_MEMORY_MMAP   buffer_num = 3                        V4L2_MEMORY_DMABUF  buffer_num = 4
+   NV12 1280x720  (1.38 MB/buf, 4.1 MB total)               NV12 1920x1080 (3.11 MB/buf, 12.4 MB)
+   main.cc:170-192                                          main.cc:584-604   (= DRM dumb buffers!)
+
+╔═════════════════════════════════════════════╗   ╔══════════════════════════════════════════════╗
+║ THREAD "apriltag-detect"      main.cc:166   ║   ║ THREAD "apriltag-disp"        main.cc:580    ║
+╠═════════════════════════════════════════════╣   ╠══════════════════════════════════════════════╣
+║                                             ║   ║  v4l2_drm_run()  lib.c:333                   ║
+║  kernel queue  [B0][B1][B2]  (FIFO)         ║   ║  poll(video_fd, drm_fd)  ── 1 s timeout      ║
+║        │  poll + VIDIOC_DQBUF               ║   ║        │                                     ║
+║        │  ⚠ returns OLDEST frame            ║   ║        │ QBUF(buffer_hold[wp]) then DQBUF    ║
+║        ▼                                    ║   ║        ▼                                     ║
+║  ┌───────────────────────────────┐          ║   ║   buffer_hold[2] ring  +  wp   (lib.c:405)   ║
+║  │ buffers[idx].mmap  1.38 MB    │          ║   ║   holds idx of frame being scanned out       ║
+║  │  Y plane 1280x720  921 KB  ───┼── ① ZERO ║   ║        │                                     ║
+║  │  UV plane          unused     │   COPY   ║   ║        └──► NO CPU TOUCH — the DMABUF *is*   ║
+║  └───────────────────────────────┘          ║   ║             the DRM video-plane buffer       ║
+║        │                                    ║   ║                                              ║
+║        │ optional 'n' denoise (full-res!)   ║   ║   ┌─── frame_handler()  main.cc:510 ───────┐ ║
+║        ▼                                    ║   ║   │ if g_overlay_generation changed:       │ ║
+║   filtered_gray  cv::Mat 921 KB  ── ②       ║   ║   │   lock(result_mutex)                   │ ║
+║        │                                    ║   ║   │   ③ memcpy 8.29 MB  draw_frame→OSD     │ ║
+║        ▼  apriltag_detect()  (SYNCHRONOUS)  ║   ║   │   unlock                               │ ║
+║  ┌──────────────────────────────────────┐   ║   ║   │   ④ dcache_clean_invalid  8.29 MB      │ ║
+║  │ Rust DetectBuffers (persistent)      │   ║   ║   │   display_update_buffer(draw_buffer)   │ ║
+║  │  decimated  640x360    230 KB        │   ║   ║   └────────────────────────────────────────┘ ║
+║  │  threshim   640x360    230 KB        │   ║   ║        │                                     ║
+║  │  scratch / rvv_buf / run_rows        │   ║   ║        ▼  display_commit(d)                  ║
+║  │  quad_fit scratch                    │   ║   ╚══════════════════════════════════════════════╝
+║  └──────────────────────────────────────┘   ║
+║        │  Vec<Detection>                    ║        ┌──────── DRM / KMS planes ──────────┐
+║        ▼                                    ║        │                                    │
+║   out[64]  apriltag_det_t                   ║        │  VIDEO plane   NV12 1920x1080      │
+║        │                                    ║        │    ← 1 of the 4 capture DMABUFs    │
+║        │  lock(result_mutex)                ║        │      (hardware scanout, zero copy) │
+║        ▼                                    ║        │                                    │
+║   ⚠ camera buffer STILL HELD here           ║        │  OSD plane     ARGB8888 1920x1080  │
+║        │                                    ║        │    ← draw_buffer  ⚠ SINGLE buffer  │
+║        └──► [ SHARED STATE ] ────────────────╬───────►│                                    │
+║        │                                    ║        │  hardware alpha-composite → HDMI   │
+║   VIDIOC_QBUF  (release, main.cc:497)       ║        └────────────────────────────────────┘
+╚═════════════════════════════════════════════╝
+
+   ┌──────────── SHARED STATE — guarded by the single result_mutex ────────────┐
+   │                                                                          │
+   │   std::vector<apriltag_det_t> detections      (a few hundred bytes)       │
+   │   cv::Mat draw_frame   ARGB8888 1920x1080  = 8.29 MB  ON THE HEAP         │
+   │      ⚠ setTo(0,0,0,0) full-frame clear EVERY detect iteration            │
+   │   std::atomic<uint64_t> g_overlay_generation  (publish handshake)         │
+   │                                                                          │
+   │   producer: detect thread (clear + draw)   consumer: frame_handler (copy) │
+   └──────────────────────────────────────────────────────────────────────────┘
+
+   Third thread: main() — blocking read(STDIN) for hotkeys c/u/n/0-5/q; sets atomics only.
+   Startup handshake: main locks result_mutex before spawning; frame_handler unlocks it on the
+   first displayed frame, so detect_proc cannot touch draw_frame before display_proc creates it.
+```
+
+Per-frame DDR traffic, CPU-side only. This is the figure that matters most,
+because the DTS in this build exposes a single C908v node, so all three
+threads time-share one core:
+
+| Path | Bytes touched by the CPU |
+|---|---|
+| ① Y-plane read into `detect()` | 921 KB read |
+| Decimate + threshold + CCL | ~700 KB read/write over a 230 KB working set |
+| ② Denoise, if `n` is enabled | +1.8 MB (runs at full 1280x720, before decimation) |
+| ③ `draw_frame` clear | 8.29 MB write |
+| ③ `memcpy` to OSD buffer | 8.29 MB read + 8.29 MB write |
+| ④ dcache clean+invalidate | 8.29 MB range writeback |
+
+The overlay plumbing (③ + ④ — roughly 25 MB of load/store plus an 8.3 MB cache
+flush) therefore moves **more than ten times the data the detector itself
+does**, on the same core the detector needs.
+
+Two structural costs the diagram makes visible:
+
+1. **Camera-buffer hold** (⚠ on the detect lane). The dequeued 1.38 MB camera
+   buffer stays out of the kernel queue from `DQBUF` through the entire
+   synchronous detection. With three buffers and no queue draining, `DQBUF`
+   also returns the *oldest* queued frame, so overlays lag reality by up to two
+   extra camera periods before detection even begins. This is what
+   back-pressures the ISP and depresses the reported `camera:` rate.
+2. **Single-buffered OSD** (⚠ on the OSD plane). `draw_frame` and the one OSD
+   dumb buffer are two separate 8.29 MB images reconciled by a `memcpy` that
+   runs *while holding* `result_mutex` — so the two threads serialise on the
+   largest memory operation in the program.
+
+The proposed remedies (split Stage 0 so the camera buffer is requeued right
+after decimation; double-buffer the OSD plane and clear only dirty rectangles;
+optionally let VICAP/ISP emit the decimated detection channel) are written up
+in `package/apriltag_demo/README.md` under "Frame flow and hardware-offload
+priorities".
+
 ## 4. NV12 Y-plane ↔ `detect()` compatibility
 
 `detect()` takes an explicit `stride` separate from `width`, which makes the
