@@ -144,7 +144,6 @@ void draw_camera_frame(cv::Mat& osd, const cv::Mat& bgr)
 
 void draw_detections(cv::Mat& osd,
                      const std::vector<apriltag_det_t>& dets,
-                     double decimate_scale,
                      int sensor_w, int sensor_h)
 {
     if (osd.empty() || sensor_w <= 0 || sensor_h <= 0) {
@@ -152,7 +151,7 @@ void draw_detections(cv::Mat& osd,
     }
     // Use the same aspect-fit transform as the USB preview/debug images.
     const cv::Size view = aspect_fit(osd, sensor_w, sensor_h);
-    const double s = decimate_scale * (double)view.width / (double)sensor_w;
+    const double s = (double)view.width / (double)sensor_w;
 
     for (const auto& d : dets) {
         cv::Point p[4];

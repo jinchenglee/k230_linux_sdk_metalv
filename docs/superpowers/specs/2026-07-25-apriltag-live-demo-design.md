@@ -4,6 +4,12 @@
 **Status:** Approved for implementation planning
 **Author:** JC Li (with Claude)
 
+**Superseded coordinate note (2026-07-30):** The detector now follows the
+official C resolution boundary. Stages through quad fitting remain decimated;
+homography construction and decode use the original image, and final detections
+use source-image coordinates. Older decimated-output statements below describe
+the initial implementation.
+
 ## 1. Goal
 
 Create a new app in the `k230_linux_sdk_metalv` buildroot that mimics

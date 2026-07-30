@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.5)
+cmake_minimum_required(VERSION 3.13)
 set(CMAKE_CXX_STANDARD 17)
 project(apriltag_demo)
 
@@ -10,11 +10,32 @@ set(common_src
 )
 set(rvv_bin apriltag_demo.elf)
 set(c_bin apriltag_c_demo.elf)
+set(bench_bin k230_apriltag_bench)
+set(bench_test_bin apriltag_bench_tests)
+set(APRILTAG_RVV_GIT_ID "unversioned" CACHE STRING "apriltag-rvv git identity")
+set(APRILTAG_SDK_GIT_ID "unversioned" CACHE STRING "SDK git identity")
+set(APRILTAG_RVV_LIB ${CMAKE_CURRENT_SOURCE_DIR}/lib/libapriltag_rvv.a)
 
 add_executable(${rvv_bin} ${common_src})
 add_executable(${c_bin}
     ${common_src}
     src/apriltag_c_adapter.cc
+)
+add_executable(${bench_bin}
+    bench/main.cc
+    bench/benchmark.cc
+    bench/rust_backend.cc
+    bench/c_backend.cc
+)
+add_executable(${bench_test_bin}
+    bench/tests.cc
+    bench/benchmark.cc
+    bench/rust_backend.cc
+    bench/c_backend.cc
+)
+target_compile_definitions(${bench_test_bin} PRIVATE
+    APRILTAG_BENCH_BACKEND_TESTS
+    APRILTAG_BENCH_FIXTURE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/bench/fixture.jpg"
 )
 target_compile_definitions(${c_bin} PRIVATE
     APRILTAG_C_BACKEND
@@ -46,7 +67,7 @@ include_directories(
     ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
 
-foreach(bin IN ITEMS ${rvv_bin} ${c_bin})
+foreach(bin IN ITEMS ${rvv_bin} ${c_bin} ${bench_bin} ${bench_test_bin})
     target_link_directories(${bin} PRIVATE
         ${usr_root}/lib
         ${CMAKE_SYSROOT}
@@ -56,8 +77,46 @@ endforeach()
 
 # Prebuilt Rust static library (built in the rvv-dev docker image; see
 # scripts/build_rust_lib.sh). Contains the apriltag_* C ABI + RVV kernels.
-set(APRILTAG_RVV_LIB ${CMAKE_CURRENT_SOURCE_DIR}/lib/libapriltag_rvv.a)
 set(APRILTAG_C_LIB ${usr_root}/lib/libapriltag.a)
+
+# Hash the exact archives, ABI header, and sources CMake will consume. The
+# compiler fields identify the configured cross-toolchain without hashing the
+# final executable (which would make the build ID self-referential).
+file(SHA256 "${APRILTAG_RVV_LIB}" APRILTAG_RVV_LIB_SHA256)
+file(SHA256 "${APRILTAG_C_LIB}" APRILTAG_C_LIB_SHA256)
+file(SHA256 "${CMAKE_CURRENT_SOURCE_DIR}/src/apriltag.h" APRILTAG_ABI_SHA256)
+file(GLOB APRILTAG_BENCH_SOURCE_FILES
+    "${CMAKE_CURRENT_SOURCE_DIR}/bench/*.cc"
+    "${CMAKE_CURRENT_SOURCE_DIR}/bench/*.h"
+)
+list(APPEND APRILTAG_BENCH_SOURCE_FILES
+    "${CMAKE_CURRENT_SOURCE_DIR}/CMakeLists.txt")
+list(SORT APRILTAG_BENCH_SOURCE_FILES)
+set(APRILTAG_BENCH_SOURCE_CONTENTS "")
+foreach(source_file IN LISTS APRILTAG_BENCH_SOURCE_FILES)
+    file(READ "${source_file}" source_contents)
+    file(RELATIVE_PATH source_name "${CMAKE_CURRENT_SOURCE_DIR}" "${source_file}")
+    string(APPEND APRILTAG_BENCH_SOURCE_CONTENTS
+        "${source_name}\n${source_contents}\n")
+endforeach()
+string(SHA256 APRILTAG_BENCH_SOURCE_SHA256 "${APRILTAG_BENCH_SOURCE_CONTENTS}")
+string(SUBSTRING "${APRILTAG_RVV_LIB_SHA256}" 0 12 APRILTAG_RVV_LIB_HASH)
+string(SUBSTRING "${APRILTAG_C_LIB_SHA256}" 0 12 APRILTAG_C_LIB_HASH)
+string(SUBSTRING "${APRILTAG_ABI_SHA256}" 0 12 APRILTAG_ABI_HASH)
+string(SUBSTRING "${APRILTAG_BENCH_SOURCE_SHA256}" 0 12 APRILTAG_BENCH_SOURCE_HASH)
+set(APRILTAG_COMPILER_ID "${CMAKE_CXX_COMPILER_ID}${CMAKE_CXX_COMPILER_VERSION}")
+string(REGEX REPLACE "[^A-Za-z0-9._-]" "-" APRILTAG_COMPILER_ID
+    "${APRILTAG_COMPILER_ID}")
+set(APRILTAG_BENCH_BUILD_ID
+    "rvv-${APRILTAG_RVV_GIT_ID}_sdk-${APRILTAG_SDK_GIT_ID}_lib-${APRILTAG_RVV_LIB_HASH}_bench-${APRILTAG_BENCH_SOURCE_HASH}_clib-${APRILTAG_C_LIB_HASH}_abi-${APRILTAG_ABI_HASH}_cc-${APRILTAG_COMPILER_ID}")
+string(REGEX REPLACE "[^A-Za-z0-9._-]" "-" APRILTAG_BENCH_BUILD_ID
+    "${APRILTAG_BENCH_BUILD_ID}")
+message(STATUS "AprilTag benchmark build ID: ${APRILTAG_BENCH_BUILD_ID}")
+foreach(bin IN ITEMS ${bench_bin} ${bench_test_bin})
+    target_compile_definitions(${bin} PRIVATE
+        APRILTAG_BENCH_BUILD_ID="${APRILTAG_BENCH_BUILD_ID}"
+    )
+endforeach()
 
 # --start-group/--end-group resolves the mutual deps between the OpenCV/K230
 # static libs and the rust-std symbols pulled by libapriltag_rvv.a.
@@ -97,14 +156,46 @@ target_link_libraries(${c_bin}
     -Wl,--end-group
 )
 
+# The fixed-image benchmark deliberately excludes all camera, DRM, display, and
+# MMZ libraries so process-level perf counters cover detector work only.
+target_link_libraries(${bench_bin}
+    -Wl,--start-group
+    ${APRILTAG_RVV_LIB}
+    ${APRILTAG_C_LIB}
+    opencv_imgcodecs
+    opencv_imgproc
+    opencv_core
+    pthread
+    dl
+    m
+    rt
+    -Wl,--end-group
+)
+target_link_libraries(${bench_test_bin}
+    -Wl,--start-group
+    ${APRILTAG_RVV_LIB}
+    ${APRILTAG_C_LIB}
+    opencv_imgcodecs
+    opencv_imgproc
+    opencv_core
+    pthread
+    dl
+    m
+    rt
+    -Wl,--end-group
+)
+
 if(CMAKE_TOOLCHAIN_FILE MATCHES "buildroot/toolchainfile.cmake")
-    message(STATUS "Buildroot build -> /root/app/apriltag_demo, apriltag_c_demo, and apriltag_profile")
+    message(STATUS "Buildroot build -> AprilTag demos, profile tools, and benchmark")
     install(TARGETS ${rvv_bin} DESTINATION /root/app/apriltag_demo)
     install(DIRECTORY utils/ DESTINATION /root/app/apriltag_demo USE_SOURCE_PERMISSIONS)
     install(TARGETS ${c_bin} DESTINATION /root/app/apriltag_c_demo)
     install(DIRECTORY utils_c/ DESTINATION /root/app/apriltag_c_demo USE_SOURCE_PERMISSIONS)
     install(DIRECTORY utils_profile/ DESTINATION /root/app/apriltag_profile USE_SOURCE_PERMISSIONS)
+    install(TARGETS ${bench_bin} DESTINATION /root/app/apriltag_bench)
+    install(FILES bench/fixture.jpg DESTINATION /root/app/apriltag_bench)
+    install(DIRECTORY utils_bench/ DESTINATION /root/app/apriltag_bench USE_SOURCE_PERMISSIONS)
 else()
     message(STATUS "Standalone build -> ./bin/")
-    install(TARGETS ${rvv_bin} ${c_bin} DESTINATION bin)
+    install(TARGETS ${rvv_bin} ${c_bin} ${bench_bin} DESTINATION bin)
 endif()

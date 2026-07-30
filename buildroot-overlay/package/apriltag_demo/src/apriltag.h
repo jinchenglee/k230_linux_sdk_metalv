@@ -1,9 +1,8 @@
 /* C ABI for libapriltag_rvv.a (apriltag-rvv crate, feature "capi").
  *
  * Must stay in sync with apriltag-rvv/src/capi.rs. Coordinates returned in
- * apriltag_det_t are in DECIMATED image space (divided by the decimation
- * factor), matching what pipeline::detect() returns; the caller maps them back
- * to display pixels via decimation scale * (display_dim / sensor_dim).
+ * apriltag_det_t use the full-resolution input image coordinate system,
+ * independently of the quad-search decimation factor.
  */
 #ifndef APRILTAG_CAPI_H
 #define APRILTAG_CAPI_H
@@ -47,7 +46,8 @@ typedef struct {
     uint64_t best_raw_code;
 } apriltag_decode_stats_t;
 
-/* One fitted quad's decode outcome from the most recent detection call. */
+/* One fitted quad's decode outcome from the most recent detection call.
+ * Candidate coordinates remain in decimated stage-4 debug-image space. */
 typedef struct {
     uint64_t nearest_id; /* UINT64_MAX when no codeword was sampled */
     uint64_t raw_code;

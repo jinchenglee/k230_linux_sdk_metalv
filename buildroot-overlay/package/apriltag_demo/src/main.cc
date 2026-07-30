@@ -33,7 +33,7 @@ using std::endl;
 
 // ── Config (from argv) ──────────────────────────────────────────────────────
 static int    g_factor_int   = 2;     // FFI: 0=1.0 1=1.5 2=2.0
-static double g_decimate_scale = 2.0;
+static double g_factor_value = 2.0;
 static int    g_mode         = 0;     // FFI: 0=scalar 1=rvv
 static uint32_t g_min_blob   = 25;
 static bool g_debug_enabled  = false;
@@ -468,8 +468,7 @@ static void detect_proc(int video_device)
             if (selected_source == 1) {
                 draw_camera_frame(draw_frame, usb_bgr);
             }
-            draw_detections(draw_frame, detections, g_decimate_scale,
-                            frame_width, frame_height);
+            draw_detections(draw_frame, detections, frame_width, frame_height);
         } else {
             apriltag_debug_image_t debug_image = {};
             if (apriltag_get_debug_image(det, &debug_image) == 1 &&
@@ -677,9 +676,19 @@ static void parse_args(int argc, char* argv[])
 #endif
         } else if (a == "--factor" && i + 1 < argc) {
             std::string f = argv[++i];
-            if (f == "1" || f == "1.0")      { g_factor_int = 0; g_decimate_scale = 1.0; }
-            else if (f == "1.5")             { g_factor_int = 1; g_decimate_scale = 1.5; }
-            else                             { g_factor_int = 2; g_decimate_scale = 2.0; }
+            if (f == "1" || f == "1.0") {
+                g_factor_int = 0;
+                g_factor_value = 1.0;
+            } else if (f == "1.5") {
+                g_factor_int = 1;
+                g_factor_value = 1.5;
+            } else if (f == "2" || f == "2.0") {
+                g_factor_int = 2;
+                g_factor_value = 2.0;
+            } else {
+                cerr << "--factor must be 1, 1.5, or 2" << endl;
+                exit(2);
+            }
         } else if (a == "--min-blob" && i + 1 < argc) {
             g_min_blob = (uint32_t)atoi(argv[++i]);
         } else if (a == "--csi-size" && i + 1 < argc) {
@@ -730,7 +739,7 @@ int main(int argc, char* argv[])
 #else
     cout << "mode=" << (g_mode ? "rvv" : "scalar")
 #endif
-         << " factor=" << g_decimate_scale
+         << " factor=" << g_factor_value
          << " min_blob=" << g_min_blob
          << " debug=" << (g_debug_enabled ? "on" : "off")
          << " input=CSI"

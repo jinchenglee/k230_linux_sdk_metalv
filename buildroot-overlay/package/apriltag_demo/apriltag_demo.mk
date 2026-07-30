@@ -5,6 +5,11 @@ APRILTAG_DEMO_RVV_DIR ?= $(realpath $(TOPDIR)/../../../apriltag-rvv)
 # Set to YES after changing the sibling apriltag-rvv source so Buildroot does
 # not reuse an older static archive from this local package's copied tree.
 APRILTAG_DEMO_FORCE_RUST_REBUILD ?= NO
+APRILTAG_DEMO_RVV_GIT_SHA = $(shell git -C "$(APRILTAG_DEMO_RVV_DIR)" rev-parse --short=12 HEAD 2>/dev/null)$(shell test -z "$$(git -C "$(APRILTAG_DEMO_RVV_DIR)" status --porcelain 2>/dev/null)" || printf '%s' -dirty)
+APRILTAG_DEMO_SDK_GIT_SHA = $(shell git -C "$(realpath $(TOPDIR)/../..)" rev-parse --short=12 HEAD 2>/dev/null)$(shell test -z "$$(git -C "$(realpath $(TOPDIR)/../..)" status --porcelain 2>/dev/null)" || printf '%s' -dirty)
+APRILTAG_DEMO_CONF_OPTS += \
+	-DAPRILTAG_RVV_GIT_ID=$(APRILTAG_DEMO_RVV_GIT_SHA) \
+	-DAPRILTAG_SDK_GIT_ID=$(APRILTAG_DEMO_SDK_GIT_SHA)
 
 # Ensure the Rust staticlib (built in the rvv-dev docker image) is present in
 # Buildroot's copied source tree before CMake configures. Local package sources
@@ -26,6 +31,7 @@ define APRILTAG_DEMO_BUILD_DEB
 	$(call COPYFILE,$(TARGET_DIR)/root/app/apriltag_demo,$(@D)/deb/root/app/)
 	$(call COPYFILE,$(TARGET_DIR)/root/app/apriltag_c_demo,$(@D)/deb/root/app/)
 	$(call COPYFILE,$(TARGET_DIR)/root/app/apriltag_profile,$(@D)/deb/root/app/)
+	$(call COPYFILE,$(TARGET_DIR)/root/app/apriltag_bench,$(@D)/deb/root/app/)
 	echo "Package: k230-apriltag-demo"                    >  $(@D)/deb/DEBIAN/control
 	echo "Version: 1.1"                                   >> $(@D)/deb/DEBIAN/control
 	echo "Section: base"                                  >> $(@D)/deb/DEBIAN/control

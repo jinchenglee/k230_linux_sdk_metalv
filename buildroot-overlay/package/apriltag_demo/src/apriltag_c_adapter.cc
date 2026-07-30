@@ -148,8 +148,7 @@ extern "C" int apriltag_detect(
 
     apriltag_c_detector* handle =
         static_cast<apriltag_c_detector*>(opaque);
-    const double scale = factor_scale(factor);
-    handle->detector->quad_decimate = static_cast<float>(scale);
+    handle->detector->quad_decimate = static_cast<float>(factor_scale(factor));
     handle->detector->debug =
         handle->debug_enabled && !handle->debug_dumped;
 
@@ -174,12 +173,11 @@ extern "C" int apriltag_detect(
         zarray_get(detections, i, &detection);
         out[i].id = static_cast<uint64_t>(detection->id);
         out[i].margin = detection->decision_margin;
-        out[i].center[0] = detection->c[0] / scale;
-        out[i].center[1] = detection->c[1] / scale;
+        out[i].center[0] = detection->c[0];
+        out[i].center[1] = detection->c[1];
         for (int corner = 0; corner < 4; ++corner) {
-            out[i].corners[corner * 2] = detection->p[corner][0] / scale;
-            out[i].corners[corner * 2 + 1] =
-                detection->p[corner][1] / scale;
+            out[i].corners[corner * 2] = detection->p[corner][0];
+            out[i].corners[corner * 2 + 1] = detection->p[corner][1];
         }
     }
 

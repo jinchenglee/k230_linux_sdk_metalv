@@ -6,6 +6,10 @@ preprocessing, display, keyboard-control, and FPS-reporting code:
 - `apriltag_demo.elf`: the Rust `apriltag-rvv` detector
 - `apriltag_c_demo.elf`: the official AprilRobotics C detector, version 3.4.5
 
+It also builds `k230_apriltag_bench`, a fixed-image detector benchmark that
+links no camera or display libraries. Its installed JPEG fixture is an unchanged
+copy of `apriltag-rvv/tests/data/33369213973_9d9bb4cc96_c.jpg`.
+
 The C detector is linked statically into its application. Its Buildroot source
 archive and license are verified by `package/apriltag/apriltag.hash`.
 
@@ -21,6 +25,7 @@ The applications are installed in the target tree at:
 /root/app/apriltag_demo/
 /root/app/apriltag_c_demo/
 /root/app/apriltag_profile/
+/root/app/apriltag_bench/
 ```
 
 The package containing both is:
@@ -57,6 +62,48 @@ multicore scaling independently of the RVV comparison.
 
 The displayed `detect` rate includes only completed detector calls. Camera and
 display rates are reported separately.
+
+## Fixed-image benchmark
+
+Run the default 1280x720 comparison and separate Rust RVV/C `perf stat` jobs:
+
+```sh
+cd /root/app/apriltag_bench
+./run_benchmark.sh
+```
+
+Additional arguments are appended to all three jobs, so later options can
+replace the wrapper defaults. For example:
+
+```sh
+./run_benchmark.sh --size native --warmup 2 --iterations 10 --batches 3
+./run_benchmark.sh --input /root/frame.y8 --format raw --size 640x360
+```
+
+Direct benchmark examples include explicit JPEG format regardless of filename
+extension and one selected backend:
+
+```sh
+./k230_apriltag_bench --input fixture.data --format jpeg --size 1920x1080
+./k230_apriltag_bench --input fixture.jpg --backend rust-rvv --size 1280x720
+./k230_apriltag_bench --input fixture.jpg --backend c --size 1280x720
+```
+
+The internal timing covers each complete public detector call and normal result
+lifecycle, but excludes image decode/resize and detector construction. Parse
+machine-readable records with `grep '^RESULT '`. If backend checksums differ,
+the reported numbers remain production API throughput comparisons but are not
+equivalent-output speedups.
+
+The benchmark supports complete result sets of 0 through 4095 detections per
+image. It rejects 4096 or more detections because the Rust C ABI cannot report
+whether a result count equal to its output capacity was truncated; the same
+limit is enforced for the C reference backend to keep comparisons equivalent.
+
+`--factor` controls quad-search decimation only. Both detectors promote fitted
+quads to the input image coordinate system and perform homography construction,
+border sampling, and payload sampling on the original-resolution image.
+Returned centers and corners therefore do not need a decimation multiplier.
 
 ## On-device profiling
 
