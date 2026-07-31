@@ -9,6 +9,9 @@ preprocessing, display, keyboard-control, and FPS-reporting code:
 It also builds `k230_apriltag_bench`, a fixed-image detector benchmark that
 links no camera or display libraries. Its installed JPEG fixture is an unchanged
 copy of `apriltag-rvv/tests/data/33369213973_9d9bb4cc96_c.jpg`.
+`k230_apriltag_workload` separately compares deterministic instrumented Rust RVV,
+Rust scalar, and prefixed official-C detector builds. Production benchmarks and
+demos continue to link only the pristine production archives.
 
 The C detector is linked statically into its application. Its Buildroot source
 archive and license are verified by `package/apriltag/apriltag.hash`.
@@ -89,6 +92,19 @@ extension and one selected backend:
 ./k230_apriltag_bench --input fixture.jpg --backend c --size 1280x720
 ```
 
+Run the untimed workload comparison with the same input and detector options:
+
+```sh
+./k230_apriltag_workload --input fixture.jpg --size 1280x720 \
+    --factor 2 --min-blob 25 --backend all
+```
+
+Each selected backend is called twice and the command fails if either its
+detections or counter snapshot changes. The readable table marks unavailable
+fields as `n/a`; stable `WORKLOAD` lines contain the complete schema for scripts.
+The Rust workload archive serves both RVV and scalar modes. The C workload ABI
+is prefixed, so the workload executable links no production detector archive.
+
 The internal timing covers each complete public detector call and normal result
 lifecycle, but excludes image decode/resize and detector construction. Parse
 machine-readable records with `grep '^RESULT '`. If backend checksums differ,
@@ -140,9 +156,15 @@ fatal.
 Each invocation creates a timestamped directory under `results/`. When
 `APRILTAG_PROFILE_OUTPUT` is set, it is treated as a root and a unique
 `run-<timestamp>-<pid>` child is created without deleting existing contents.
-It contains `environment.txt`, `comparison.log`, `images/`, per-backend
+It contains `environment.txt`, `workload.log`, `workload-summary.txt`,
+`comparison.log`, `images/`, per-backend
 `.stat`, `.data`, `.report`, optional callgraph/annotation files, and
 `summary.txt`.
+
+The workload run happens before any perf collection and is never used as an
+authoritative latency measurement. `summary.txt` appends Rust-RVV/C ratios for
+emitted, sorted, LFPS, error-fit, quad, and decode work and preserves warnings
+for threshold or final-output mismatches.
 
 The defaults are 20 warmup calls, 50 iterations in each of 10 batches, sampling
 at 199 Hz, and 7 repeated stat runs in full mode. Configure them with:

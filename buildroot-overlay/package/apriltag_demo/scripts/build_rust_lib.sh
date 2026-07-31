@@ -9,6 +9,7 @@
 # Usage:
 #   scripts/build_rust_lib.sh            # with RVV (+v, default)
 #   scripts/build_rust_lib.sh --no-rvv   # scalar fallback
+#   scripts/build_rust_lib.sh --workload-only # separate instrumented archive
 #
 # The source-tree invocation auto-detects a sibling apriltag-rvv repository.
 # Buildroot passes that path explicitly because its copied package has no .git.
@@ -27,13 +28,22 @@ if [ -z "${APRILTAG_RVV_DIR:-}" ]; then
     fi
 fi
 RVV_DOCKER_IMAGE="${RVV_DOCKER_IMAGE:-rvv-dev:latest}"
-RVV_ARGS=("$@")
-for arg in "${RVV_ARGS[@]}"; do
+WORKLOAD=0
+NO_RVV=0
+for arg in "$@"; do
     case "$arg" in
-        --no-rvv) ;;
+        --no-rvv) NO_RVV=1 ;;
+        --workload-only) WORKLOAD=1 ;;
         *) echo "error: unknown Rust build argument: $arg" >&2; exit 2 ;;
     esac
 done
+if [ "$WORKLOAD" -eq 1 ] && [ -z "${APRILTAG_WORKLOAD_SOURCE_HASH:-}" ]; then
+    echo "error: APRILTAG_WORKLOAD_SOURCE_HASH is required with --workload-only" >&2
+    exit 2
+fi
+RVV_ARGS=()
+[ "$NO_RVV" -eq 0 ] || RVV_ARGS+=(--no-rvv)
+[ "$WORKLOAD" -eq 0 ] || RVV_ARGS+=(--workload-counters)
 RVV_ARG_STRING="${RVV_ARGS[*]}"
 
 if [ ! -d "$APRILTAG_RVV_DIR" ]; then
@@ -59,12 +69,36 @@ docker run --rm \
         chown -R ${UID_HOST}:${GID_HOST} target
     "
 
-SRC_A="$APRILTAG_RVV_DIR/target/riscv64gc-unknown-linux-gnu/release/libapriltag_rvv.a"
+if [ "$WORKLOAD" -eq 1 ]; then
+    ARCHIVE=libapriltag_rvv_workload.a
+else
+    ARCHIVE=libapriltag_rvv.a
+fi
+SRC_A="$APRILTAG_RVV_DIR/target/riscv64gc-unknown-linux-gnu/release/$ARCHIVE"
 if [ ! -f "$SRC_A" ]; then
     echo "error: build did not produce $SRC_A" >&2
     exit 1
 fi
 mkdir -p "$PKG_DIR/lib"
-cp -f "$SRC_A" "$PKG_DIR/lib/libapriltag_rvv.a"
-echo "Copied -> $PKG_DIR/lib/libapriltag_rvv.a"
-ls -l "$PKG_DIR/lib/libapriltag_rvv.a"
+if [ "$WORKLOAD" -eq 1 ]; then
+    ARCHIVE_TMP="$(mktemp "$PKG_DIR/lib/.${ARCHIVE}.XXXXXX")"
+    HEADER_TMP="$(mktemp "$PKG_DIR/lib/.rust_apriltag_workload.h.XXXXXX")"
+    STAMP_TMP="$(mktemp "$PKG_DIR/lib/.source-hash.XXXXXX")"
+    trap 'rm -f "$ARCHIVE_TMP" "$HEADER_TMP" "$STAMP_TMP"' EXIT
+    cp -f "$SRC_A" "$ARCHIVE_TMP"
+    cp -f "$APRILTAG_RVV_DIR/include/apriltag_workload.h" "$HEADER_TMP"
+    printf '%s\n' "$APRILTAG_WORKLOAD_SOURCE_HASH" >"$STAMP_TMP"
+    rm -f "$PKG_DIR/lib/.apriltag_rvv_workload.source-hash"
+    mv -f "$ARCHIVE_TMP" "$PKG_DIR/lib/$ARCHIVE"
+    mv -f "$HEADER_TMP" "$PKG_DIR/lib/rust_apriltag_workload.h"
+    mv -f "$STAMP_TMP" "$PKG_DIR/lib/.apriltag_rvv_workload.source-hash"
+    trap - EXIT
+else
+    ARCHIVE_TMP="$(mktemp "$PKG_DIR/lib/.${ARCHIVE}.XXXXXX")"
+    trap 'rm -f "$ARCHIVE_TMP"' EXIT
+    cp -f "$SRC_A" "$ARCHIVE_TMP"
+    mv -f "$ARCHIVE_TMP" "$PKG_DIR/lib/$ARCHIVE"
+    trap - EXIT
+fi
+echo "Copied -> $PKG_DIR/lib/$ARCHIVE"
+ls -l "$PKG_DIR/lib/$ARCHIVE"

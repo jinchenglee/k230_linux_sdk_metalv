@@ -1,0 +1,872 @@
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -74,6 +74,34 @@
+ add_library(${PROJECT_NAME} ${APRILTAG_SRCS} ${COMMON_SRC} ${TAG_FILES})
+ set_property(TARGET ${PROJECT_NAME} PROPERTY POSITION_INDEPENDENT_CODE ON)
+ 
++option(BUILD_WORKLOAD_COUNTERS "Build prefixed workload-counter library" OFF)
++if(BUILD_WORKLOAD_COUNTERS)
++    add_library(apriltag_workload STATIC ${APRILTAG_SRCS} ${COMMON_SRC} ${TAG_FILES})
++    set_property(TARGET apriltag_workload PROPERTY POSITION_INDEPENDENT_CODE ON)
++    set_property(TARGET apriltag_workload PROPERTY C_STANDARD 99)
++    target_compile_definitions(apriltag_workload PRIVATE APRILTAG_WORKLOAD_COUNTERS
++      apriltag_get_workload_counters=c_apriltag_get_workload_counters
++      apriltag_quad_thresh=c_apriltag_quad_thresh apriltag_detector_remove_family=c_apriltag_detector_remove_family
++      apriltag_detector_add_family_bits=c_apriltag_detector_add_family_bits apriltag_detector_clear_families=c_apriltag_detector_clear_families
++      apriltag_detector_create=c_apriltag_detector_create apriltag_detector_destroy=c_apriltag_detector_destroy
++      apriltag_detector_detect=c_apriltag_detector_detect apriltag_detection_destroy=c_apriltag_detection_destroy
++      apriltag_detections_destroy=c_apriltag_detections_destroy apriltag_to_image=c_apriltag_to_image
++      tag16h5_create=c_tag16h5_create tag16h5_destroy=c_tag16h5_destroy tag25h9_create=c_tag25h9_create tag25h9_destroy=c_tag25h9_destroy
++      tag36h10_create=c_tag36h10_create tag36h10_destroy=c_tag36h10_destroy tag36h11_create=c_tag36h11_create tag36h11_destroy=c_tag36h11_destroy
++      tagCircle21h7_create=c_tagCircle21h7_create tagCircle21h7_destroy=c_tagCircle21h7_destroy
++      tagCircle49h12_create=c_tagCircle49h12_create tagCircle49h12_destroy=c_tagCircle49h12_destroy
++      tagCustom48h12_create=c_tagCustom48h12_create tagCustom48h12_destroy=c_tagCustom48h12_destroy
++      tagStandard41h12_create=c_tagStandard41h12_create tagStandard41h12_destroy=c_tagStandard41h12_destroy
++      tagStandard52h13_create=c_tagStandard52h13_create tagStandard52h13_destroy=c_tagStandard52h13_destroy)
++    target_include_directories(apriltag_workload PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
++    if(NOT MSVC)
++        target_link_libraries(apriltag_workload PUBLIC Threads::Threads)
++    endif()
++    if(UNIX)
++        target_link_libraries(apriltag_workload PUBLIC m)
++    endif()
++endif()
++
+ if(CMAKE_C_COMPILER_ID MATCHES "Clang" AND NOT APPLE AND NOT CMAKE_C_SIMULATE_ID MATCHES "MSVC")
+     target_link_options(${PROJECT_NAME} PRIVATE "-Wl,-z,relro,-z,now,-z,defs")
+ endif()
+@@ -141,6 +169,17 @@
+         ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+         RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+         )
++if(BUILD_WORKLOAD_COUNTERS)
++    install(TARGETS apriltag_workload ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
++    install(FILES apriltag_workload.h
++        DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/apriltag
++        RENAME c_apriltag_workload.h)
++    if(BUILD_TESTING)
++        add_executable(test_workload test/test_workload.c)
++        target_link_libraries(test_workload apriltag_workload)
++        add_test(NAME test_workload COMMAND test_workload)
++    endif()
++endif()
+ 
+ install(EXPORT ${targets_export_name}
+     NAMESPACE apriltag::
+--- a/apriltag.c
++++ b/apriltag.c
+@@ -31,6 +31,11 @@
+ */
+ 
+ #include "apriltag.h"
++#ifdef APRILTAG_WORKLOAD_COUNTERS
++#include "apriltag_workload.h"
++static uint64_t workload_checksum(const image_u8_t *im) { uint64_t h=UINT64_C(0xcbf29ce484222325); for(int y=0;y<im->height;y++) for(int x=0;x<im->width;x++){h^=im->buf[y*im->stride+x];h*=UINT64_C(0x100000001b3);} return h; }
++int apriltag_get_workload_counters(apriltag_detector_t *td, apriltag_workload_counters_t *out) { if(!td||!out||!td->workload_counters)return -1; *out=*td->workload_counters; return 0; }
++#endif
+ 
+ #define _USE_MATH_DEFINES
+ #include <math.h>
+@@ -369,6 +374,14 @@
+     td->qtp.min_white_black_diff = 5;
+ 
+     td->tag_families = zarray_create(sizeof(apriltag_family_t*));
++#ifdef APRILTAG_WORKLOAD_COUNTERS
++    td->workload_counters = calloc(1, sizeof(apriltag_workload_counters_t));
++    if (!td->workload_counters) {
++        zarray_destroy(td->tag_families);
++        free(td);
++        return NULL;
++    }
++#endif
+ 
+     pthread_mutex_init(&td->mutex, NULL);
+ 
+@@ -394,6 +407,9 @@
+     apriltag_detector_clear_families(td);
+ 
+     zarray_destroy(td->tag_families);
++#ifdef APRILTAG_WORKLOAD_COUNTERS
++    free(td->workload_counters);
++#endif
+     free(td);
+ }
+ 
+@@ -569,6 +585,9 @@
+ // returns the decision margin. Return < 0 if the detection should be rejected.
+ static float quad_decode(apriltag_detector_t* td, apriltag_family_t *family, image_u8_t *im, struct quad *quad, struct quick_decode_entry *entry, image_u8_t *im_samples)
+ {
++#ifdef APRILTAG_WORKLOAD_COUNTERS
++    td->workload_counters->decode_attempts++;
++#endif
+     // decode the tag binary contents by sampling the pixel
+     // closest to the center of each bit cell.
+ 
+@@ -672,6 +691,9 @@
+ 
+     // XXX Tunable
+     if ((graymodel_interpolate(&whitemodel, 0, 0) - graymodel_interpolate(&blackmodel, 0, 0) < 0) != family->reversed_border) {
++#ifdef APRILTAG_WORKLOAD_COUNTERS
++        td->workload_counters->photometric_polarity_rejects++;
++#endif
+         return -1;
+     }
+ 
+@@ -737,6 +759,9 @@
+     }
+ 
+     quick_decode_codeword(family, rcode, entry);
++#ifdef APRILTAG_WORKLOAD_COUNTERS
++    if(entry->hamming==255) td->workload_counters->codeword_rejects++;
++#endif
+     free(values);
+     return fmin(white_score / white_score_count, black_score / black_score_count);
+ }
+@@ -933,18 +958,29 @@
+             refine_edges(td, im, quad_original);
+         }
+ 
++#ifdef APRILTAG_WORKLOAD_COUNTERS
++        int family_count = zarray_size(td->tag_families);
++        td->workload_counters->quad_family_candidates += family_count;
++#endif
++
+         // make sure the homographies are computed...
+-        if (quad_update_homographies(quad_original) != 0)
++        if (quad_update_homographies(quad_original) != 0) {
++#ifdef APRILTAG_WORKLOAD_COUNTERS
++            td->workload_counters->homography_rejects += zarray_size(td->tag_families);
++#endif
+             continue;
++        }
+ 
+         for (int famidx = 0; famidx < zarray_size(td->tag_families); famidx++) {
+             apriltag_family_t *family;
+             zarray_get(td->tag_families, famidx, &family);
+ 
+             if (family->reversed_border != quad_original->reversed_border) {
++#ifdef APRILTAG_WORKLOAD_COUNTERS
++                td->workload_counters->family_polarity_rejects++;
++#endif
+                 continue;
+             }
+-
+             // since the geometry of tag families can vary, start any
+             // optimization process over with the original quad.
+             struct quad *quad = quad_copy(quad_original);
+@@ -997,6 +1033,9 @@
+                 pthread_mutex_lock(&td->mutex);
+                 zarray_add(task->detections, &det);
+                 pthread_mutex_unlock(&td->mutex);
++#ifdef APRILTAG_WORKLOAD_COUNTERS
++                td->workload_counters->raw_detections++;
++#endif
+             }
+ 
+             quad_destroy(quad);
+@@ -1029,6 +1068,18 @@
+ 
+ zarray_t *apriltag_detector_detect(apriltag_detector_t *td, image_u8_t *im_orig)
+ {
++#ifdef APRILTAG_WORKLOAD_COUNTERS
++    apriltag_workload_counters_t *wc=td->workload_counters;
++    memset(wc,0,sizeof(*wc));
++    wc->schema_version=APRILTAG_WORKLOAD_SCHEMA_VERSION;
++    wc->struct_size=sizeof(*wc);
++    wc->validity=APRILTAG_WORKLOAD_VALID_INPUT;
++    wc->input_width=im_orig->width; wc->input_height=im_orig->height; wc->uf_granularity=APRILTAG_WORKLOAD_UF_GRANULARITY_PIXEL;
++    if (td->nthreads != 1) {
++        errno = EINVAL;
++        return NULL;
++    }
++#endif
+     if (zarray_size(td->tag_families) == 0) {
+         zarray_t *s = zarray_create(sizeof(apriltag_detection_t*));
+         debug_print("No tag families enabled\n");
+@@ -1057,6 +1108,9 @@
+         timeprofile_stamp(td->tp, "decimate");
+     }
+ 
++#ifdef APRILTAG_WORKLOAD_COUNTERS
++    wc->decimated_width=quad_im->width; wc->decimated_height=quad_im->height; wc->decimated_checksum=workload_checksum(quad_im);
++#endif
+     if (td->quad_sigma != 0) {
+         // compute a reasonable kernel width by figuring that the
+         // kernel should go out 2 std devs.
+@@ -1108,6 +1162,15 @@
+         image_u8_write_pnm(quad_im, "debug_preprocess.pnm");
+ 
+     zarray_t *quads = apriltag_quad_thresh(td, quad_im);
++#ifdef APRILTAG_WORKLOAD_COUNTERS
++    wc->validity |= APRILTAG_WORKLOAD_VALID_COMMON_THRESHOLD |
++        APRILTAG_WORKLOAD_VALID_COMMON_SEGMENTATION |
++        APRILTAG_WORKLOAD_VALID_COMMON_FITTING |
++        APRILTAG_WORKLOAD_VALID_COMPARABLE_UF |
++        APRILTAG_WORKLOAD_VALID_COMPARABLE_LINE_FIT |
++        APRILTAG_WORKLOAD_VALID_C_SPECIFIC |
++        APRILTAG_WORKLOAD_VALID_CLUSTER_REJECT_BORDER_POLARITY;
++#endif
+ 
+     // adjust centers of pixels so that they correspond to the
+     // original full-resolution image.
+@@ -1181,6 +1244,10 @@
+         }
+ 
+         workerpool_run(td->wp);
++#ifdef APRILTAG_WORKLOAD_COUNTERS
++        wc->validity |= APRILTAG_WORKLOAD_VALID_COMMON_DECODE |
++            APRILTAG_WORKLOAD_VALID_FAMILY_POLARITY_REJECTS;
++#endif
+ 
+         free(tasks);
+ 
+@@ -1244,6 +1311,9 @@
+                     zarray_set(poly1, k, det1->p[k], NULL);
+ 
+                 if (g2d_polygon_overlaps_polygon(poly0, poly1)) {
++#ifdef APRILTAG_WORKLOAD_COUNTERS
++                    wc->duplicate_rejects++;
++#endif
+                     // the tags overlap. Delete one, keep the other.
+ 
+                     int pref = 0; // 0 means undecided which one we'll keep.
+@@ -1427,6 +1497,9 @@
+     zarray_destroy(quads);
+ 
+     zarray_sort(detections, detection_compare_function);
++#ifdef APRILTAG_WORKLOAD_COUNTERS
++    wc->detections=zarray_size(detections);
++#endif
+     timeprofile_stamp(td->tp, "cleanup");
+ 
+     return detections;
+--- a/apriltag.h
++++ b/apriltag.h
+@@ -40,6 +40,10 @@
+ #include "common/timeprofile.h"
+ #include "common/pthreads_cross.h"
+ 
++#ifdef APRILTAG_WORKLOAD_COUNTERS
++struct apriltag_workload_counters;
++#endif
++
+ #define APRILTAG_TASKS_PER_THREAD_TARGET 10
+ 
+ struct quad
+@@ -188,6 +192,9 @@
+ 
+     // Used for thread safety.
+     pthread_mutex_t mutex;
++#ifdef APRILTAG_WORKLOAD_COUNTERS
++    struct apriltag_workload_counters *workload_counters;
++#endif
+ };
+ 
+ // Represents the detection of a tag. These are returned to the user
+--- a/apriltag_quad_thresh.c
++++ b/apriltag_quad_thresh.c
+@@ -36,6 +36,20 @@
+ #include <stdint.h>
+ 
+ #include "apriltag.h"
++#ifdef APRILTAG_WORKLOAD_COUNTERS
++#include "apriltag_workload.h"
++#define WORKLOAD_PARAM , apriltag_workload_counters_t *wc
++#define WORKLOAD_ARG(td) , (td)->workload_counters
++#define WORKLOAD_TASK_ARG(task) , (task)->wc
++#define WORKLOAD_CLUSTER_TASK_ARG(task) , &(task)->counters
++#define WORKLOAD_COUNTER_ARG , wc
++#else
++#define WORKLOAD_PARAM
++#define WORKLOAD_ARG(td)
++#define WORKLOAD_TASK_ARG(task)
++#define WORKLOAD_CLUSTER_TASK_ARG(task)
++#define WORKLOAD_COUNTER_ARG
++#endif
+ #include "common/image_u8x3.h"
+ #include "common/zarray.h"
+ #include "common/unionfind.h"
+@@ -78,6 +92,9 @@
+     int w, h, s;
+     unionfind_t *uf;
+     image_u8_t *im;
++#ifdef APRILTAG_WORKLOAD_COUNTERS
++    apriltag_workload_counters_t *wc;
++#endif
+ };
+ 
+ struct quad_task
+@@ -105,6 +122,9 @@
+     unionfind_t* uf;
+     image_u8_t* im;
+     zarray_t* clusters;
++#ifdef APRILTAG_WORKLOAD_COUNTERS
++    apriltag_workload_counters_t counters;
++#endif
+ };
+ 
+ struct minmax_task {
+@@ -172,10 +192,13 @@
+ //
+ // fit a line to the points [i0, i1] (inclusive). i0, i1 are both [0,
+ // sz) if i1 < i0, we treat this as a wrap around.
+-void fit_line(struct line_fit_pt *lfps, int sz, int i0, int i1, double *lineparm, double *err, double *mse)
++void fit_line(struct line_fit_pt *lfps, int sz, int i0, int i1, double *lineparm, double *err, double *mse WORKLOAD_PARAM)
+ {
+     assert(i0 != i1);
+     assert(i0 >= 0 && i1 >= 0 && i0 < sz && i1 < sz);
++#ifdef APRILTAG_WORKLOAD_COUNTERS
++    wc->line_fit_queries++; wc->fit_line_calls++;
++#endif
+ 
+     double Mx, My, Mxx, Myy, Mxy, W;
+     int N; // how many points are included in the set?
+@@ -221,6 +244,9 @@
+     }
+ 
+     assert(N >= 2);
++#ifdef APRILTAG_WORKLOAD_COUNTERS
++    wc->line_fit_query_points += N; wc->fit_line_span_points += N;
++#endif
+ 
+     double Ex = Mx / W;
+     double Ey = My / W;
+@@ -344,8 +370,11 @@
+     double *errs = malloc(sizeof(double)*sz);
+ 
+     for (int i = 0; i < sz; i++) {
+-        fit_line(lfps, sz, (i + sz - ksz) % sz, (i + ksz) % sz, NULL, &errs[i], NULL);
++        fit_line(lfps, sz, (i + sz - ksz) % sz, (i + ksz) % sz, NULL, &errs[i], NULL WORKLOAD_ARG(td));
+     }
++#ifdef APRILTAG_WORKLOAD_COUNTERS
++    td->workload_counters->points_entering_errors += sz; td->workload_counters->compute_errors_calls++; td->workload_counters->compute_errors_points += sz;
++#endif
+ 
+     // apply a low-pass filter to errs
+     if (1) {
+@@ -404,6 +433,9 @@
+         }
+     }
+     free(errs);
++#ifdef APRILTAG_WORKLOAD_COUNTERS
++    td->workload_counters->raw_peaks += nmaxima;
++#endif
+ 
+     // if we didn't get at least 4 maxima, we can't fit a quad.
+     if (nmaxima < 4){
+@@ -433,6 +465,9 @@
+         free(maxima_errs_copy);
+     }
+     free(maxima_errs);
++#ifdef APRILTAG_WORKLOAD_COUNTERS
++    td->workload_counters->retained_peaks += nmaxima;
++#endif
+ 
+     int best_indices[4];
+     double best_error = HUGE_VALF;
+@@ -450,7 +485,7 @@
+         for (int m1 = m0+1; m1 < nmaxima - 2; m1++) {
+             int i1 = maxima[m1];
+ 
+-            fit_line(lfps, sz, i0, i1, params01, &err01, &mse01);
++            fit_line(lfps, sz, i0, i1, params01, &err01, &mse01 WORKLOAD_ARG(td));
+ 
+             if (mse01 > td->qtp.max_line_fit_mse)
+                 continue;
+@@ -458,7 +493,7 @@
+             for (int m2 = m1+1; m2 < nmaxima - 1; m2++) {
+                 int i2 = maxima[m2];
+ 
+-                fit_line(lfps, sz, i1, i2, params12, &err12, &mse12);
++                fit_line(lfps, sz, i1, i2, params12, &err12, &mse12 WORKLOAD_ARG(td));
+                 if (mse12 > td->qtp.max_line_fit_mse)
+                     continue;
+ 
+@@ -469,11 +504,11 @@
+                 for (int m3 = m2+1; m3 < nmaxima; m3++) {
+                     int i3 = maxima[m3];
+ 
+-                    fit_line(lfps, sz, i2, i3, NULL, &err23, &mse23);
++                    fit_line(lfps, sz, i2, i3, NULL, &err23, &mse23 WORKLOAD_ARG(td));
+                     if (mse23 > td->qtp.max_line_fit_mse)
+                         continue;
+ 
+-                    fit_line(lfps, sz, i3, i0, NULL, &err30, &mse30);
++                    fit_line(lfps, sz, i3, i0, NULL, &err30, &mse30 WORKLOAD_ARG(td));
+                     if (mse30 > td->qtp.max_line_fit_mse)
+                         continue;
+ 
+@@ -504,7 +539,7 @@
+ }
+ 
+ // returns 0 if the cluster looks bad.
+-int quad_segment_agg(zarray_t *cluster, struct line_fit_pt *lfps, int indices[4])
++int quad_segment_agg(zarray_t *cluster, struct line_fit_pt *lfps, int indices[4] WORKLOAD_PARAM)
+ {
+     int sz = zarray_size(cluster);
+ 
+@@ -534,7 +569,7 @@
+             rv->right = (i+1) % sz;
+         }
+ 
+-        fit_line(lfps, sz, rv->left, rv->right, NULL, NULL, &rv->err);
++        fit_line(lfps, sz, rv->left, rv->right, NULL, NULL, &rv->err WORKLOAD_COUNTER_ARG);
+ 
+         zmaxheap_add(heap, &rv, -rv->err);
+ 
+@@ -578,7 +613,7 @@
+             child->left = segs[rv->left].left;
+             child->right = rv->right;
+ 
+-            fit_line(lfps, sz, child->left, child->right, NULL, NULL, &child->err);
++            fit_line(lfps, sz, child->left, child->right, NULL, NULL, &child->err WORKLOAD_COUNTER_ARG);
+ 
+             zmaxheap_add(heap, &child, -child->err);
+         }
+@@ -590,7 +625,7 @@
+             child->left = rv->left;
+             child->right = segs[rv->right].right;
+ 
+-            fit_line(lfps, sz, child->left, child->right, NULL, NULL, &child->err);
++            fit_line(lfps, sz, child->left, child->right, NULL, NULL, &child->err WORKLOAD_COUNTER_ARG);
+ 
+             zmaxheap_add(heap, &child, -child->err);
+         }
+@@ -768,6 +803,10 @@
+     int sz = zarray_size(cluster);
+-    if (sz < 24) // Synchronize with later check.
++    if (sz < 24) { // Synchronize with later check.
++#ifdef APRILTAG_WORKLOAD_COUNTERS
++        td->workload_counters->cluster_reject_too_few_points++;
++#endif
+         return 0;
++    }
+ 
+     /////////////////////////////////////////////////////////////
+     // Step 1. Sort points so they wrap around the center of the
+@@ -800,6 +838,9 @@
+     }
+ 
+     if ((xmax - xmin)*(ymax - ymin) < tag_width) {
++#ifdef APRILTAG_WORKLOAD_COUNTERS
++        td->workload_counters->cluster_reject_extent++;
++#endif
+         return 0;
+     }
+ 
+@@ -841,18 +882,35 @@
+     // Ensure that the black border is inside the white border.
+     quad->reversed_border = dot < 0;
+     if (!reversed_border && quad->reversed_border) {
++#ifdef APRILTAG_WORKLOAD_COUNTERS
++        td->workload_counters->cluster_reject_border_polarity++;
++#endif
+         return 0;
+     }
+     if (!normal_border && !quad->reversed_border) {
++#ifdef APRILTAG_WORKLOAD_COUNTERS
++        td->workload_counters->cluster_reject_border_polarity++;
++#endif
+         return 0;
+     }
+ 
++#ifdef APRILTAG_WORKLOAD_COUNTERS
++    td->workload_counters->clusters_after_filters++;
++    td->workload_counters->quad_fit_attempts++;
++#endif
++
+     // we now sort the points according to theta. This is a prepatory
+     // step for segmenting them into four lines.
+     if (1) {
++#ifdef APRILTAG_WORKLOAD_COUNTERS
++        td->workload_counters->points_entering_sort += sz;
++#endif
+         ptsort((struct pt*) cluster->data, zarray_size(cluster));
+     }
+ 
++#ifdef APRILTAG_WORKLOAD_COUNTERS
++    td->workload_counters->points_entering_lfps += sz;
++#endif
+     struct line_fit_pt *lfps = compute_lfps(sz, cluster, im);
+ 
+     int indices[4];
+@@ -860,7 +913,7 @@
+         if (!quad_segment_maxima(td, cluster, lfps, indices))
+             goto finish;
+     } else {
+-        if (!quad_segment_agg(cluster, lfps, indices))
++        if (!quad_segment_agg(cluster, lfps, indices WORKLOAD_ARG(td)))
+             goto finish;
+     }
+ 
+@@ -872,7 +925,7 @@
+         int i1 = indices[(i+1)&3];
+ 
+         double mse;
+-        fit_line(lfps, sz, i0, i1, lines[i], NULL, &mse);
++        fit_line(lfps, sz, i0, i1, lines[i], NULL, &mse WORKLOAD_ARG(td));
+ 
+         if (mse > td->qtp.max_line_fit_mse) {
+             res = 0;
+@@ -979,9 +1032,13 @@
+     return res;
+ }
+ 
++#ifdef APRILTAG_WORKLOAD_COUNTERS
++#define DO_UNIONFIND2(dx, dy) if (im->buf[(y + dy)*s + x + dx] == v) { uint32_t a=unionfind_get_representative(uf,y*w+x),b=unionfind_get_representative(uf,(y+dy)*w+x+dx); wc->uf_union_attempts++; if(a!=b) wc->uf_union_successes++; unionfind_connect(uf,a,b); }
++#else
+ #define DO_UNIONFIND2(dx, dy) if (im->buf[(y + dy)*s + x + dx] == v) unionfind_connect(uf, y*w + x, (y + dy)*w + x + dx);
++#endif
+ 
+-static void do_unionfind_first_line(unionfind_t *uf, image_u8_t *im, int w, int s)
++static void do_unionfind_first_line(unionfind_t *uf, image_u8_t *im, int w, int s WORKLOAD_PARAM)
+ {
+     int y = 0;
+     uint8_t v;
+@@ -996,7 +1053,7 @@
+     }
+ }
+ 
+-static void do_unionfind_line2(unionfind_t *uf, image_u8_t *im, int w, int s, int y)
++static void do_unionfind_line2(unionfind_t *uf, image_u8_t *im, int w, int s, int y WORKLOAD_PARAM)
+ {
+     assert(y > 0);
+ 
+@@ -1042,7 +1099,7 @@
+     struct unionfind_task *task = (struct unionfind_task*) p;
+ 
+     for (int y = task->y0; y < task->y1; y++) {
+-        do_unionfind_line2(task->uf, task->im, task->w, task->s, y);
++        do_unionfind_line2(task->uf, task->im, task->w, task->s, y WORKLOAD_TASK_ARG(task));
+     }
+ }
+ 
+@@ -1060,8 +1117,16 @@
+         zarray_t **cluster;
+         zarray_get_volatile(clusters, cidx, &cluster);
+ 
++#ifdef APRILTAG_WORKLOAD_COUNTERS
++        int cluster_size = zarray_size(*cluster);
++        if (cluster_size < td->qtp.min_cluster_pixels) {
++            td->workload_counters->cluster_reject_too_few_points++;
++            continue;
++        }
++#else
+         if (zarray_size(*cluster) < td->qtp.min_cluster_pixels)
+             continue;
++#endif
+ 
+         // a cluster should contain only boundary points around the
+         // tag. it cannot be bigger than the whole screen. (Reject
+@@ -1070,8 +1135,11 @@
+         // times (because it has 2 unique neighbors). The maximum
+         // perimeter is 2w+2h.
+         if (zarray_size(*cluster) > 2*(2*w+2*h)) {
++#ifdef APRILTAG_WORKLOAD_COUNTERS
++            td->workload_counters->cluster_reject_too_large++;
++#endif
+             continue;
+         }
+ 
+         struct quad quad;
+         memset(&quad, 0, sizeof(struct quad));
+@@ -1079,6 +1147,9 @@
+         if (fit_quad(td, task->im, *cluster, &quad, task->tag_width, task->normal_border, task->reversed_border)) {
+             pthread_mutex_lock(&td->mutex);
+             zarray_add(quads, &quad);
++#ifdef APRILTAG_WORKLOAD_COUNTERS
++            td->workload_counters->quads++;
++#endif
+             pthread_mutex_unlock(&td->mutex);
+         }
+     }
+@@ -1372,6 +1448,9 @@
+     }
+ 
+     timeprofile_stamp(td->tp, "threshold");
++#ifdef APRILTAG_WORKLOAD_COUNTERS
++    apriltag_workload_counters_t *wc=td->workload_counters; uint64_t hash=UINT64_C(0xcbf29ce484222325); for(int y=0;y<h;y++) for(int x=0;x<w;x++){uint8_t v=threshim->buf[y*s+x];hash^=v;hash*=UINT64_C(0x100000001b3);if(v==0)wc->threshold_black_pixels++;else if(v==127)wc->threshold_uncertain_pixels++;else if(v==255)wc->threshold_white_pixels++;} wc->threshold_checksum=hash;
++#endif
+ 
+     return threshim;
+ }
+@@ -1497,14 +1576,17 @@
+ 
+ unionfind_t* connected_components(apriltag_detector_t *td, image_u8_t* threshim, int w, int h, int ts) {
+     unionfind_t *uf = unionfind_create(w * h);
++#ifdef APRILTAG_WORKLOAD_COUNTERS
++    apriltag_workload_counters_t *wc=td->workload_counters; wc->uf_elements=(uint64_t)w*h; for(int y=0;y<h;y++)for(int x=0;x<w;x++)if(threshim->buf[y*ts+x]!=127)wc->active_uf_pixels++;
++#endif
+ 
+     if (td->nthreads <= 1) {
+-        do_unionfind_first_line(uf, threshim, w, ts);
++        do_unionfind_first_line(uf, threshim, w, ts WORKLOAD_COUNTER_ARG);
+         for (int y = 1; y < h; y++) {
+-            do_unionfind_line2(uf, threshim, w, ts, y);
++            do_unionfind_line2(uf, threshim, w, ts, y WORKLOAD_COUNTER_ARG);
+         }
+     } else {
+-        do_unionfind_first_line(uf, threshim, w, ts);
++        do_unionfind_first_line(uf, threshim, w, ts WORKLOAD_COUNTER_ARG);
+ 
+         int sz = h;
+         int chunksize = 1 + sz / (APRILTAG_TASKS_PER_THREAD_TARGET * td->nthreads);
+@@ -1525,6 +1607,9 @@
+             tasks[ntasks].s = ts;
+             tasks[ntasks].uf = uf;
+             tasks[ntasks].im = threshim;
++#ifdef APRILTAG_WORKLOAD_COUNTERS
++            tasks[ntasks].wc = wc;
++#endif
+ 
+             workerpool_add_task(td->wp, do_unionfind_task2, &tasks[ntasks]);
+             ntasks++;
+@@ -1534,7 +1619,7 @@
+ 
+         // XXX stitch together the different chunks.
+         for (int i = 1; i < ntasks; i++) {
+-            do_unionfind_line2(uf, threshim, w, ts, tasks[i].y0 - 1);
++            do_unionfind_line2(uf, threshim, w, ts, tasks[i].y0 - 1 WORKLOAD_COUNTER_ARG);
+         }
+ 
+         free(tasks);
+@@ -1542,7 +1627,7 @@
+     return uf;
+ }
+ 
+-zarray_t* do_gradient_clusters(image_u8_t* threshim, int ts, int y0, int y1, int w, int nclustermap, unionfind_t* uf, zarray_t* clusters) {
++zarray_t* do_gradient_clusters(image_u8_t* threshim, int ts, int y0, int y1, int w, int nclustermap, unionfind_t* uf, zarray_t* clusters WORKLOAD_PARAM) {
+     struct uint64_zarray_entry **clustermap = calloc(nclustermap, sizeof(struct uint64_zarray_entry*));
+ 
+     int mem_chunk_size = 2048;
+@@ -1589,8 +1674,18 @@
+             // within the same cluster.
+ 
+             bool connected;
++#ifdef APRILTAG_WORKLOAD_COUNTERS
++#define WORKLOAD_CANDIDATE() ((void)0)
++#define WORKLOAD_EMIT() wc->boundary_points_emitted++
++#define WORKLOAD_CLUSTER() wc->cluster_hash_entries++
++#else
++#define WORKLOAD_CANDIDATE() ((void)0)
++#define WORKLOAD_EMIT() ((void)0)
++#define WORKLOAD_CLUSTER() ((void)0)
++#endif
+ #define DO_CONN(dx, dy)                                                 \
+             if (1) {                                                    \
++                WORKLOAD_CANDIDATE();                                   \
+                 uint8_t v1 = threshim->buf[(y + dy)*ts + x + dx];       \
+                                                                         \
+                 if (v0 + v1 == 255) {                                   \
+@@ -1610,6 +1705,7 @@
+                         }                                                   \
+                                                                             \
+                         if (!entry) {                                       \
++                            WORKLOAD_CLUSTER();                              \
+                             if (mem_pool_loc == mem_chunk_size) {           \
+                                 mem_pool_loc = 0;                           \
+                                 mem_pool_idx++;                             \
+@@ -1626,6 +1722,7 @@
+                                                                             \
+                         struct pt p = { .x = 2*x + dx, .y = 2*y + dy, .gx = dx*((int) v1-v0), .gy = dy*((int) v1-v0)}; \
+                         zarray_add(entry->cluster, &p);                     \
++                        WORKLOAD_EMIT();                                    \
+                         connected = true;                                   \
+                     }                                                   \
+                 }                                                       \
+@@ -1649,6 +1746,9 @@
+         }
+     }
+ #undef DO_CONN
++#undef WORKLOAD_CANDIDATE
++#undef WORKLOAD_EMIT
++#undef WORKLOAD_CLUSTER
+ 
+     for (int i = 0; i < nclustermap; i++) {
+         int start = zarray_size(clusters);
+@@ -1690,7 +1790,7 @@
+ {
+     struct cluster_task *task = (struct cluster_task*) p;
+ 
+-    do_gradient_clusters(task->im, task->s, task->y0, task->y1, task->w, task->nclustermap, task->uf, task->clusters);
++    do_gradient_clusters(task->im, task->s, task->y0, task->y1, task->w, task->nclustermap, task->uf, task->clusters WORKLOAD_CLUSTER_TASK_ARG(task));
+ }
+ 
+ zarray_t* merge_clusters(zarray_t* c1, zarray_t* c2) {
+@@ -1754,6 +1854,9 @@
+         tasks[ntasks].im = threshim;
+         tasks[ntasks].nclustermap = nclustermap/(sz / chunksize + 1);
+         tasks[ntasks].clusters = zarray_create(sizeof(struct cluster_hash*));
++#ifdef APRILTAG_WORKLOAD_COUNTERS
++        memset(&tasks[ntasks].counters, 0, sizeof(tasks[ntasks].counters));
++#endif
+ 
+         workerpool_add_task(td->wp, do_cluster_task, &tasks[ntasks]);
+         ntasks++;
+@@ -1761,6 +1864,13 @@
+ 
+     workerpool_run(td->wp);
+ 
++#ifdef APRILTAG_WORKLOAD_COUNTERS
++    for (int i = 0; i < ntasks; i++) {
++        td->workload_counters->boundary_points_emitted += tasks[i].counters.boundary_points_emitted;
++        td->workload_counters->cluster_hash_entries += tasks[i].counters.cluster_hash_entries;
++    }
++#endif
++
+     zarray_t** clusters_list = malloc(sizeof(zarray_t *)*ntasks);
+     for (int i = 0; i < ntasks; i++) {
+         clusters_list[i] = tasks[i].clusters;
+@@ -1790,6 +1900,9 @@
+         free(*hash);
+     }
+     zarray_destroy(clusters_list[0]);
++#ifdef APRILTAG_WORKLOAD_COUNTERS
++    td->workload_counters->clusters_created = zarray_size(clusters);
++#endif
+     free(clusters_list);
+     free(tasks);
+     return clusters;
+--- /dev/null
++++ b/apriltag_workload.h
+@@ -0,0 +1,55 @@
++#ifndef APRILTAG_WORKLOAD_H
++#define APRILTAG_WORKLOAD_H
++#include <stdint.h>
++#ifdef __cplusplus
++extern "C" {
++#endif
++#define APRILTAG_WORKLOAD_SCHEMA_VERSION UINT32_C(1)
++#define APRILTAG_WORKLOAD_VALID_INPUT (UINT64_C(1)<<0)
++#define APRILTAG_WORKLOAD_VALID_COMMON_THRESHOLD (UINT64_C(1)<<1)
++#define APRILTAG_WORKLOAD_VALID_COMMON_SEGMENTATION (UINT64_C(1)<<2)
++#define APRILTAG_WORKLOAD_VALID_COMMON_FITTING (UINT64_C(1)<<3)
++#define APRILTAG_WORKLOAD_VALID_COMMON_DECODE (UINT64_C(1)<<4)
++#define APRILTAG_WORKLOAD_VALID_COMPARABLE_UF (UINT64_C(1)<<5)
++#define APRILTAG_WORKLOAD_VALID_COMPARABLE_LINE_FIT (UINT64_C(1)<<6)
++#define APRILTAG_WORKLOAD_VALID_RUST_RLE (UINT64_C(1)<<7)
++#define APRILTAG_WORKLOAD_VALID_RUST_BOUNDARY (UINT64_C(1)<<8)
++#define APRILTAG_WORKLOAD_VALID_RUST_PAIR_STATS (UINT64_C(1)<<9)
++#define APRILTAG_WORKLOAD_VALID_C_SPECIFIC (UINT64_C(1)<<10)
++#define APRILTAG_WORKLOAD_VALID_CLUSTER_REJECT_BORDER_POLARITY (UINT64_C(1)<<11)
++#define APRILTAG_WORKLOAD_VALID_FAMILY_POLARITY_REJECTS (UINT64_C(1)<<12)
++#define APRILTAG_WORKLOAD_VALID_COMPARABLE_BOUNDARY_CANDIDATES (UINT64_C(1)<<13)
++#define APRILTAG_WORKLOAD_VALID_HYPOTHETICAL_EARLY_POLARITY (UINT64_C(1)<<14)
++#define APRILTAG_WORKLOAD_UF_GRANULARITY_PIXEL UINT64_C(2)
++typedef struct apriltag_workload_counters {
++ uint32_t schema_version, struct_size; uint64_t validity;
++ uint64_t input_width,input_height,decimated_width,decimated_height,decimated_checksum,threshold_checksum;
++ uint64_t threshold_black_pixels,threshold_uncertain_pixels,threshold_white_pixels;
++ uint64_t boundary_candidates,boundary_points_emitted,clusters_created,clusters_after_filters;
++ uint64_t cluster_reject_too_few_points,cluster_reject_too_large,cluster_reject_extent,cluster_reject_border_polarity;
++ uint64_t points_entering_sort,points_entering_lfps,points_entering_errors,compute_errors_calls,compute_errors_points;
++ uint64_t raw_peaks,retained_peaks,quad_fit_attempts,quads,quad_family_candidates,homography_rejects;
++ uint64_t family_polarity_rejects,decode_attempts,photometric_polarity_rejects,codeword_rejects;
++ uint64_t raw_detections,duplicate_rejects,detections;
++ uint64_t uf_elements,uf_union_attempts,uf_union_successes,uf_granularity,line_fit_queries,line_fit_query_points;
++ uint64_t rle_runs,pending_boundary_records,pending_boundary_expanded_points,rvv_runs_repacked;
++ uint64_t pair_stats_computed,pair_stats_span_points,pair_table_lookups;
++ uint64_t active_uf_pixels,fit_line_calls,fit_line_span_points,cluster_hash_entries;
++ uint64_t hypothetical_early_polarity_reject_clusters,hypothetical_early_polarity_reject_points;
++ uint64_t hypothetical_wasted_sort_points,hypothetical_wasted_lfps_points;
++ uint64_t hypothetical_wasted_compute_errors_points,hypothetical_wasted_peak_search_clusters;
++} apriltag_workload_counters_t;
++#include "apriltag.h"
++int apriltag_get_workload_counters(apriltag_detector_t*,apriltag_workload_counters_t*);
++apriltag_detector_t *c_apriltag_detector_create(void);
++void c_apriltag_detector_destroy(apriltag_detector_t*);
++void c_apriltag_detector_add_family_bits(apriltag_detector_t*,apriltag_family_t*,int);
++zarray_t *c_apriltag_detector_detect(apriltag_detector_t*,image_u8_t*);
++void c_apriltag_detections_destroy(zarray_t*);
++int c_apriltag_get_workload_counters(apriltag_detector_t*,apriltag_workload_counters_t*);
++apriltag_family_t *c_tag36h11_create(void);
++void c_tag36h11_destroy(apriltag_family_t*);
++#ifdef __cplusplus
++}
++#endif
++#endif
+--- /dev/null
++++ b/test/test_workload.c
+@@ -0,0 +1,82 @@
++#include "apriltag.h"
++#include "apriltag_workload.h"
++#include "tag36h11.h"
++
++#include <errno.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include <stdio.h>
++#define CHECK(condition) do { if (!(condition)) { fprintf(stderr, "check failed at line %d: %s\n", __LINE__, #condition); abort(); } } while (0)
++
++static image_u8_t make_image(unsigned char *pixels, int width, int height)
++{
++    image_u8_t image = {width, height, width, pixels};
++    return image;
++}
++
++int main(void)
++{
++    unsigned char pixels_a[64 * 64];
++    unsigned char pixels_b[64 * 64];
++    memset(pixels_a, 0, sizeof(pixels_a));
++    for (int i = 0; i < 64 * 64; i++) pixels_b[i] = (unsigned char)i;
++    image_u8_t image_a = make_image(pixels_a, 64, 64);
++    image_u8_t image_b = make_image(pixels_b, 64, 64);
++    apriltag_detector_t *first = c_apriltag_detector_create();
++    apriltag_detector_t *second = c_apriltag_detector_create();
++    apriltag_workload_counters_t a, b, before;
++    CHECK(first && second);
++
++    zarray_t *detections = c_apriltag_detector_detect(first, &image_a);
++    CHECK(detections);
++    c_apriltag_detections_destroy(detections);
++    CHECK(c_apriltag_get_workload_counters(first, &a) == 0);
++    CHECK(a.validity == APRILTAG_WORKLOAD_VALID_INPUT);
++    CHECK(a.input_width == 64 && a.input_height == 64);
++
++    apriltag_family_t *family = c_tag36h11_create();
++    c_apriltag_detector_add_family_bits(first, family, 0);
++    detections = c_apriltag_detector_detect(first, &image_a);
++    CHECK(detections);
++    c_apriltag_detections_destroy(detections);
++    CHECK(c_apriltag_get_workload_counters(first, &a) == 0);
++    CHECK((a.validity & APRILTAG_WORKLOAD_VALID_COMMON_DECODE) != 0);
++    CHECK(APRILTAG_WORKLOAD_VALID_COMPARABLE_BOUNDARY_CANDIDATES ==
++          (UINT64_C(1) << 13));
++    CHECK(a.boundary_candidates == 0);
++    CHECK((a.validity &
++           APRILTAG_WORKLOAD_VALID_COMPARABLE_BOUNDARY_CANDIDATES) == 0);
++    CHECK(a.threshold_black_pixels + a.threshold_uncertain_pixels +
++           a.threshold_white_pixels == a.decimated_width * a.decimated_height);
++    CHECK(a.clusters_after_filters == a.quad_fit_attempts);
++    CHECK(a.clusters_after_filters + a.cluster_reject_too_few_points +
++           a.cluster_reject_too_large + a.cluster_reject_extent +
++           a.cluster_reject_border_polarity == a.clusters_created);
++    CHECK(a.quad_family_candidates == a.homography_rejects +
++           a.family_polarity_rejects + a.decode_attempts);
++
++    CHECK(c_apriltag_get_workload_counters(first, &before) == 0);
++    apriltag_family_t *second_family = c_tag36h11_create();
++    c_apriltag_detector_add_family_bits(second, second_family, 0);
++    detections = c_apriltag_detector_detect(second, &image_b);
++    CHECK(detections);
++    c_apriltag_detections_destroy(detections);
++    CHECK(c_apriltag_get_workload_counters(second, &b) == 0);
++    CHECK(c_apriltag_get_workload_counters(first, &a) == 0);
++    CHECK(memcmp(&a, &before, sizeof(a)) == 0);
++    CHECK(a.decimated_checksum != b.decimated_checksum);
++
++    second->nthreads = 2;
++    errno = 0;
++    CHECK(c_apriltag_detector_detect(second, &image_b) == NULL);
++    CHECK(errno == EINVAL);
++    CHECK(c_apriltag_get_workload_counters(second, &b) == 0);
++    CHECK(b.validity == APRILTAG_WORKLOAD_VALID_INPUT);
++
++    c_apriltag_detector_destroy(first);
++    c_apriltag_detector_destroy(second);
++    c_tag36h11_destroy(family);
++    c_tag36h11_destroy(second_family);
++    return 0;
++}

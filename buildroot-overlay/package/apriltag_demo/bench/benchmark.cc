@@ -631,6 +631,7 @@ void print_usage(std::ostream& out, const char* program)
         << "  --help                 print this help\n";
 }
 
+#ifndef APRILTAG_BENCH_CORE_ONLY
 int benchmark_main(int argc, const char* const argv[], std::ostream& out,
                    std::ostream& err)
 {
@@ -658,5 +659,6 @@ int benchmark_main(int argc, const char* const argv[], std::ostream& out,
         return 1;
     }
 }
+#endif
 
 }  // namespace apriltag_bench

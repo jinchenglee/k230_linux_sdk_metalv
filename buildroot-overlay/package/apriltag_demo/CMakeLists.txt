@@ -12,9 +12,12 @@ set(rvv_bin apriltag_demo.elf)
 set(c_bin apriltag_c_demo.elf)
 set(bench_bin k230_apriltag_bench)
 set(bench_test_bin apriltag_bench_tests)
+set(workload_bin k230_apriltag_workload)
+set(workload_test_bin apriltag_workload_format_tests)
 set(APRILTAG_RVV_GIT_ID "unversioned" CACHE STRING "apriltag-rvv git identity")
 set(APRILTAG_SDK_GIT_ID "unversioned" CACHE STRING "SDK git identity")
 set(APRILTAG_RVV_LIB ${CMAKE_CURRENT_SOURCE_DIR}/lib/libapriltag_rvv.a)
+set(APRILTAG_RVV_WORKLOAD_LIB ${CMAKE_CURRENT_SOURCE_DIR}/lib/libapriltag_rvv_workload.a)
 
 add_executable(${rvv_bin} ${common_src})
 add_executable(${c_bin}
@@ -35,6 +38,15 @@ add_executable(${bench_test_bin}
     bench/rust_backend.cc
     bench/c_backend.cc
 )
+add_executable(${workload_bin}
+    bench/workload_main.cc bench/workload_rust.cc bench/workload_c.cc
+    bench/benchmark.cc bench/visual_dump.cc)
+add_executable(${workload_test_bin}
+    bench/workload_tests.cc bench/workload_main.cc bench/benchmark.cc)
+target_compile_definitions(${workload_test_bin} PRIVATE
+    APRILTAG_WORKLOAD_FORMAT_TEST APRILTAG_BENCH_NO_OPENCV APRILTAG_BENCH_CORE_ONLY)
+target_compile_definitions(${workload_bin} PRIVATE APRILTAG_BENCH_CORE_ONLY)
+target_include_directories(${workload_bin} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/lib)
 target_compile_options(${bench_bin} PRIVATE -fno-omit-frame-pointer)
 target_compile_definitions(${bench_test_bin} PRIVATE
     APRILTAG_BENCH_BACKEND_TESTS
@@ -70,7 +82,7 @@ include_directories(
     ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
 
-foreach(bin IN ITEMS ${rvv_bin} ${c_bin} ${bench_bin} ${bench_test_bin})
+foreach(bin IN ITEMS ${rvv_bin} ${c_bin} ${bench_bin} ${bench_test_bin} ${workload_bin})
     target_link_directories(${bin} PRIVATE
         ${usr_root}/lib
         ${CMAKE_SYSROOT}
@@ -81,6 +93,7 @@ endforeach()
 # Prebuilt Rust static library (built in the rvv-dev docker image; see
 # scripts/build_rust_lib.sh). Contains the apriltag_* C ABI + RVV kernels.
 set(APRILTAG_C_LIB ${usr_root}/lib/libapriltag.a)
+set(APRILTAG_C_WORKLOAD_LIB ${usr_root}/lib/libapriltag_workload.a)
 
 # Hash the exact archives, ABI header, and sources CMake will consume. The
 # compiler fields identify the configured cross-toolchain without hashing the
@@ -187,6 +200,12 @@ target_link_libraries(${bench_test_bin}
     rt
     -Wl,--end-group
 )
+target_link_libraries(${workload_bin}
+    -Wl,--start-group
+    ${APRILTAG_RVV_WORKLOAD_LIB}
+    ${APRILTAG_C_WORKLOAD_LIB}
+    opencv_imgcodecs opencv_imgproc opencv_core pthread dl m rt
+    -Wl,--end-group)
 
 if(CMAKE_TOOLCHAIN_FILE MATCHES "buildroot/toolchainfile.cmake")
     message(STATUS "Buildroot build -> AprilTag demos, profile tools, and benchmark")
@@ -195,10 +214,10 @@ if(CMAKE_TOOLCHAIN_FILE MATCHES "buildroot/toolchainfile.cmake")
     install(TARGETS ${c_bin} DESTINATION /root/app/apriltag_c_demo)
     install(DIRECTORY utils_c/ DESTINATION /root/app/apriltag_c_demo USE_SOURCE_PERMISSIONS)
     install(DIRECTORY utils_profile/ DESTINATION /root/app/apriltag_profile USE_SOURCE_PERMISSIONS)
-    install(TARGETS ${bench_bin} DESTINATION /root/app/apriltag_bench)
+    install(TARGETS ${bench_bin} ${workload_bin} DESTINATION /root/app/apriltag_bench)
     install(FILES bench/fixture.jpg DESTINATION /root/app/apriltag_bench)
     install(DIRECTORY utils_bench/ DESTINATION /root/app/apriltag_bench USE_SOURCE_PERMISSIONS)
 else()
     message(STATUS "Standalone build -> ./bin/")
-    install(TARGETS ${rvv_bin} ${c_bin} ${bench_bin} DESTINATION bin)
+    install(TARGETS ${rvv_bin} ${c_bin} ${bench_bin} ${workload_bin} DESTINATION bin)
 endif()
