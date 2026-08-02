@@ -41,6 +41,9 @@ if [ "$WORKLOAD" -eq 1 ] && [ -z "${APRILTAG_WORKLOAD_SOURCE_HASH:-}" ]; then
     echo "error: APRILTAG_WORKLOAD_SOURCE_HASH is required with --workload-only" >&2
     exit 2
 fi
+if [ "$WORKLOAD" -eq 0 ] && [ -z "${APRILTAG_SOURCE_HASH:-}" ]; then
+    APRILTAG_SOURCE_HASH="$($PKG_DIR/scripts/rust_source_hash.sh "$APRILTAG_RVV_DIR" production)"
+fi
 RVV_ARGS=()
 [ "$NO_RVV" -eq 0 ] || RVV_ARGS+=(--no-rvv)
 [ "$WORKLOAD" -eq 0 ] || RVV_ARGS+=(--workload-counters)
@@ -95,9 +98,13 @@ if [ "$WORKLOAD" -eq 1 ]; then
     trap - EXIT
 else
     ARCHIVE_TMP="$(mktemp "$PKG_DIR/lib/.${ARCHIVE}.XXXXXX")"
-    trap 'rm -f "$ARCHIVE_TMP"' EXIT
+    STAMP_TMP="$(mktemp "$PKG_DIR/lib/.source-hash.XXXXXX")"
+    trap 'rm -f "$ARCHIVE_TMP" "$STAMP_TMP"' EXIT
     cp -f "$SRC_A" "$ARCHIVE_TMP"
+    printf '%s\n' "$APRILTAG_SOURCE_HASH" >"$STAMP_TMP"
+    rm -f "$PKG_DIR/lib/.apriltag_rvv.source-hash"
     mv -f "$ARCHIVE_TMP" "$PKG_DIR/lib/$ARCHIVE"
+    mv -f "$STAMP_TMP" "$PKG_DIR/lib/.apriltag_rvv.source-hash"
     trap - EXIT
 fi
 echo "Copied -> $PKG_DIR/lib/$ARCHIVE"

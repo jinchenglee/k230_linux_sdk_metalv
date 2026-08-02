@@ -105,6 +105,15 @@ extern "C" int apriltag_set_debug_enabled(void* opaque, int enabled)
     return 0;
 }
 
+extern "C" int apriltag_configure_recovery(
+    void* opaque, int enabled, double min_full_res_extent)
+{
+    (void)opaque;
+    (void)enabled;
+    (void)min_full_res_extent;
+    return -1;
+}
+
 extern "C" int apriltag_set_debug_stage(void* opaque, int stage)
 {
     return opaque && stage == 0 ? 0 : -1;
@@ -124,6 +133,20 @@ extern "C" int apriltag_get_decode_stats(
 
 extern "C" int apriltag_get_decode_candidates(
     void* opaque, apriltag_decode_candidate_t* out, int max_out)
+{
+    return opaque && out && max_out > 0 ? 0 : -1;
+}
+
+extern "C" int apriltag_get_recovery_stats(
+    void* opaque, apriltag_recovery_stats_t* out)
+{
+    (void)opaque;
+    (void)out;
+    return -1;
+}
+
+extern "C" int apriltag_get_recovery_candidates(
+    void* opaque, apriltag_recovery_candidate_t* out, int max_out)
 {
     return opaque && out && max_out > 0 ? 0 : -1;
 }
@@ -175,6 +198,13 @@ extern "C" int apriltag_detect(
         out[i].margin = detection->decision_margin;
         out[i].center[0] = detection->c[0];
         out[i].center[1] = detection->c[1];
+        out[i].recovered = 0;
+        out[i].visible_edges = 0;
+        out[i].inferred_edges = 0;
+        out[i].erasure_count = 0;
+        out[i].corrected_bit_count = 0;
+        out[i].geometry_residual = 0.0;
+        out[i].recovery_group = 0;
         for (int corner = 0; corner < 4; ++corner) {
             out[i].corners[corner * 2] = detection->p[corner][0];
             out[i].corners[corner * 2 + 1] = detection->p[corner][1];

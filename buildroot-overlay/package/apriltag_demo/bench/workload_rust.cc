@@ -40,7 +40,7 @@ public:
             checksum.add(d);
         }
         apriltag_workload_counters_t native{};
-        if (apriltag_get_workload_counters(handle_, &native) != 1)
+        if (apriltag_get_workload_counters_v2(handle_, &native, sizeof(native)) != 1)
             throw std::runtime_error("Rust workload counter retrieval failed");
         WorkloadResult result{kind_, {count, checksum.value()}, {}};
         std::memcpy(&result.counters, &native, sizeof(native));

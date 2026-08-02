@@ -19,7 +19,7 @@ WorkloadResult sample(BackendKind kind, std::uint64_t scale)
     result.kind = kind;
     result.detection = {2, 0x1234};
     auto& c = result.counters;
-    c.schema_version = 1;
+    c.schema_version = 2;
     c.struct_size = sizeof(c);
     c.validity = kWorkloadValidInput | kWorkloadValidThreshold |
                  kWorkloadValidSegmentation | kWorkloadValidFitting |
@@ -51,6 +51,15 @@ void test_determinism_rejection()
     try { validate_workload_pair(a, changed); }
     catch (const std::runtime_error&) { threw = true; }
     CHECK(threw);
+    auto timer_changed = a;
+    ++timer_changed.counters.ccl_connected_components_ns;
+    validate_workload_pair(a, timer_changed);
+    auto provenance_changed = a;
+    provenance_changed.counters.provenance[0].dedup_detection_id = 7;
+    threw = false;
+    try { validate_workload_pair(a, provenance_changed); }
+    catch (const std::runtime_error&) { threw = true; }
+    CHECK(threw);
 }
 
 void test_schema_output()
@@ -64,8 +73,8 @@ void test_schema_output()
     const std::string text = out.str();
     CHECK(text.find("Common workload counters") != std::string::npos);
     CHECK(text.find("Early polarity estimates") != std::string::npos);
-    CHECK(text.find("WORKLOAD backend=rust-rvv schema=1") != std::string::npos);
-    CHECK(text.find("WORKLOAD backend=c-reference schema=1") != std::string::npos);
+    CHECK(text.find("WORKLOAD backend=rust-rvv schema=2") != std::string::npos);
+    CHECK(text.find("WORKLOAD backend=c-reference schema=2") != std::string::npos);
     CHECK(text.find("validity=0x3f") != std::string::npos);
     CHECK(text.find("boundary_points_emitted=200") != std::string::npos);
     CHECK(text.find("points_entering_sort=160") != std::string::npos);
@@ -82,6 +91,62 @@ void test_schema_output()
     CHECK(text.find("decode attempts: 2.000000x") != std::string::npos);
     CHECK(text.find("threshold_checksum_match=1") != std::string::npos);
     CHECK(text.find("output_match=1") != std::string::npos);
+    CHECK(text.find("CCL substage timers") != std::string::npos);
+    CHECK(text.find("Successful detection provenance") != std::string::npos);
+    CHECK(text.find("boundary_down_left_contrast") != std::string::npos);
+    CHECK(text.find("boundary_down_right_size_qualified") != std::string::npos);
+}
+
+void test_direction_and_timer_validity_are_precise()
+{
+    BenchmarkConfig config;
+    PreparedImage image{8, 6, 8, std::vector<std::uint8_t>(48)};
+    auto c = sample(BackendKind::CReference, 1);
+    c.counters.validity |= kWorkloadValidBoundaryDiagnostics | kWorkloadValidCclTimers;
+    c.counters.boundary_right_checks = 8;
+    c.counters.boundary_down_checks = 7;
+    c.counters.boundary_down_left_checks = 6;
+    c.counters.boundary_down_right_checks = 5;
+    c.counters.boundary_connected_last_suppressions = 4;
+    c.counters.ccl_timer_validity =
+        kWorkloadTimerUfInit | kWorkloadTimerConnectedComponents |
+        kWorkloadTimerGradientClustering;
+    c.counters.ccl_uf_init_ns = 1000;
+    c.counters.ccl_connected_components_ns = 2000;
+    c.counters.ccl_gradient_clustering_ns = 3000;
+    std::ostringstream out;
+    print_workload_report(config, image, {c}, out);
+    const std::string text = out.str();
+    CHECK(text.find("boundary_right_checks") != std::string::npos);
+    CHECK(text.find("ccl_uf_init_ns") != std::string::npos);
+    CHECK(text.find("ccl_total_ns") != std::string::npos);
+    CHECK(text.find("n/a") != std::string::npos);
+}
+
+void test_cross_backend_provenance_matches_id_and_nearest_center()
+{
+    BenchmarkConfig config;
+    PreparedImage image{8, 6, 8, std::vector<std::uint8_t>(48)};
+    auto rust = sample(BackendKind::RustRvv, 1);
+    auto c = sample(BackendKind::CReference, 1);
+    rust.counters.validity |= kWorkloadValidDetectionProvenance | kWorkloadValidCounterfactualDedup;
+    c.counters.validity |= kWorkloadValidDetectionProvenance;
+    rust.counters.provenance_count = c.counters.provenance_count = 1;
+    rust.counters.provenance[0].detection_id = c.counters.provenance[0].detection_id = 7;
+    rust.counters.provenance[0].detection_center_x_bits = double_bits(10.0);
+    rust.counters.provenance[0].detection_center_y_bits = double_bits(12.0);
+    c.counters.provenance[0].detection_center_x_bits = double_bits(11.0);
+    c.counters.provenance[0].detection_center_y_bits = double_bits(12.0);
+    rust.counters.provenance[0].detection_geometry_checksum = 0x1234;
+    c.counters.provenance[0].detection_geometry_checksum = 0x1234;
+    rust.counters.provenance[0].dedup_id_matches = 1;
+    rust.counters.provenance[0].dedup_geometry_matches = 0;
+    std::ostringstream out;
+    print_workload_report(config, image, {rust, c}, out);
+    const std::string text = out.str();
+    CHECK(text.find("PROVENANCE_MATCH id=7") != std::string::npos);
+    CHECK(text.find("center_distance=1.000000") != std::string::npos);
+    CHECK(text.find("counterfactual_id_match=1 counterfactual_geometry_match=0") != std::string::npos);
 }
 
 void test_max_u64_checksum_table_columns_are_readable()
@@ -200,12 +265,14 @@ int main()
 {
     test_determinism_rejection();
     test_schema_output();
+    test_direction_and_timer_validity_are_precise();
     test_max_u64_checksum_table_columns_are_readable();
     test_invalid_ratio_numerator_is_not_available();
     test_zero_denominator_ratios_are_not_available();
     test_early_polarity_ratios_require_valid_counters();
     test_early_polarity_ratios_use_hypothetical_validity();
     test_checksum_matches_require_valid_counters();
+    test_cross_backend_provenance_matches_id_and_nearest_center();
     if (failures) return 1;
     std::cout << "all workload format tests passed\n";
     return 0;

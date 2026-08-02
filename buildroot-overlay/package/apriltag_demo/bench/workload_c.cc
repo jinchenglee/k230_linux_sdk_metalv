@@ -38,7 +38,7 @@ public:
             for(int j=0;j<4;++j){n.corners[j*2]=d->p[j][0];n.corners[j*2+1]=d->p[j][1];} checksum.add(n); }
         c_apriltag_detections_destroy(detections);
         apriltag_workload_counters_t native{};
-        if(c_apriltag_get_workload_counters(detector_,&native)!=0) throw std::runtime_error("C workload counter retrieval failed");
+        if(c_apriltag_get_workload_counters_v2(detector_,&native,sizeof(native))!=0) throw std::runtime_error("C workload counter retrieval failed");
         WorkloadResult result{kind(),{count,checksum.value()},{}}; std::memcpy(&result.counters,&native,sizeof(native)); return result;
     }
 private:

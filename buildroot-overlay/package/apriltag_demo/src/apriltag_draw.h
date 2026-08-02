@@ -22,6 +22,15 @@ void draw_detections(cv::Mat& osd,
  * landscape view on the ARGB OSD plane. */
 void draw_debug_image(cv::Mat& osd, const apriltag_debug_image_t& image);
 
+/* Add compact Group D/E and trial counters to the recovery debug page. */
+void draw_recovery_stats(cv::Mat& osd,
+                          const apriltag_recovery_stats_t& stats);
+
+/* Draw Rust-provided stage-6 candidate labels at source-image anchors. */
+void draw_recovery_candidates(
+    cv::Mat& osd, int source_width, int source_height,
+    const apriltag_recovery_candidate_t* candidates, size_t count);
+
 /* Label substantial fitted quads in a pipeline debug image with their
  * individual decode outcome and nearest ID/Hamming distance. */
 void draw_decode_candidates(cv::Mat& osd,

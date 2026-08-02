@@ -3,6 +3,8 @@
 #include <cstring>
 #include <iomanip>
 #include <iostream>
+#include <cmath>
+#include <limits>
 #include <sstream>
 #include <string>
 
@@ -13,6 +15,11 @@ struct Field {
     std::uint64_t WorkloadCounters::*member;
     std::uint64_t validity;
     bool hexadecimal;
+};
+struct TimerField {
+    const char* name;
+    std::uint64_t WorkloadCounters::*member;
+    std::uint64_t timer_validity;
 };
 #define F(name, validity) {#name, &WorkloadCounters::name, validity, false}
 #define FH(name, validity) {#name, &WorkloadCounters::name, validity, true}
@@ -49,6 +56,29 @@ const Field c_fields[] = {
     F(active_uf_pixels,kWorkloadValidCSpecific), F(fit_line_calls,kWorkloadValidCSpecific),
     F(fit_line_span_points,kWorkloadValidCSpecific), F(cluster_hash_entries,kWorkloadValidCSpecific),
 };
+const Field boundary_fields[] = {
+    F(boundary_right_checks,kWorkloadValidBoundaryDiagnostics), F(boundary_right_contrast,kWorkloadValidBoundaryDiagnostics),
+    F(boundary_right_size_qualified,kWorkloadValidBoundaryDiagnostics), F(boundary_right_emitted,kWorkloadValidBoundaryDiagnostics),
+    F(boundary_down_checks,kWorkloadValidBoundaryDiagnostics), F(boundary_down_contrast,kWorkloadValidBoundaryDiagnostics),
+    F(boundary_down_size_qualified,kWorkloadValidBoundaryDiagnostics), F(boundary_down_emitted,kWorkloadValidBoundaryDiagnostics),
+    F(boundary_down_left_checks,kWorkloadValidBoundaryDiagnostics), F(boundary_down_left_contrast,kWorkloadValidBoundaryDiagnostics),
+    F(boundary_down_left_size_qualified,kWorkloadValidBoundaryDiagnostics), F(boundary_down_left_emitted,kWorkloadValidBoundaryDiagnostics),
+    F(boundary_down_right_checks,kWorkloadValidBoundaryDiagnostics), F(boundary_down_right_contrast,kWorkloadValidBoundaryDiagnostics),
+    F(boundary_down_right_size_qualified,kWorkloadValidBoundaryDiagnostics), F(boundary_down_right_emitted,kWorkloadValidBoundaryDiagnostics),
+    F(boundary_connected_last_suppressions,kWorkloadValidBoundaryDiagnostics),
+    F(boundary_exact_duplicates,kWorkloadValidBoundaryDiagnostics), F(boundary_coordinate_duplicates,kWorkloadValidBoundaryDiagnostics),
+    F(boundary_exact_unique,kWorkloadValidBoundaryDiagnostics), F(boundary_coordinate_unique,kWorkloadValidBoundaryDiagnostics),
+    F(boundary_perimeter_points,kWorkloadValidBoundaryDiagnostics),
+};
+#define TF(name, validity) {#name, &WorkloadCounters::name, validity}
+const TimerField timer_fields[] = {
+    TF(ccl_total_ns,kWorkloadTimerTotal), TF(ccl_rle_repack_ns,kWorkloadTimerRleRepack),
+    TF(ccl_uf_init_ns,kWorkloadTimerUfInit), TF(ccl_connected_components_ns,kWorkloadTimerConnectedComponents),
+    TF(ccl_diag_left_ns,kWorkloadTimerDiagLeft), TF(ccl_diag_right_ns,kWorkloadTimerDiagRight),
+    TF(ccl_root_materialize_ns,kWorkloadTimerRootMaterialize), TF(ccl_gradient_clustering_ns,kWorkloadTimerGradientClustering),
+    TF(ccl_conversion_ns,kWorkloadTimerConversion),
+};
+#undef TF
 #undef FH
 #undef F
 
@@ -69,6 +99,20 @@ void print_fields(const Field* first, const Field* last,
         out << std::left << std::setw(42) << first->name;
         for (const auto& result : results) {
             out << std::right << std::setw(22) << field_value(result.counters, *first);
+        }
+        out << '\n';
+    }
+}
+void print_timers(const std::vector<WorkloadResult>& results, std::ostream& out)
+{
+    for (const auto& field : timer_fields) {
+        out << std::left << std::setw(42) << field.name;
+        for (const auto& result : results) {
+            const bool available =
+                (result.counters.validity & kWorkloadValidCclTimers) != 0 &&
+                (result.counters.ccl_timer_validity & field.timer_validity) == field.timer_validity;
+            out << std::right << std::setw(22)
+                << (available ? std::to_string(result.counters.*field.member) : "n/a");
         }
         out << '\n';
     }
@@ -111,13 +155,20 @@ void print_ratio(std::ostream& out, const char* label,
 
 void validate_workload_pair(const WorkloadResult& a, const WorkloadResult& b)
 {
+    WorkloadCounters ac = a.counters, bc = b.counters;
+    for (auto* counters : {&ac, &bc}) {
+        counters->ccl_total_ns = counters->ccl_rle_repack_ns = counters->ccl_uf_init_ns = 0;
+        counters->ccl_connected_components_ns = 0;
+        counters->ccl_diag_left_ns = counters->ccl_diag_right_ns = counters->ccl_root_materialize_ns = 0;
+        counters->ccl_gradient_clustering_ns = counters->ccl_conversion_ns = 0;
+    }
     if (a.kind != b.kind || a.detection.count != b.detection.count ||
         a.detection.checksum != b.detection.checksum ||
-        std::memcmp(&a.counters, &b.counters, sizeof(a.counters)) != 0) {
+        std::memcmp(&ac, &bc, sizeof(ac)) != 0) {
         throw std::runtime_error(std::string(backend_name(a.kind)) +
                                  " produced nondeterministic workload counters");
     }
-    if (a.counters.schema_version != 1 || a.counters.struct_size != sizeof(WorkloadCounters)) {
+    if (a.counters.schema_version != 2 || a.counters.struct_size != sizeof(WorkloadCounters)) {
         throw std::runtime_error(std::string(backend_name(a.kind)) +
                                  " returned an incompatible workload schema");
     }
@@ -136,6 +187,69 @@ void print_workload_report(const BenchmarkConfig& config, const PreparedImage& i
     print_fields(std::begin(rust_fields), std::end(rust_fields), results, out);
     out << "\nC-specific counters\n";
     print_fields(std::begin(c_fields), std::end(c_fields), results, out);
+    out << "\nBoundary diagnostics\n";
+    print_fields(std::begin(boundary_fields), std::end(boundary_fields), results, out);
+    out << "\nCCL substage timers\n";
+    print_timers(results, out);
+    out << "\nSuccessful detection provenance\n";
+    for (const auto& r : results) {
+        const bool provenance_valid =
+            (r.counters.validity & kWorkloadValidDetectionProvenance) != 0;
+        const bool counterfactual_valid =
+            (r.counters.validity & kWorkloadValidCounterfactualDedup) != 0;
+        out << backend_key(r.kind) << " traces="
+            << (provenance_valid ? std::to_string(r.counters.provenance_count) : "n/a")
+            << " dropped="
+            << (provenance_valid ? std::to_string(r.counters.provenance_dropped) : "n/a") << '\n';
+        if (!provenance_valid) continue;
+        for (std::uint64_t i=0; i<r.counters.provenance_count && i<16; ++i) {
+            const auto& p=r.counters.provenance[i];
+            out << "PROVENANCE backend=" << backend_key(r.kind) << " id=" << p.detection_id
+                << " raw_index=" << p.raw_index << " final_index=" << p.final_index
+                << " component_pair=" << p.component_pair << " bbox=" << p.bbox_min_x << ',' << p.bbox_min_y
+                << ',' << p.bbox_max_x << ',' << p.bbox_max_y << " points=" << p.point_count
+                << " exact_duplicates=" << p.exact_duplicates << " coordinate_duplicates=" << p.coordinate_duplicates
+                << " directions=" << p.right_points << ',' << p.down_points << ',' << p.down_left_points << ',' << p.down_right_points
+                << " center=" << std::setprecision(9) << bits_double(p.detection_center_x_bits) << ',' << bits_double(p.detection_center_y_bits)
+                << " perimeter=" << p.perimeter_points << " dedup_survives="
+                << (counterfactual_valid ? std::to_string(p.dedup_survives) : "n/a")
+                << " dedup_id_match=" << (counterfactual_valid ? std::to_string(p.dedup_id_matches) : "n/a")
+                << " dedup_geometry_match=" << (counterfactual_valid ? std::to_string(p.dedup_geometry_matches) : "n/a")
+                << " dedup_points=" << (counterfactual_valid ? std::to_string(p.dedup_point_count) : "n/a")
+                << " dedup_id=" << (counterfactual_valid ? std::to_string(p.dedup_detection_id) : "n/a")
+                << " dedup_geometry=" << (counterfactual_valid ? std::to_string(p.dedup_geometry_checksum) : "n/a") << '\n';
+        }
+    }
+    if (results.size() >= 2) {
+        for (std::size_t ai = 0; ai < results.size(); ++ai) for (std::size_t bi = ai + 1; bi < results.size(); ++bi) {
+            const auto& a = results[ai]; const auto& b = results[bi];
+            if (!(a.counters.validity & kWorkloadValidDetectionProvenance) ||
+                !(b.counters.validity & kWorkloadValidDetectionProvenance)) continue;
+            for (std::uint64_t i = 0; i < a.counters.provenance_count && i < 16; ++i) {
+                const auto& p = a.counters.provenance[i]; const DetectionProvenance* nearest = nullptr;
+                double best = std::numeric_limits<double>::infinity();
+                for (std::uint64_t j = 0; j < b.counters.provenance_count && j < 16; ++j) {
+                    const auto& q = b.counters.provenance[j];
+                    if (q.detection_id != p.detection_id ||
+                        q.detection_geometry_checksum != p.detection_geometry_checksum) continue;
+                    const double dx = bits_double(q.detection_center_x_bits) - bits_double(p.detection_center_x_bits);
+                    const double dy = bits_double(q.detection_center_y_bits) - bits_double(p.detection_center_y_bits);
+                    const double distance = std::sqrt(dx * dx + dy * dy);
+                    if (distance < best) { best = distance; nearest = &q; }
+                }
+                if (nearest) out << "PROVENANCE_MATCH id=" << p.detection_id
+                    << " from=" << backend_key(a.kind) << " to=" << backend_key(b.kind)
+                    << " center_distance=" << std::fixed << std::setprecision(6) << best
+                    << " nearest_component_pair=" << nearest->component_pair
+                    << " counterfactual_id_match="
+                    << ((a.counters.validity & kWorkloadValidCounterfactualDedup)
+                            ? std::to_string(p.dedup_id_matches) : "n/a")
+                    << " counterfactual_geometry_match="
+                    << ((a.counters.validity & kWorkloadValidCounterfactualDedup)
+                            ? std::to_string(p.dedup_geometry_matches) : "n/a") << '\n';
+            }
+        }
+    }
     out << "\nEarly polarity estimates\n";
     for (const auto& r : results) {
         if (r.kind == BackendKind::CReference) continue;

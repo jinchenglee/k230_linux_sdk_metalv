@@ -8,7 +8,7 @@
  * Structure cloned from face_detect/src/main.cc (camera + DRM + OSD), with the
  * nncase AI pipeline replaced by the apriltag C ABI (src/apriltag.h).
  *
- * With --debug, keys 1–5 replace the transparent detection overlay with live
+ * With --debug, keys 1–6 replace the transparent detection overlay with live
  * intermediate pipeline images, making on-device camera/threshold/quad/decode
  * failures visible without writing a debug image sequence to storage.
  */
@@ -16,6 +16,7 @@
 #include <thread>
 #include <string>
 #include <cstring>
+#include <cmath>
 #include <pthread.h>
 #include <termios.h>
 #include <sys/ioctl.h>
@@ -37,6 +38,8 @@ static double g_factor_value = 2.0;
 static int    g_mode         = 0;     // FFI: 0=scalar 1=rvv
 static uint32_t g_min_blob   = 25;
 static bool g_debug_enabled  = false;
+static bool g_recovery_enabled = false;
+static double g_recovery_min_extent = 64.0;
 static std::atomic<int> g_debug_stage(0);
 static std::atomic<int> g_input_source(0); // 0=CSI, 1=USB
 static std::atomic<int> g_denoise_mode(0);  // 0=off, 1=median3, 2=gaussian3
@@ -85,7 +88,7 @@ static void print_key_help()
 #ifndef APRILTAG_C_BACKEND
     if (g_debug_enabled) {
         cout << " 0=camera 1=gray 2=threshold 3=clusters"
-                " 4=quads 5=detections";
+                " 4=quads 5=detections 6=recovery";
     }
 #endif
     cout << " q=quit" << endl;
@@ -98,7 +101,8 @@ static void print_usage(const char* name)
     cout << " [--rvv]";
 #endif
     cout << " [--factor 1|1.5|2] [--min-blob N]"
-            " [--csi-size WxH] [--usb-video X] [--debug]" << endl;
+            " [--csi-size WxH] [--usb-video X] [--debug]"
+            " [--recovery] [--recovery-min-extent PX]" << endl;
 #ifndef APRILTAG_C_BACKEND
     cout << "  --rvv         use RVV kernels (default: scalar)" << endl;
 #else
@@ -120,6 +124,10 @@ static void print_usage(const char* name)
 #ifndef APRILTAG_C_BACKEND
     cout << "  --debug       enable live pipeline views and decode diagnostics"
             " (default: off)" << endl;
+    cout << "  --recovery    enable conservative occlusion recovery"
+            " (default: off)" << endl;
+    cout << "  --recovery-min-extent PX  minimum full-resolution candidate"
+            " extent (default: 64)" << endl;
 #else
     cout << "  --debug       dump one set of upstream debug images and enable"
             " detection logs" << endl;
@@ -128,7 +136,7 @@ static void print_usage(const char* name)
     cout << "  u             select configured USB camera" << endl;
     cout << "  n             cycle luma denoise: off/median3/Gaussian3" << endl;
 #ifndef APRILTAG_C_BACKEND
-    cout << "  0..5          select pipeline view (requires --debug)" << endl;
+    cout << "  0..6          select pipeline view (requires --debug)" << endl;
 #endif
     cout << "  q             quit" << endl;
 }
@@ -231,6 +239,15 @@ static void detect_proc(int video_device)
         return;
     }
 #endif
+#ifndef APRILTAG_C_BACKEND
+    if (apriltag_configure_recovery(
+            det, g_recovery_enabled ? 1 : 0, g_recovery_min_extent) != 0) {
+        cerr << "detect: cannot configure recovery" << endl;
+        apriltag_free(det);
+        v4l2_drm_stop(&context);
+        return;
+    }
+#endif
     if (apriltag_set_debug_enabled(det, g_debug_enabled ? 1 : 0) != 0) {
         cerr << "detect: cannot configure diagnostics" << endl;
         apriltag_free(det);
@@ -239,8 +256,10 @@ static void detect_proc(int video_device)
     }
     std::vector<apriltag_det_t> out(MAX_DETS);
     std::vector<apriltag_decode_candidate_t> decode_candidates;
+    std::vector<apriltag_recovery_candidate_t> recovery_candidates;
     if (g_debug_enabled) {
         decode_candidates.resize(MAX_DECODE_CANDIDATES);
+        recovery_candidates.resize(MAX_DECODE_CANDIDATES);
     }
     cv::VideoCapture usb_capture;
     cv::Mat usb_bgr;
@@ -378,14 +397,21 @@ static void detect_proc(int video_device)
         const int selected_debug_stage =
             g_debug_enabled ? g_debug_stage.load() : 0;
         if (g_debug_enabled) {
-            apriltag_set_debug_stage(det, selected_debug_stage);
+            if (apriltag_set_debug_stage(det, selected_debug_stage) != 0) {
+                cerr << "detect: cannot select debug stage "
+                     << selected_debug_stage << endl;
+                break;
+            }
         }
         int n = apriltag_detect(det, gray, frame_width, frame_height,
                                 frame_stride, g_factor_int, g_mode,
                                 out.data(), MAX_DETS);
         apriltag_decode_stats_t decode_stats = {};
+        apriltag_recovery_stats_t recovery_stats = {};
         bool have_decode_stats = false;
+        bool have_recovery_stats = false;
         int decode_candidate_count = 0;
+        int recovery_candidate_count = 0;
         if (g_debug_enabled) {
             have_decode_stats =
                 apriltag_get_decode_stats(det, &decode_stats) == 1;
@@ -394,6 +420,17 @@ static void detect_proc(int video_device)
             if (decode_candidate_count < 0) {
                 decode_candidate_count = 0;
             }
+            if (selected_debug_stage == 6) {
+                recovery_candidate_count = apriltag_get_recovery_candidates(
+                    det, recovery_candidates.data(), MAX_DECODE_CANDIDATES);
+                if (recovery_candidate_count < 0) {
+                    recovery_candidate_count = 0;
+                }
+            }
+        }
+        if (g_recovery_enabled) {
+            have_recovery_stats =
+                apriltag_get_recovery_stats(det, &recovery_stats) == 1;
         }
 
         // ── Diagnostics (throttled ~1/s): distinguish panic (-1) from
@@ -414,7 +451,8 @@ static void detect_proc(int video_device)
                         frame_width, frame_height, frame_stride,
                         frames, max_n, panics, n);
                 if (n > 0) {
-                    fprintf(stderr, "  det0: id=%llu m=%.1f center=(%.0f,%.0f) c0=(%.0f,%.0f)",
+                    fprintf(stderr, "  det0: %sid=%llu m=%.1f center=(%.0f,%.0f) c0=(%.0f,%.0f)",
+                            out[0].recovered ? "R " : "",
                             (unsigned long long)out[0].id, out[0].margin,
                             out[0].center[0], out[0].center[1],
                             out[0].corners[0], out[0].corners[1]);
@@ -453,6 +491,19 @@ static void detect_proc(int video_device)
                                 (unsigned long long)largest_code->raw_code);
                     }
                 }
+                if (have_recovery_stats) {
+                    fprintf(stderr,
+                            "  recovery: D=%llu/%llu/%llu E=%llu/%llu/%llu"
+                            " trials=%llu erasure_decodes=%llu",
+                            (unsigned long long)recovery_stats.group_d_total,
+                            (unsigned long long)recovery_stats.group_d_eligible,
+                            (unsigned long long)recovery_stats.group_d_success,
+                            (unsigned long long)recovery_stats.group_e_total,
+                            (unsigned long long)recovery_stats.group_e_eligible,
+                            (unsigned long long)recovery_stats.group_e_success,
+                            (unsigned long long)recovery_stats.trials_attempted,
+                            (unsigned long long)recovery_stats.erasure_decodes);
+                }
                 fprintf(stderr, "\n");
                 dtv = now; frames = 0; max_n = 0; panics = 0;
             }
@@ -476,6 +527,13 @@ static void detect_proc(int video_device)
                 // This copies the borrowed Rust image into draw_frame before
                 // the next apriltag_detect() call can reuse its storage.
                 draw_debug_image(draw_frame, debug_image);
+                if (selected_debug_stage == 6 && have_recovery_stats) {
+                    draw_recovery_stats(draw_frame, recovery_stats);
+                    draw_recovery_candidates(
+                        draw_frame, frame_width, frame_height,
+                        recovery_candidates.data(),
+                        (size_t)recovery_candidate_count);
+                }
                 if (selected_debug_stage == 4) {
                     draw_decode_candidates(
                         draw_frame, debug_image, decode_candidates.data(),
@@ -646,6 +704,29 @@ static void parse_args(int argc, char* argv[])
 #endif
         } else if (a == "--debug") {
             g_debug_enabled = true;
+        } else if (a == "--recovery") {
+#ifdef APRILTAG_C_BACKEND
+            cerr << "--recovery is unsupported by apriltag_c_demo; "
+                    "use the Rust apriltag_demo backend" << endl;
+            exit(2);
+#else
+            g_recovery_enabled = true;
+#endif
+        } else if (a == "--recovery-min-extent" && i + 1 < argc) {
+#ifdef APRILTAG_C_BACKEND
+            cerr << "--recovery-min-extent is unsupported by apriltag_c_demo; "
+                    "use the Rust apriltag_demo backend" << endl;
+            exit(2);
+#else
+            char* end = nullptr;
+            g_recovery_min_extent = strtod(argv[++i], &end);
+            if (!end || *end != '\0' || !std::isfinite(g_recovery_min_extent) ||
+                g_recovery_min_extent < 0.0) {
+                cerr << "--recovery-min-extent must be a non-negative number"
+                     << endl;
+                exit(2);
+            }
+#endif
 #ifdef APRILTAG_C_BACKEND
         } else if (a == "--threads" && i + 1 < argc) {
             g_c_threads = atoi(argv[++i]);
@@ -738,6 +819,8 @@ int main(int argc, char* argv[])
          << " decode_sharpening=" << g_c_decode_sharpening
 #else
     cout << "mode=" << (g_mode ? "rvv" : "scalar")
+         << " recovery=" << (g_recovery_enabled ? "on" : "off")
+         << " recovery_min_extent=" << g_recovery_min_extent
 #endif
          << " factor=" << g_factor_value
          << " min_blob=" << g_min_blob
@@ -785,7 +868,7 @@ int main(int argc, char* argv[])
             usleep(100000);
             detect_stop.store(true);
             break;
-        } else if (key >= '0' && key <= '5') {
+        } else if (key >= '0' && key <= '6') {
 #ifdef APRILTAG_C_BACKEND
             cerr << "\nlive pipeline views are available in apriltag_demo; "
                     "use --debug to dump one set of upstream C images" << endl;
@@ -795,6 +878,10 @@ int main(int argc, char* argv[])
                      << endl;
             } else {
                 int stage = key - '0';
+                if (stage == 6 && !g_recovery_enabled) {
+                    cerr << "\nrecovery view requires --recovery" << endl;
+                    continue;
+                }
                 g_debug_stage.store(stage);
                 cout << "\nview " << stage << ": "
                      << apriltag_debug_stage_name(stage) << endl;

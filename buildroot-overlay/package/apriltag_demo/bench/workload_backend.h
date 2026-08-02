@@ -4,6 +4,7 @@
 #include "benchmark.h"
 
 #include <cstdint>
+#include <cstring>
 #include <iosfwd>
 #include <memory>
 #include <string>
@@ -26,6 +27,34 @@ constexpr std::uint64_t kWorkloadValidBorderPolarity = UINT64_C(1) << 11;
 constexpr std::uint64_t kWorkloadValidFamilyPolarity = UINT64_C(1) << 12;
 constexpr std::uint64_t kWorkloadValidBoundaryCandidates = UINT64_C(1) << 13;
 constexpr std::uint64_t kWorkloadValidHypotheticalEarlyPolarity = UINT64_C(1) << 14;
+constexpr std::uint64_t kWorkloadValidBoundaryDiagnostics = UINT64_C(1) << 15;
+constexpr std::uint64_t kWorkloadValidCclTimers = UINT64_C(1) << 16;
+constexpr std::uint64_t kWorkloadValidDetectionProvenance = UINT64_C(1) << 17;
+constexpr std::uint64_t kWorkloadValidCounterfactualDedup = UINT64_C(1) << 18;
+constexpr std::uint64_t kWorkloadTimerTotal = UINT64_C(1) << 0;
+constexpr std::uint64_t kWorkloadTimerRleRepack = UINT64_C(1) << 1;
+constexpr std::uint64_t kWorkloadTimerUfInit = UINT64_C(1) << 2;
+constexpr std::uint64_t kWorkloadTimerConnectedComponents = UINT64_C(1) << 3;
+constexpr std::uint64_t kWorkloadTimerDiagLeft = UINT64_C(1) << 4;
+constexpr std::uint64_t kWorkloadTimerDiagRight = UINT64_C(1) << 5;
+constexpr std::uint64_t kWorkloadTimerRootMaterialize = UINT64_C(1) << 6;
+constexpr std::uint64_t kWorkloadTimerGradientClustering = UINT64_C(1) << 7;
+constexpr std::uint64_t kWorkloadTimerConversion = UINT64_C(1) << 8;
+
+struct DetectionProvenance {
+    std::uint64_t detection_id = 0, component_pair = 0;
+    std::uint32_t raw_index = 0, final_index = 0;
+    std::uint32_t bbox_min_x = 0, bbox_min_y = 0, bbox_max_x = 0, bbox_max_y = 0;
+    std::uint32_t point_count = 0, right_points = 0, down_points = 0;
+    std::uint32_t down_left_points = 0, down_right_points = 0;
+    std::uint32_t exact_duplicates = 0, coordinate_duplicates = 0, perimeter_points = 0;
+    std::uint32_t dedup_survives = 0, dedup_id_matches = 0;
+    std::uint32_t dedup_geometry_matches = 0, dedup_point_count = 0;
+    std::uint64_t dedup_detection_id = 0, dedup_center_x_bits = 0, dedup_center_y_bits = 0;
+    std::uint64_t dedup_geometry_checksum = 0;
+    std::uint64_t detection_center_x_bits = 0, detection_center_y_bits = 0;
+    std::uint64_t detection_geometry_checksum = 0;
+};
 
 struct WorkloadCounters {
     std::uint32_t schema_version = 0;
@@ -53,10 +82,20 @@ struct WorkloadCounters {
     X(cluster_hash_entries) X(hypothetical_early_polarity_reject_clusters) \
     X(hypothetical_early_polarity_reject_points) X(hypothetical_wasted_sort_points) \
     X(hypothetical_wasted_lfps_points) X(hypothetical_wasted_compute_errors_points) \
-    X(hypothetical_wasted_peak_search_clusters)
+    X(hypothetical_wasted_peak_search_clusters) \
+    X(boundary_right_checks) X(boundary_right_contrast) X(boundary_right_size_qualified) X(boundary_right_emitted) \
+    X(boundary_down_checks) X(boundary_down_contrast) X(boundary_down_size_qualified) X(boundary_down_emitted) \
+    X(boundary_down_left_checks) X(boundary_down_left_contrast) X(boundary_down_left_size_qualified) X(boundary_down_left_emitted) \
+    X(boundary_down_right_checks) X(boundary_down_right_contrast) X(boundary_down_right_size_qualified) X(boundary_down_right_emitted) \
+    X(boundary_connected_last_suppressions) X(boundary_exact_duplicates) X(boundary_coordinate_duplicates) \
+    X(boundary_exact_unique) X(boundary_coordinate_unique) X(boundary_perimeter_points) \
+    X(ccl_timer_validity) X(ccl_total_ns) X(ccl_rle_repack_ns) X(ccl_uf_init_ns) X(ccl_connected_components_ns) \
+    X(ccl_diag_left_ns) X(ccl_diag_right_ns) X(ccl_root_materialize_ns) X(ccl_gradient_clustering_ns) X(ccl_conversion_ns) \
+    X(provenance_count) X(provenance_dropped)
 #define DECLARE_COUNTER(name) std::uint64_t name = 0;
     WORKLOAD_COUNTER_FIELDS(DECLARE_COUNTER)
 #undef DECLARE_COUNTER
+    DetectionProvenance provenance[16]{};
 };
 
 struct WorkloadResult {
@@ -64,6 +103,21 @@ struct WorkloadResult {
     DetectionResult detection;
     WorkloadCounters counters;
 };
+
+inline std::uint64_t double_bits(double value)
+{
+    std::uint64_t bits;
+    static_assert(sizeof(bits) == sizeof(value), "unexpected double size");
+    std::memcpy(&bits, &value, sizeof(bits));
+    return bits;
+}
+
+inline double bits_double(std::uint64_t bits)
+{
+    double value;
+    std::memcpy(&value, &bits, sizeof(value));
+    return value;
+}
 
 class WorkloadBackend {
 public:

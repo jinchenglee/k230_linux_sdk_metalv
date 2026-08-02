@@ -20,6 +20,13 @@ typedef struct {
     double   margin;
     double   center[2];
     double   corners[8];
+    uint8_t  recovered;
+    uint8_t  visible_edges;
+    uint8_t  inferred_edges;
+    uint8_t  erasure_count;
+    uint8_t  corrected_bit_count;
+    double   geometry_residual;
+    uint32_t recovery_group; /* 0=normal, 1=Group D, 2=Group E */
 } apriltag_det_t;
 
 /* Borrowed packed-RGB image from the selected live-debug pipeline stage.
@@ -57,6 +64,38 @@ typedef struct {
     int32_t  hamming;    /* -1 when no codeword was sampled */
 } apriltag_decode_candidate_t;
 
+typedef struct {
+    uint64_t group_d_total;
+    uint64_t group_d_eligible;
+    uint64_t group_d_attempted;
+    uint64_t group_d_skipped_cap;
+    uint64_t group_d_success;
+    uint64_t group_d_fail;
+    uint64_t group_e_total;
+    uint64_t group_e_eligible;
+    uint64_t group_e_attempted;
+    uint64_t group_e_skipped_cap;
+    uint64_t group_e_success;
+    uint64_t group_e_fail;
+    uint64_t trials_attempted;
+    uint64_t erasure_decodes;
+} apriltag_recovery_stats_t;
+
+/* Bounded stage-6 recovery-candidate label summary. result is 0=skipped,
+ * 1=selected failure, or 2=recovered; id is UINT64_MAX unless recovered. */
+typedef struct {
+    uint64_t id;
+    double   anchor[2];
+    uint32_t group; /* 1=Group D, 2=Group E */
+    uint8_t  strong_line_count;
+    uint8_t  eligible;
+    uint8_t  selected;
+    uint8_t  result;
+    uint8_t  errors;
+    uint8_t  erasures;
+    uint8_t  reserved[2];
+} apriltag_recovery_candidate_t;
+
 /* Allocate a detector (holds persistent buffers + Tag36h11 + min_blob_size).
  * min_blob_size mirrors detect()'s parameter (live_demo uses 25). */
 void* apriltag_new(uint32_t min_blob_size);
@@ -80,9 +119,14 @@ int   apriltag_detect(void* handle,
  * Returns 0 on success or -1 for an invalid handle. */
 int   apriltag_set_debug_enabled(void* handle, int enabled);
 
+/* Configure conservative recovery. Disabled by default. min_full_res_extent
+ * is the minimum candidate extent in input-image pixels. */
+int   apriltag_configure_recovery(void* handle, int enabled,
+                                  double min_full_res_extent);
+
 /* Select the live pipeline view:
  *   0 normal camera/detection overlay, 1 decimated grayscale, 2 threshold,
- *   3 boundary clusters, 4 fitted quads, 5 decoded detections.
+ *   3 boundary clusters, 4 fitted quads, 5 decoded detections, 6 recovery.
  * Returns 0 on success or -1 for an invalid handle/stage. */
 int   apriltag_set_debug_stage(void* handle, int stage);
 
@@ -100,6 +144,15 @@ int   apriltag_get_decode_stats(void* handle, apriltag_decode_stats_t* out);
 int   apriltag_get_decode_candidates(void* handle,
                                      apriltag_decode_candidate_t* out,
                                      int max_out);
+
+/* Copy counters from the most recent recovery-enabled detection call. */
+int   apriltag_get_recovery_stats(void* handle,
+                                   apriltag_recovery_stats_t* out);
+
+/* Copy up to max_out stage-6 candidate summaries. Returns 0 when diagnostics
+ * are disabled, copied count when enabled, or -1 on invalid arguments. */
+int   apriltag_get_recovery_candidates(
+          void* handle, apriltag_recovery_candidate_t* out, int max_out);
 
 #ifdef __cplusplus
 }

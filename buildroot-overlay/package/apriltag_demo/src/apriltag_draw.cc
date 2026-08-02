@@ -7,6 +7,7 @@ static const cv::Scalar kGreen (0,   255, 0,   255);
 static const cv::Scalar kBlue  (255, 0,   0,   255);
 static const cv::Scalar kRed   (0,   0,   255, 255);
 static const cv::Scalar kYellow(0,   255, 255, 255);
+static const cv::Scalar kMagenta(255, 0, 255, 255);
 
 static cv::Size aspect_fit(const cv::Mat& osd, int width, int height)
 {
@@ -28,6 +29,7 @@ const char* apriltag_debug_stage_name(int stage)
     case 3: return "boundary clusters";
     case 4: return "fitted quads";
     case 5: return "decoded detections";
+    case 6: return "recovery";
     default: return "unknown";
     }
 }
@@ -62,7 +64,76 @@ void draw_debug_image(cv::Mat& osd, const apriltag_debug_image_t& image)
                  image.stage, apriltag_debug_stage_name((int)image.stage));
     }
     cv::putText(osd, label, cv::Point(18, 32),
-                cv::FONT_HERSHEY_SIMPLEX, 0.75, kYellow, 2, cv::LINE_8, false);
+                 cv::FONT_HERSHEY_SIMPLEX, 0.75, kYellow, 2, cv::LINE_8, false);
+}
+
+void draw_recovery_stats(cv::Mat& osd,
+                         const apriltag_recovery_stats_t& stats)
+{
+    if (osd.empty()) {
+        return;
+    }
+    char label[160];
+    snprintf(label, sizeof(label),
+             "D total/eligible/ok=%llu/%llu/%llu  "
+             "E=%llu/%llu/%llu  trials=%llu erasures=%llu",
+             (unsigned long long)stats.group_d_total,
+             (unsigned long long)stats.group_d_eligible,
+             (unsigned long long)stats.group_d_success,
+             (unsigned long long)stats.group_e_total,
+             (unsigned long long)stats.group_e_eligible,
+             (unsigned long long)stats.group_e_success,
+             (unsigned long long)stats.trials_attempted,
+             (unsigned long long)stats.erasure_decodes);
+    cv::putText(osd, label, cv::Point(18, osd.rows - 18),
+                cv::FONT_HERSHEY_SIMPLEX, 0.48, kYellow, 1,
+                cv::LINE_8, false);
+    if (stats.group_d_eligible + stats.group_e_eligible == 0) {
+        cv::putText(osd, "No eligible recovery candidates", cv::Point(18, 64),
+                    cv::FONT_HERSHEY_SIMPLEX, 0.65, kYellow, 2,
+                    cv::LINE_8, false);
+    }
+}
+
+void draw_recovery_candidates(
+    cv::Mat& osd, int source_width, int source_height,
+    const apriltag_recovery_candidate_t* candidates, size_t count)
+{
+    if (osd.empty() || !candidates || source_width <= 0 || source_height <= 0) {
+        return;
+    }
+    const cv::Size view = aspect_fit(osd, source_width, source_height);
+    const double sx = (double)view.width / source_width;
+    const double sy = (double)view.height / source_height;
+    for (size_t i = 0; i < count; ++i) {
+        const auto& candidate = candidates[i];
+        char label[96];
+        const char* result = candidate.result == 2 ? "ok" :
+                             candidate.result == 1 ? "fail" : "skip";
+        if (candidate.id != UINT64_MAX) {
+            snprintf(label, sizeof(label),
+                     "%c L%u %s%s %s id=%llu e=%u/%u",
+                     candidate.group == 1 ? 'D' : 'E',
+                     candidate.strong_line_count,
+                     candidate.eligible ? "eligible" : "ineligible",
+                     candidate.selected ? " selected" : "",
+                     result, (unsigned long long)candidate.id,
+                     candidate.errors, candidate.erasures);
+        } else {
+            snprintf(label, sizeof(label), "%c L%u %s%s %s",
+                     candidate.group == 1 ? 'D' : 'E',
+                     candidate.strong_line_count,
+                     candidate.eligible ? "eligible" : "ineligible",
+                     candidate.selected ? " selected" : "", result);
+        }
+        cv::Point anchor((int)(candidate.anchor[0] * sx),
+                         (int)(candidate.anchor[1] * sy));
+        anchor.x = std::clamp(anchor.x + 5, 0, std::max(0, osd.cols - 1));
+        anchor.y = std::clamp(anchor.y - 5, 14, std::max(14, osd.rows - 1));
+        cv::putText(osd, label, anchor, cv::FONT_HERSHEY_SIMPLEX, 0.42,
+                    candidate.result == 2 ? kMagenta : kYellow, 1,
+                    cv::LINE_8, false);
+    }
 }
 
 void draw_decode_candidates(cv::Mat& osd,
@@ -159,18 +230,27 @@ void draw_detections(cv::Mat& osd,
             p[i] = cv::Point((int)(d.corners[2 * i]     * s),
                              (int)(d.corners[2 * i + 1] * s));
         }
-        // Quad edges (color-coded like live_demo / opencv_demo).
-        cv::line(osd, p[0], p[1], kGreen, 2, cv::LINE_8, 0);
-        cv::line(osd, p[0], p[3], kBlue,  2, cv::LINE_8, 0);
-        cv::line(osd, p[1], p[2], kRed,   2, cv::LINE_8, 0);
-        cv::line(osd, p[2], p[3], kRed,   2, cv::LINE_8, 0);
+        if (d.recovered) {
+            for (int i = 0; i < 4; ++i) {
+                cv::line(osd, p[i], p[(i + 1) % 4], kMagenta, 2,
+                         cv::LINE_8, 0);
+            }
+        } else {
+            // Quad edges (color-coded like live_demo / opencv_demo).
+            cv::line(osd, p[0], p[1], kGreen, 2, cv::LINE_8, 0);
+            cv::line(osd, p[0], p[3], kBlue,  2, cv::LINE_8, 0);
+            cv::line(osd, p[1], p[2], kRed,   2, cv::LINE_8, 0);
+            cv::line(osd, p[2], p[3], kRed,   2, cv::LINE_8, 0);
+        }
 
         int cx = (int)(d.center[0] * s);
         int cy = (int)(d.center[1] * s);
         char label[64];
-        snprintf(label, sizeof(label), "id=%llu m=%.1f",
-                 (unsigned long long)d.id, d.margin);
+        snprintf(label, sizeof(label), "%sid=%llu m=%.1f",
+                  d.recovered ? "R " : "",
+                  (unsigned long long)d.id, d.margin);
         cv::putText(osd, label, cv::Point(cx - 40, cy),
-                    cv::FONT_HERSHEY_SIMPLEX, 0.55, kYellow, 2, cv::LINE_8, false);
+                    cv::FONT_HERSHEY_SIMPLEX, 0.55,
+                    d.recovered ? kMagenta : kYellow, 2, cv::LINE_8, false);
     }
 }

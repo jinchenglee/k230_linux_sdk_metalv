@@ -58,6 +58,29 @@ cd /root/app/apriltag_c_demo
 Both applications start on CSI. Press `u` for the configured USB camera, `c`
 for CSI, `n` to cycle the identical luma denoise modes, and `q` to quit.
 
+## Occlusion recovery
+
+The Rust demo has conservative partial-occlusion recovery, disabled by default.
+Enable it explicitly and optionally override the default 64-pixel minimum
+full-resolution candidate extent:
+
+```sh
+./apriltag_demo.elf --rvv --recovery --recovery-min-extent 96 --debug
+```
+
+With `--debug`, press `6` for the recovery page. The detector-provided image
+shows candidate points and recovered geometry; the page title reports the
+candidate count and displays `No eligible recovery candidates` when empty.
+Normal detections retain their existing colored overlay. Recovered detections
+use magenta edges and an `R id=` label. Once per second, debug logging reports
+Group D/E total, eligible, and successful candidates plus attempted trials and
+erasure decodes.
+
+Recovery is Rust-only. `apriltag_c_demo.elf` rejects `--recovery` and
+`--recovery-min-extent` because the official C detector does not implement this
+path; its ABI adapter exports unsupported stubs so both binaries retain the
+same link interface.
+
 Use `--upstream-defaults` with the C application to select the upstream
 behavior: minimum blob size 5, two corrected bits, edge refinement on, and
 decode sharpening 0.25. Use `--threads N` to measure the original detector's
