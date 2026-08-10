@@ -2,6 +2,27 @@
 set -euo pipefail
 
 PKG_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+WORKLOAD_HEADER="${APRILTAG_WORKLOAD_HEADER:-$PKG_DIR/lib/rust_apriltag_workload.h}"
+
+validate_workload_header_size() (
+    local tmp
+    tmp="$(mktemp -d)"
+    trap 'rm -rf "$tmp"' EXIT
+    cp "$WORKLOAD_HEADER" "$tmp/rust_apriltag_workload.h"
+    cat >"$tmp/check_workload_size.c" <<'EOF'
+#include "rust_apriltag_workload.h"
+_Static_assert(sizeof(apriltag_workload_counters_t) == 480,
+               "schema-v1 workload ABI must be exactly 480 bytes");
+EOF
+    "${CC:-cc}" -std=c11 -I"$tmp" -c "$tmp/check_workload_size.c" \
+        -o "$tmp/check_workload_size.o"
+)
+
+validate_workload_header_size
+if [ "${APRILTAG_PACKAGING_HEADER_ONLY:-0}" = 1 ]; then
+    exit 0
+fi
+
 if [ -n "${APRILTAG_RVV_DIR:-}" ]; then
     RVV_DIR="$APRILTAG_RVV_DIR"
 else
@@ -27,7 +48,12 @@ trap - EXIT
 
 test "$(cat "$PKG_DIR/lib/.apriltag_rvv.source-hash")" = "$production_before"
 test "$(cat "$PKG_DIR/lib/.apriltag_rvv_workload.source-hash")" = "$workload_before"
-nm -g --defined-only "$PKG_DIR/lib/libapriltag_rvv.a" | grep -q ' apriltag_configure_recovery$'
-nm -g --defined-only "$PKG_DIR/lib/libapriltag_rvv.a" | grep -q ' apriltag_get_recovery_stats$'
-nm -g --defined-only "$PKG_DIR/lib/libapriltag_rvv.a" | grep -q ' apriltag_get_recovery_candidates$'
-nm -g --defined-only "$PKG_DIR/lib/libapriltag_rvv_workload.a" | grep -q ' apriltag_get_workload_counters_v2$'
+production_symbols="$(nm -g --defined-only "$PKG_DIR/lib/libapriltag_rvv.a")"
+workload_symbols="$(nm -g --defined-only "$PKG_DIR/lib/libapriltag_rvv_workload.a")"
+grep -Eq ' apriltag_detect$' <<<"$production_symbols"
+grep -Eq ' apriltag_get_workload_counters$' <<<"$workload_symbols"
+if grep -Eq ' apriltag_get_workload_counters_v2$' <<<"$workload_symbols"; then
+    exit 1
+fi
+grep -Eq '^#define[[:space:]]+APRILTAG_WORKLOAD_SCHEMA_VERSION[[:space:]]+UINT32_C\(1\)[[:space:]]*$' \
+    "$WORKLOAD_HEADER"

@@ -14,7 +14,6 @@ set(bench_bin k230_apriltag_bench)
 set(bench_test_bin apriltag_bench_tests)
 set(workload_bin k230_apriltag_workload)
 set(workload_test_bin apriltag_workload_format_tests)
-set(recovery_test_bin apriltag_recovery_integration_tests)
 set(APRILTAG_RVV_GIT_ID "unversioned" CACHE STRING "apriltag-rvv git identity")
 set(APRILTAG_SDK_GIT_ID "unversioned" CACHE STRING "SDK git identity")
 set(APRILTAG_RVV_LIB ${CMAKE_CURRENT_SOURCE_DIR}/lib/libapriltag_rvv.a)
@@ -47,8 +46,6 @@ add_executable(${workload_test_bin}
 target_compile_definitions(${workload_test_bin} PRIVATE
     APRILTAG_WORKLOAD_FORMAT_TEST APRILTAG_BENCH_NO_OPENCV APRILTAG_BENCH_CORE_ONLY)
 target_compile_definitions(${workload_bin} PRIVATE APRILTAG_BENCH_CORE_ONLY)
-add_executable(${recovery_test_bin}
-    src/recovery_integration_tests.cc src/apriltag_draw.cc)
 target_include_directories(${workload_bin} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/lib)
 target_compile_options(${bench_bin} PRIVATE -fno-omit-frame-pointer)
 target_compile_definitions(${bench_test_bin} PRIVATE
@@ -86,22 +83,13 @@ include_directories(
 )
 
 foreach(bin IN ITEMS ${rvv_bin} ${c_bin} ${bench_bin} ${bench_test_bin}
-                     ${workload_bin} ${recovery_test_bin})
+                     ${workload_bin})
     target_link_directories(${bin} PRIVATE
         ${usr_root}/lib
         ${CMAKE_SYSROOT}
         ${CMAKE_SYSROOT}/usr/lib64/lp64d
     )
 endforeach()
-target_link_libraries(${recovery_test_bin}
-    -Wl,--start-group ${APRILTAG_RVV_LIB}
-    opencv_imgproc opencv_core pthread dl m rt -Wl,--end-group)
-add_custom_command(TARGET ${recovery_test_bin} POST_BUILD
-    COMMAND ${CMAKE_NM} -g --defined-only $<TARGET_FILE:${recovery_test_bin}>
-            > ${CMAKE_CURRENT_BINARY_DIR}/recovery_symbols.txt
-    COMMAND /bin/sh -c
-            "grep -q ' apriltag_configure_recovery$' '${CMAKE_CURRENT_BINARY_DIR}/recovery_symbols.txt' && grep -q ' apriltag_get_recovery_stats$' '${CMAKE_CURRENT_BINARY_DIR}/recovery_symbols.txt' && grep -q ' apriltag_get_recovery_candidates$' '${CMAKE_CURRENT_BINARY_DIR}/recovery_symbols.txt'"
-    VERBATIM)
 
 # Prebuilt Rust static library (built in the rvv-dev docker image; see
 # scripts/build_rust_lib.sh). Contains the apriltag_* C ABI + RVV kernels.

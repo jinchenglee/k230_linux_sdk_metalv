@@ -18,7 +18,18 @@ printf '%s\n' 'fn main() {}' >"$RVV/build.rs"
 printf '%s\n' '[toolchain]' 'channel = "nightly"' >"$RVV/rust-toolchain.toml"
 printf '%s\n' '[build]' 'rustflags = []' >"$RVV/.cargo/config.toml"
 printf '%s\n' 'pub fn fixture() {}' >"$RVV/src/lib.rs"
-printf '%s\n' '#define FIXTURE 1' >"$RVV/include/apriltag_workload.h"
+cat >"$RVV/include/apriltag_workload.h" <<'EOF'
+#ifndef APRILTAG_WORKLOAD_H
+#define APRILTAG_WORKLOAD_H
+#include <stdint.h>
+#define APRILTAG_WORKLOAD_SCHEMA_VERSION UINT32_C(1)
+typedef struct apriltag_workload_counters {
+    uint32_t schema_version;
+    uint32_t struct_size;
+    unsigned char payload[472];
+} apriltag_workload_counters_t;
+#endif
+EOF
 printf '%s\n' '#!/bin/sh' >"$RVV/scripts/build-capi.sh"
 
 cat >"$TMP/hash.mk" <<EOF
@@ -38,6 +49,8 @@ expected_hash="$("$PKG_DIR/scripts/rust_source_hash.sh" "$RVV" workload)"
     exit 1
 }
 
+# The single-quoted strings intentionally defer expansion to the generated script.
+# shellcheck disable=SC2016
 printf '%s\n' '#!/bin/bash' 'set -euo pipefail' \
     'pkg_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"' \
     'printf "%s\\n" "$*" >>"$PACKAGING_TEST_LOG"' \
@@ -108,8 +121,24 @@ BUILD_SCRIPT_TEST_LOG="$TMP/docker.log" PATH="$fake_bin:$PATH" \
     APRILTAG_RVV_DIR="$RVV" APRILTAG_WORKLOAD_SOURCE_HASH="$config_hash" \
     bash "$script_pkg/scripts/build_rust_lib.sh" --workload-only
 grep -q 'scripts/build-capi.sh --workload-counters' "$TMP/docker.log"
-! grep -q -- '--workload-only' "$TMP/docker.log"
+if grep -q -- '--workload-only' "$TMP/docker.log"; then
+    exit 1
+fi
 [ "$(cat "$script_pkg/lib/.apriltag_rvv_workload.source-hash")" = "$config_hash" ]
+cmp "$RVV/include/apriltag_workload.h" "$script_pkg/lib/rust_apriltag_workload.h"
+[ "$(stat -c '%a' "$script_pkg/lib/libapriltag_rvv_workload.a")" = 644 ]
+[ "$(stat -c '%a' "$script_pkg/lib/rust_apriltag_workload.h")" = 644 ]
+[ "$(stat -c '%a' "$script_pkg/lib/.apriltag_rvv_workload.source-hash")" = 644 ]
+
+APRILTAG_PACKAGING_HEADER_ONLY=1 APRILTAG_WORKLOAD_HEADER="$RVV/include/apriltag_workload.h" \
+    bash "$PKG_DIR/scripts/test_rust_packaging.sh"
+cp "$RVV/include/apriltag_workload.h" "$TMP/malformed_workload.h"
+sed -i 's/payload\[472\]/payload[464]/' "$TMP/malformed_workload.h"
+if APRILTAG_PACKAGING_HEADER_ONLY=1 APRILTAG_WORKLOAD_HEADER="$TMP/malformed_workload.h" \
+    bash "$PKG_DIR/scripts/test_rust_packaging.sh" >/dev/null 2>&1; then
+    echo "malformed workload ABI header was accepted" >&2
+    exit 1
+fi
 
 # The checked-out SDK and apriltag-rvv repositories are siblings. Recreate that
 # layout in isolation to verify default discovery without touching packaged
@@ -122,9 +151,11 @@ cp "$PKG_DIR/scripts/rust_source_hash.sh" "$default_pkg/scripts/rust_source_hash
 git -C "$default_sdk" init -q
 default_log="$TMP/default-docker.log"
 BUILD_SCRIPT_TEST_LOG="$default_log" PATH="$fake_bin:$PATH" \
-    APRILTAG_SOURCE_HASH="$config_hash" APRILTAG_RVV_DIR= \
+    APRILTAG_SOURCE_HASH="$config_hash" APRILTAG_RVV_DIR='' \
     bash "$default_pkg/scripts/build_rust_lib.sh"
 grep -q -- "-w $RVV" "$default_log"
+[ "$(stat -c '%a' "$default_pkg/lib/libapriltag_rvv.a")" = 644 ]
+[ "$(stat -c '%a' "$default_pkg/lib/.apriltag_rvv.source-hash")" = 644 ]
 
 explicit_log="$TMP/explicit-docker.log"
 BUILD_SCRIPT_TEST_LOG="$explicit_log" PATH="$fake_bin:$PATH" \

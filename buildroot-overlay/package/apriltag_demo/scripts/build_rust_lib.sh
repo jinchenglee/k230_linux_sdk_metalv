@@ -91,6 +91,7 @@ if [ "$WORKLOAD" -eq 1 ]; then
     cp -f "$SRC_A" "$ARCHIVE_TMP"
     cp -f "$APRILTAG_RVV_DIR/include/apriltag_workload.h" "$HEADER_TMP"
     printf '%s\n' "$APRILTAG_WORKLOAD_SOURCE_HASH" >"$STAMP_TMP"
+    chmod 0644 "$ARCHIVE_TMP" "$HEADER_TMP" "$STAMP_TMP"
     rm -f "$PKG_DIR/lib/.apriltag_rvv_workload.source-hash"
     mv -f "$ARCHIVE_TMP" "$PKG_DIR/lib/$ARCHIVE"
     mv -f "$HEADER_TMP" "$PKG_DIR/lib/rust_apriltag_workload.h"
@@ -102,6 +103,7 @@ else
     trap 'rm -f "$ARCHIVE_TMP" "$STAMP_TMP"' EXIT
     cp -f "$SRC_A" "$ARCHIVE_TMP"
     printf '%s\n' "$APRILTAG_SOURCE_HASH" >"$STAMP_TMP"
+    chmod 0644 "$ARCHIVE_TMP" "$STAMP_TMP"
     rm -f "$PKG_DIR/lib/.apriltag_rvv.source-hash"
     mv -f "$ARCHIVE_TMP" "$PKG_DIR/lib/$ARCHIVE"
     mv -f "$STAMP_TMP" "$PKG_DIR/lib/.apriltag_rvv.source-hash"

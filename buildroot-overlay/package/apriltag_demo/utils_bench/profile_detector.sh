@@ -289,7 +289,7 @@ annotate_full()
     [ -s "$data" ] || return 0
     if [ "$backend" = rust-rvv ]; then
         symbols='apriltag_rvv::pipeline::detect
-apriltag_rvv::pipeline::ccl_and_boundary_extract_impl
+apriltag_rvv::pipeline::ccl_and_boundary_extract
 apriltag_rvv::pipeline::filter_and_sort_clusters_impl
 apriltag_rvv::pipeline::sort_by_angle
 apriltag_rvv::pipeline::compute_errors_into
@@ -474,7 +474,7 @@ correlate_report()
         if (wanted=="c") {
             names[1]="do_gradient_clusters"; names[2]="do_unionfind"; names[3]="fit_line"; names[4]="fit_quad"; count=4
         } else {
-            names[1]="ccl_and_boundary_extract_impl"; names[2]="sort_by_angle"; names[3]="compute_lfps_rvv"
+            names[1]="ccl_and_boundary_extract"; names[2]="sort_by_angle"; names[3]="compute_lfps_rvv"
             names[4]="compute_lfps_scalar"; names[5]="compute_errors_into"; names[6]="decode_quad_detailed"; count=6
         }
         for(i=1;i<=count;i++) if(index($0,names[i])) pct[names[i]]+=p
@@ -487,7 +487,7 @@ correlate_report()
             sample("fit_line","line","line-fit point",64)
             sample("fit_quad","quad","quad attempt",8)
         } else {
-            sample("ccl_and_boundary_extract_impl","boundary","boundary point",4)
+            sample("ccl_and_boundary_extract","boundary","boundary point",4)
             sample("sort_by_angle","sort","point entering sort",8)
             sample("compute_lfps_rvv","lfps","point entering LFPS",8)
             sample("compute_lfps_scalar","lfps","point entering LFPS",8)
