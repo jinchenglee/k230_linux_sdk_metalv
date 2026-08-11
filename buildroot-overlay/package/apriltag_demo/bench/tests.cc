@@ -88,6 +88,7 @@ void test_parser()
     CHECK(defaults.size.native);
     CHECK(defaults.backends.size() == 3);
     CHECK(defaults.factor == 2 && defaults.factor_value == 2.0);
+    CHECK(!defaults.rvv_mask_explicit);
     CHECK(defaults.dump_dir.empty());
 
     CHECK(parse({"bench", "--dump-dir", "output"}).dump_dir == "output");
@@ -107,6 +108,19 @@ void test_parser()
     CHECK(parse({"bench", "--backend", "rust-rvv"}).backends ==
           std::vector<BackendKind>{BackendKind::RustRvv});
     CHECK(parse({"bench", "--backend", "all"}).backends.size() == 3);
+    const auto masked = parse({"bench", "--rvv-stages",
+                               "gray-model,decimate,rle"});
+    CHECK(masked.rvv_mask_explicit);
+    CHECK(masked.rvv_mask == (APRILTAG_KERNEL_GRAY_MODEL |
+                              APRILTAG_KERNEL_DECIMATE |
+                              APRILTAG_KERNEL_RLE));
+    CHECK(masked.rvv_stages == "decimate,rle,gray-model");
+    CHECK(masked.backends == std::vector<BackendKind>(
+        {BackendKind::RustRvv, BackendKind::CReference}));
+    CHECK(parse({"bench", "--backend", "all", "--rvv-stages", "all"})
+              .rvv_mask == APRILTAG_KERNEL_ALL);
+    CHECK(parse({"bench", "--rvv-stages", "none", "--backend", "rust-rvv"})
+              .rvv_stages == "none");
     CHECK(parse({"bench", "--factor", "1.5"}).factor == 1);
     CHECK(parse({"bench", "--help"}).help);
     CHECK(parse({"bench", "--format", "raw", "--size", "native",
@@ -116,6 +130,12 @@ void test_parser()
     expect_parse_error({"bench", "--factor", "1.0"});
     expect_parse_error({"bench", "--factor", "2.0"});
     expect_parse_error({"bench", "--backend", "c-reference"});
+    expect_parse_error({"bench", "--rvv-stages", "rle,rle"});
+    expect_parse_error({"bench", "--rvv-stages", "unknown"});
+    expect_parse_error({"bench", "--rvv-stages", ""});
+    expect_parse_error({"bench", "--backend", "rust-scalar",
+                        "--rvv-stages", "all"});
+    expect_parse_error({"bench", "--rvv-stages", "all", "--backend", "c"});
     expect_parse_error({"bench", "--size", "1280"});
     expect_parse_error({"bench", "--warmup", "-1"});
     expect_parse_error({"bench", "--iterations", "0"});
@@ -400,6 +420,8 @@ void test_schedule_and_stability()
                             APRILTAG_BENCH_BUILD_ID) !=
           std::string::npos);
     CHECK(output.str().find("Bytes       : 1") != std::string::npos);
+    CHECK(output.str().find("RVV stages  : uniform by backend") !=
+          std::string::npos);
     CHECK(output.str().find("Total measured") != std::string::npos);
     CHECK(output.str().find("equivalent-output speed") != std::string::npos);
     const std::string result = output.str().substr(
@@ -410,6 +432,10 @@ void test_schedule_and_stability()
              " warmup=1", " iterations=2", " batches=2"}) {
         CHECK(result.find(field) != std::string::npos);
     }
+    CHECK(result.find(" rvv_mask=all stages=all") != std::string::npos);
+    const auto c_result = output.str().find("RESULT backend=c-reference");
+    CHECK(output.str().substr(c_result).find(" rvv_mask=n/a stages=n/a") !=
+          std::string::npos);
     CHECK(result.find(std::string(" build=") + APRILTAG_BENCH_BUILD_ID) !=
           std::string::npos);
 

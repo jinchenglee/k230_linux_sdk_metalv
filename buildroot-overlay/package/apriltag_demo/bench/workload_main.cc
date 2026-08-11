@@ -191,7 +191,12 @@ void print_workload_report(const BenchmarkConfig& config, const PreparedImage& i
                                       rvv->detection.checksum == cref->detection.checksum) << '\n';
     }
     for (const auto& r : results) {
-        out << "WORKLOAD backend=" << backend_key(r.kind) << " schema=" << r.counters.schema_version
+        out << "WORKLOAD backend=" << backend_key(r.kind) << " rvv_mask=";
+        if (r.kind == BackendKind::CReference) out << "n/a stages=n/a";
+        else if (config.rvv_mask_explicit) out << "0x" << std::hex << config.rvv_mask
+                                                << std::dec << " stages=" << config.rvv_stages;
+        else out << (r.kind == BackendKind::RustRvv ? "all stages=all" : "none stages=none");
+        out << " schema=" << r.counters.schema_version
             << " validity=0x" << std::hex << r.counters.validity << std::dec
             << " detections=" << r.detection.count
             << " checksum=" << std::hex << r.detection.checksum << std::dec;

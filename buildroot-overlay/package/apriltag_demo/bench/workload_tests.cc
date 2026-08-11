@@ -1,6 +1,7 @@
 #include "workload_backend.h"
 
 #include <cstdint>
+#include <cstring>
 #include <iostream>
 #include <limits>
 #include <sstream>
@@ -8,6 +9,37 @@
 #include <string>
 
 using namespace apriltag_bench;
+
+#ifdef APRILTAG_WORKLOAD_BACKEND_TEST
+#include "apriltag.h"
+#include "rust_apriltag_workload.h"
+static int mock_new_calls;
+static int mock_free_calls;
+static int mock_setter_calls;
+static int mock_detect_calls;
+static int mock_setter_result;
+static std::uint64_t mock_mask;
+extern "C" {
+void* apriltag_new(std::uint32_t) { ++mock_new_calls; return reinterpret_cast<void*>(1); }
+void apriltag_free(void*) { ++mock_free_calls; }
+int apriltag_set_kernel_mask_v1(void*, std::uint64_t mask)
+{
+    ++mock_setter_calls; mock_mask = mask; return mock_setter_result;
+}
+int apriltag_detect(void*, const std::uint8_t*, std::size_t, std::size_t, std::size_t,
+                    int, int, apriltag_det_t*, int)
+{
+    ++mock_detect_calls; return 0;
+}
+int apriltag_get_workload_counters(apriltag_t*, apriltag_workload_counters_t* out)
+{
+    std::memset(out, 0, sizeof(*out));
+    out->schema_version = 1;
+    out->struct_size = sizeof(*out);
+    return 1;
+}
+}
+#endif
 
 namespace {
 int failures;
@@ -87,8 +119,8 @@ void test_schema_output()
     const std::string text = out.str();
     CHECK(text.find("Common workload counters") != std::string::npos);
     CHECK(text.find("Early polarity estimates") != std::string::npos);
-    CHECK(text.find("WORKLOAD backend=rust-rvv schema=1") != std::string::npos);
-    CHECK(text.find("WORKLOAD backend=c-reference schema=1") != std::string::npos);
+    CHECK(text.find("WORKLOAD backend=rust-rvv rvv_mask=all stages=all schema=1") != std::string::npos);
+    CHECK(text.find("WORKLOAD backend=c-reference rvv_mask=n/a stages=n/a schema=1") != std::string::npos);
     CHECK(text.find("validity=0x3f") != std::string::npos);
     CHECK(text.find("boundary_points_emitted=200") != std::string::npos);
     CHECK(text.find("points_entering_sort=160") != std::string::npos);
@@ -105,6 +137,19 @@ void test_schema_output()
     CHECK(text.find("decode attempts: 2.000000x") != std::string::npos);
     CHECK(text.find("threshold_checksum_match=1") != std::string::npos);
     CHECK(text.find("output_match=1") != std::string::npos);
+}
+
+void test_explicit_mask_metadata()
+{
+    BenchmarkConfig config;
+    config.rvv_mask_explicit = true;
+    config.rvv_mask = APRILTAG_KERNEL_RLE;
+    config.rvv_stages = "rle";
+    PreparedImage image{8, 6, 8, std::vector<std::uint8_t>(48)};
+    std::ostringstream out;
+    print_workload_report(config, image, {sample(BackendKind::RustRvv, 1)}, out);
+    CHECK(out.str().find("WORKLOAD backend=rust-rvv rvv_mask=0x4 stages=rle schema=1") !=
+          std::string::npos);
 }
 
 void test_max_u64_checksum_table_columns_are_readable()
@@ -217,6 +262,48 @@ void test_checksum_matches_require_valid_counters()
     CHECK(text.find("threshold_checksum_match=n/a") != std::string::npos);
     CHECK(text.find("output_match=1") != std::string::npos);
 }
+
+#ifdef APRILTAG_WORKLOAD_BACKEND_TEST
+void reset_mock_backend()
+{
+    mock_new_calls = mock_free_calls = mock_setter_calls = mock_detect_calls = 0;
+    mock_setter_result = 0;
+    mock_mask = 0;
+}
+
+void test_workload_mask_set_before_detect()
+{
+    reset_mock_backend();
+    BenchmarkConfig config;
+    config.rvv_mask_explicit = true;
+    config.rvv_mask = APRILTAG_KERNEL_RLE | APRILTAG_KERNEL_GRAY_MODEL;
+    auto backend = make_workload_rust_backend(config, BackendKind::RustRvv);
+    CHECK(mock_new_calls == 1);
+    CHECK(mock_setter_calls == 1);
+    CHECK(mock_mask == config.rvv_mask);
+    PreparedImage image{1, 1, 1, {0}};
+    backend->run(image);
+    CHECK(mock_detect_calls == 1);
+    backend.reset();
+    CHECK(mock_free_calls == 1);
+}
+
+void test_workload_mask_failure_frees_without_detect()
+{
+    reset_mock_backend();
+    mock_setter_result = -1;
+    BenchmarkConfig config;
+    config.rvv_mask_explicit = true;
+    config.rvv_mask = APRILTAG_KERNEL_THRESHOLD;
+    bool threw = false;
+    try { (void)make_workload_rust_backend(config, BackendKind::RustRvv); }
+    catch (const std::runtime_error&) { threw = true; }
+    CHECK(threw);
+    CHECK(mock_setter_calls == 1);
+    CHECK(mock_free_calls == 1);
+    CHECK(mock_detect_calls == 0);
+}
+#endif
 }  // namespace
 
 int main()
@@ -224,12 +311,17 @@ int main()
     test_determinism_rejection();
     test_incompatible_schema_rejection();
     test_schema_output();
+    test_explicit_mask_metadata();
     test_max_u64_checksum_table_columns_are_readable();
     test_invalid_ratio_numerator_is_not_available();
     test_zero_denominator_ratios_are_not_available();
     test_early_polarity_ratios_require_valid_counters();
     test_early_polarity_ratios_use_hypothetical_validity();
     test_checksum_matches_require_valid_counters();
+#ifdef APRILTAG_WORKLOAD_BACKEND_TEST
+    test_workload_mask_set_before_detect();
+    test_workload_mask_failure_frees_without_detect();
+#endif
     if (failures) return 1;
     std::cout << "all workload format tests passed\n";
     return 0;

@@ -9,6 +9,11 @@
 #include <string>
 #include <vector>
 
+#include "apriltag_kernel_modes.h"
+#ifdef APRILTAG_BENCH_PROFILE
+#include "rust_apriltag_profile.h"
+#endif
+
 namespace apriltag_bench {
 
 // Both backends support complete result sets of 0..4095 detections.
@@ -40,6 +45,9 @@ struct BenchmarkConfig {
     int iterations = 100;
     int batches = 10;
     std::string dump_dir;
+    bool rvv_mask_explicit = false;
+    std::uint64_t rvv_mask = APRILTAG_KERNEL_ALL;
+    std::string rvv_stages = "all";
     bool help = false;
 };
 
@@ -108,6 +116,9 @@ public:
     virtual void set_capture_detections(bool capture) = 0;
     virtual DetectionResult detect(const PreparedImage& image) = 0;
     virtual const std::vector<Detection>& detections() const = 0;
+#ifdef APRILTAG_BENCH_PROFILE
+    virtual bool consume_profile(apriltag_ccl_profile_t&) = 0;
+#endif
 };
 
 BenchmarkConfig parse_args(int argc, const char* const argv[]);
@@ -133,6 +144,14 @@ int benchmark_main(int argc, const char* const argv[], std::ostream& out,
 void print_usage(std::ostream& out, const char* program);
 const char* backend_key(BackendKind kind);
 const char* backend_name(BackendKind kind);
+#ifdef APRILTAG_BENCH_PROFILE
+std::size_t profile_timing_descriptor_count();
+std::size_t profile_counter_descriptor_count();
+void validate_profile_sequence(const std::vector<apriltag_ccl_profile_t>& profiles);
+void print_profile_report(const BenchmarkConfig& config, BackendKind kind,
+                          const std::vector<apriltag_ccl_profile_t>& profiles,
+                          std::ostream& out);
+#endif
 void write_visual_dumps(const std::string& directory,
                         const PreparedImage& image,
                         const std::vector<VisualDump>& dumps);

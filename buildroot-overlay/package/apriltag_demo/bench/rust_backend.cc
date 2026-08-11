@@ -6,6 +6,10 @@
 #include <stdexcept>
 #include <vector>
 
+#ifdef APRILTAG_BENCH_PROFILE
+#include "rust_apriltag_profile.h"
+#endif
+
 namespace apriltag_bench {
 namespace {
 
@@ -19,6 +23,12 @@ public:
         if (!handle_) {
             throw std::runtime_error(std::string(backend_name(kind_)) +
                                      " detector construction failed");
+        }
+        if (config.rvv_mask_explicit &&
+            apriltag_set_kernel_mask_v1(handle_, config.rvv_mask) != 0) {
+            apriltag_free(handle_);
+            handle_ = nullptr;
+            throw std::runtime_error("failed to configure Rust RVV stage mask");
         }
         normalized_.reserve(kMaxDetections);
     }
@@ -58,6 +68,16 @@ public:
         }
         return {count, checksum.value()};
     }
+
+#ifdef APRILTAG_BENCH_PROFILE
+    bool consume_profile(apriltag_ccl_profile_t& profile) override
+    {
+        const int result = apriltag_get_ccl_profile_v1(
+            static_cast<apriltag_t*>(handle_), &profile, sizeof(profile));
+        if (result != 1) throw std::runtime_error("CCL profile getter failed");
+        return true;
+    }
+#endif
 
 private:
     void* handle_;

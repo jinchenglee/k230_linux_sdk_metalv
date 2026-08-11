@@ -9,6 +9,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include "apriltag_kernel_modes.h"
 
 #ifdef __cplusplus
 extern "C" {

@@ -142,6 +142,7 @@ because the target exposes one application CPU.
 cd /root/app/apriltag_bench
 ./profile_detector.sh fast
 ./profile_detector.sh full --input /root/frame.y8 --format raw --size 640x360
+APRILTAG_PROFILE_ABLATIONS=1 ./profile_detector.sh fast
 ```
 
 User benchmark options follow the wrapper defaults, while the wrapper appends
@@ -161,6 +162,20 @@ It contains `environment.txt`, `workload.log`, `workload-summary.txt`,
 `.stat`, `.data`, `.report`, optional callgraph/annotation files, and
 `summary.txt`.
 
+Set `APRILTAG_PROFILE_ABLATIONS=1` to append a long-running 14-configuration
+Rust matrix: scalar, each of the six stages in isolation, all stages, and each
+stage disabled from all. Every label has its own directory under `ablations/`
+with authoritative production `benchmark.log`, Rust `workload.log`,
+instrumented `profile.log` (including `STAGE` and `CCL_WORK` records), and
+probed `perf.stat`/`perf.log`. The matrix deliberately does not record a flat
+sample profile per mask. Fast and full retain their normal work unchanged;
+full mode does not repeat ablation stats because the matrix is already costly.
+Use `APRILTAG_PROFILE_STAGE_BENCH` only to override the instrumented executable.
+Matrix defaults are 5 warmup calls plus 20 iterations in 5 batches for each
+production, instrumented, and perf run. With 14 masks and two deterministic
+workload calls per mask this is 4,480 detector calls. `environment.txt` records
+the production, profile, perf, workload, and total call budgets.
+
 The workload run happens before any perf collection and is never used as an
 authoritative latency measurement. `summary.txt` appends Rust-RVV/C ratios for
 emitted, sorted, LFPS, error-fit, quad, and decode work and preserves warnings
@@ -177,6 +192,14 @@ APRILTAG_PROFILE_OUTPUT       root for a unique per-run output directory
 APRILTAG_PROFILE_WARMUP       benchmark warmup calls
 APRILTAG_PROFILE_ITERATIONS   calls per batch
 APRILTAG_PROFILE_BATCHES      measurement batches
+APRILTAG_PROFILE_ABLATIONS    1 enables the 14-configuration stage matrix
+APRILTAG_PROFILE_STAGE_BENCH  instrumented benchmark used for STAGE/CCL_WORK
+APRILTAG_ABLATION_WARMUP      matrix production/profile warmup calls (default 5)
+APRILTAG_ABLATION_ITERATIONS  matrix production/profile calls per batch (20)
+APRILTAG_ABLATION_BATCHES     matrix production/profile batches (5)
+APRILTAG_ABLATION_PERF_WARMUP perf-run warmup calls (defaults to matrix warmup)
+APRILTAG_ABLATION_PERF_ITERATIONS perf-run calls per batch (defaults to 20)
+APRILTAG_ABLATION_PERF_BATCHES perf-run batches (defaults to 5)
 ```
 
 Every candidate stat event is probed separately and unsupported events are
@@ -196,6 +219,27 @@ instructions exist. Symbol percentages are sample attribution; their displayed
 milliseconds are explicitly approximate statistical estimates, not independently
 timed detector stages. A checksum mismatch warning means speed ratios are not
 equivalent-output comparisons.
+
+`ablations/summary.txt` reports each production mean and workload checksum,
+isolated gain relative to all-scalar, and disabled-stage regression relative
+to all-optimized. An isolated gain is reported only when both production and
+workload detection count/checksum match scalar; a disabled-stage regression is
+reported only when both match all-optimized. The corresponding
+`equivalent_to_scalar` or `equivalent_to_all` field is `0` and the marginal is
+`n/a` when either comparison fails. Available cycles, instructions, branches, and branch misses
+are normalized over measured + warmup + one validation detector call; the
+whole-process setup/teardown caveat still applies. Output mismatches are
+explicitly warned and invalidate equivalent-output marginal interpretation.
+`lfps-tuned` selects the tuned LFPS kernel as one mask bit; scalar and disabled
+forms use the scalar implementation. Instrumented stage timers are diagnostic
+and can perturb latency, so production `RESULT` records remain authoritative.
+The matrix records `production_mean_ms`, `instrumented_mean_ms`, and the
+absolute/percentage instrumentation overhead for each mask. Marginal gains
+continue to use only production means. `CCL_TIMER_HEALTH` enforces per-snapshot
+timer conservation: diagnostic time is included among attributed phases,
+optional resolve/filter time is included only when valid, and unattributed time
+must equal total minus attributed time. The summary reports mean/max
+unattributed ratios and warns, without failing, when the maximum exceeds 10%.
 
 For direct annotation, pass a profile and exact symbol (or add
 `--interactive`):

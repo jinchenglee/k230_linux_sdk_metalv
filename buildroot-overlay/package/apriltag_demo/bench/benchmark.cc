@@ -68,6 +68,51 @@ ImageSize parse_size(const char* value)
     return ImageSize::explicit_size(width, height);
 }
 
+void parse_rvv_stages(const std::string& value, BenchmarkConfig& config)
+{
+    struct Stage { const char* name; std::uint64_t bit; };
+    static constexpr Stage stages[] = {
+        {"decimate", APRILTAG_KERNEL_DECIMATE},
+        {"threshold", APRILTAG_KERNEL_THRESHOLD},
+        {"rle", APRILTAG_KERNEL_RLE},
+        {"lfps-tuned", APRILTAG_KERNEL_LFPS_TUNED},
+        {"gaussian", APRILTAG_KERNEL_GAUSSIAN},
+        {"gray-model", APRILTAG_KERNEL_GRAY_MODEL},
+    };
+    if (value.empty()) throw ArgumentError("--rvv-stages requires a non-empty value");
+    config.rvv_mask_explicit = true;
+    if (value == "all") config.rvv_mask = APRILTAG_KERNEL_ALL;
+    else if (value == "none") config.rvv_mask = 0;
+    else {
+        config.rvv_mask = 0;
+        std::size_t begin = 0;
+        while (begin < value.size()) {
+            const std::size_t end = value.find(',', begin);
+            const std::string name = value.substr(begin, end - begin);
+            const auto stage = std::find_if(std::begin(stages), std::end(stages),
+                [&](const Stage& candidate) { return name == candidate.name; });
+            if (name.empty() || stage == std::end(stages))
+                throw ArgumentError("--rvv-stages contains unknown stage: " + name);
+            if (config.rvv_mask & stage->bit)
+                throw ArgumentError("--rvv-stages contains duplicate stage: " + name);
+            config.rvv_mask |= stage->bit;
+            if (end == std::string::npos) break;
+            begin = end + 1;
+            if (begin == value.size())
+                throw ArgumentError("--rvv-stages contains an empty stage");
+        }
+    }
+    if (config.rvv_mask == 0) config.rvv_stages = "none";
+    else if (config.rvv_mask == APRILTAG_KERNEL_ALL) config.rvv_stages = "all";
+    else {
+        config.rvv_stages.clear();
+        for (const auto& stage : stages) if (config.rvv_mask & stage.bit) {
+            if (!config.rvv_stages.empty()) config.rvv_stages += ',';
+            config.rvv_stages += stage.name;
+        }
+    }
+}
+
 InputFormat infer_format(const std::string& path)
 {
     const auto dot = path.find_last_of('.');
@@ -154,6 +199,9 @@ int validate_detection_count(int count)
 BenchmarkConfig parse_args(int argc, const char* const argv[])
 {
     BenchmarkConfig config;
+#ifdef APRILTAG_BENCH_PROFILE
+    config.backends = {BackendKind::RustRvv};
+#endif
     for (int i = 1; i < argc; ++i) {
         const std::string option(argv[i]);
         if (option == "--input") {
@@ -192,6 +240,8 @@ BenchmarkConfig parse_args(int argc, const char* const argv[])
             } else {
                 throw ArgumentError("--factor must be 1, 1.5, or 2");
             }
+        } else if (option == "--rvv-stages") {
+            parse_rvv_stages(require_value(argc, argv, i), config);
         } else if (option == "--min-blob") {
             config.min_blob = parse_integer<std::uint32_t>(
                 require_value(argc, argv, i), "--min-blob", 1);
@@ -223,6 +273,23 @@ BenchmarkConfig parse_args(int argc, const char* const argv[])
                                      ? infer_format(config.input) : config.format;
     if (resolved == InputFormat::Raw && config.size.native) {
         throw ArgumentError("raw input requires --size WxH");
+    }
+#ifdef APRILTAG_BENCH_PROFILE
+    if (config.backends != std::vector<BackendKind>{BackendKind::RustRvv})
+        throw ArgumentError("profile benchmark supports only rust-rvv");
+#endif
+    if (config.rvv_mask_explicit) {
+        if (config.backends == std::vector<BackendKind>{BackendKind::RustRvv,
+                                                        BackendKind::CReference,
+                                                        BackendKind::RustScalar}) {
+            config.backends.pop_back();
+        }
+        const bool has_rvv = std::find(config.backends.begin(), config.backends.end(),
+                                       BackendKind::RustRvv) != config.backends.end();
+        if (!has_rvv || std::find(config.backends.begin(), config.backends.end(),
+                                  BackendKind::RustScalar) != config.backends.end()) {
+            throw ArgumentError("--rvv-stages requires rust-rvv (optionally with C)");
+        }
     }
     return config;
 }
@@ -422,6 +489,8 @@ int run_benchmark(const BenchmarkConfig& config,
         << "Input hash  : " << std::hex << input_hash << std::dec << '\n'
         << "Factor      : " << config.factor_value << '\n'
         << "Min blob    : " << config.min_blob << '\n'
+        << "RVV stages  : " << (config.rvv_mask_explicit ? config.rvv_stages
+                                                          : "uniform by backend") << '\n'
         << "Warmup      : " << config.warmup << " calls/backend\n"
         << "Measurement : " << config.batches << " batches x "
         << config.iterations << " calls/backend\n"
@@ -434,6 +503,9 @@ int run_benchmark(const BenchmarkConfig& config,
 
     std::vector<DetectionResult> expected(backends.size());
     std::vector<std::vector<std::uint64_t>> samples(backends.size());
+#ifdef APRILTAG_BENCH_PROFILE
+    std::vector<std::vector<apriltag_ccl_profile_t>> profiles(backends.size());
+#endif
     std::vector<std::vector<double>> batch_means(
         static_cast<std::size_t>(config.batches),
         std::vector<double>(backends.size()));
@@ -485,6 +557,19 @@ int run_benchmark(const BenchmarkConfig& config,
                         error.what());
                 }
                 const std::uint64_t finish = monotonic_raw_ns();
+#ifdef APRILTAG_BENCH_PROFILE
+                apriltag_ccl_profile_t profile{};
+                try {
+                    if (backends[index]->consume_profile(profile))
+                        profiles[index].push_back(profile);
+                } catch (const std::exception& error) {
+                    throw std::runtime_error(
+                        std::string(backends[index]->name()) + " (" +
+                        backend_key(backends[index]->kind()) +
+                        ") profile failed in batch " + std::to_string(batch + 1) +
+                        " call " + std::to_string(call + 1) + ": " + error.what());
+                }
+#endif
                 if (result.count != expected[index].count ||
                     result.checksum != expected[index].checksum) {
                     throw std::runtime_error(std::string(backends[index]->name()) +
@@ -586,6 +671,13 @@ int run_benchmark(const BenchmarkConfig& config,
     out << '\n';
     for (std::size_t i = 0; i < backends.size(); ++i) {
         out << "RESULT backend=" << backend_key(backends[i]->kind())
+            << " rvv_mask=";
+        if (backends[i]->kind() == BackendKind::CReference) out << "n/a stages=n/a";
+        else if (config.rvv_mask_explicit) out << "0x" << std::hex << config.rvv_mask
+                                               << std::dec << " stages=" << config.rvv_stages;
+        else out << (backends[i]->kind() == BackendKind::RustRvv ? "all stages=all"
+                                                                  : "none stages=none");
+        out
             << " calls=" << stats[i].count << std::fixed << std::setprecision(3)
             << " total_ms=" << stats[i].total_ms
             << " min_ms=" << stats[i].min_ms
@@ -608,7 +700,10 @@ int run_benchmark(const BenchmarkConfig& config,
             << " min_blob=" << config.min_blob
             << " warmup=" << config.warmup
             << " iterations=" << config.iterations
-            << " batches=" << config.batches << '\n';
+             << " batches=" << config.batches << '\n';
+#ifdef APRILTAG_BENCH_PROFILE
+        if (!profiles[i].empty()) print_profile_report(config, backends[i]->kind(), profiles[i], out);
+#endif
     }
     out << std::flush;
     return 0;
@@ -620,8 +715,14 @@ void print_usage(std::ostream& out, const char* program)
         << "  --input PATH          raw Y8 or JPEG input\n"
         << "  --format FORMAT       auto, raw, or jpeg\n"
         << "  --size SIZE           native or WxH; raw requires WxH\n"
+#ifdef APRILTAG_BENCH_PROFILE
+        << "  --backend BACKEND     rust-rvv only\n"
+#else
         << "  --backend BACKEND     all, rust-rvv, rust-scalar, or c\n"
+#endif
         << "  --factor FACTOR       1, 1.5, or 2\n"
+        << "  --rvv-stages STAGES   all, none, or comma-separated:\n"
+        << "                        decimate,threshold,rle,lfps-tuned,gaussian,gray-model\n"
         << "  --min-blob N          minimum cluster pixels\n"
         << "  --warmup N            untimed calls per backend\n"
         << "  --iterations N        calls per measured batch\n"
@@ -650,8 +751,12 @@ int benchmark_main(int argc, const char* const argv[], std::ostream& out,
         PreparedImage image = load_image(config);
         std::vector<std::unique_ptr<Backend>> backends;
         for (const BackendKind kind : config.backends) {
+#ifdef APRILTAG_BENCH_PROFILE
+            backends.push_back(make_rust_backend(config, kind));
+#else
             if (kind == BackendKind::CReference) backends.push_back(make_c_backend(config));
             else backends.push_back(make_rust_backend(config, kind));
+#endif
         }
         return run_benchmark(config, std::move(backends), image, out);
     } catch (const std::exception& error) {

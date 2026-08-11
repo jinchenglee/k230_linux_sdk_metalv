@@ -1,6 +1,13 @@
-# Prebuilt Rust staticlib — reproducible via scripts/build_rust_lib.sh
-# (built in the rvv-dev docker image); not tracked in git.
+# Prebuilt production/workload/profile Rust archives are reproducible via
+# scripts/build_rust_lib.sh and intentionally ignored. Their ABI headers and
+# source-hash stamps are generated package inputs and remain visible to git;
+# Buildroot rebuilds an ignored archive when its matching set is stale/missing.
 lib/*.a
+lib/.apriltag-rvv-package.lock
+lib/.publish-backup.*
+lib/.source-hash.*
+lib/.libapriltag_rvv*.a.*
+lib/.rust_apriltag*.h.*
 
 # Standalone build_app.sh outputs
 out/

@@ -19,6 +19,12 @@ public:
           mode_(kind == BackendKind::RustRvv ? 1 : 0), output_(kMaxDetections)
     {
         if (!handle_) throw std::runtime_error("Rust workload detector construction failed");
+        if (config.rvv_mask_explicit &&
+            apriltag_set_kernel_mask_v1(handle_, config.rvv_mask) != 0) {
+            apriltag_free(handle_);
+            handle_ = nullptr;
+            throw std::runtime_error("failed to configure Rust workload RVV stage mask");
+        }
     }
     ~RustWorkloadBackend() override { apriltag_free(handle_); }
     BackendKind kind() const override { return kind_; }
