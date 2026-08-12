@@ -9,6 +9,9 @@ preprocessing, display, keyboard-control, and FPS-reporting code:
 It also builds `k230_apriltag_bench`, a fixed-image detector benchmark that
 links no camera or display libraries. Its installed JPEG fixture is an unchanged
 copy of `apriltag-rvv/tests/data/33369213973_9d9bb4cc96_c.jpg`.
+The fixture decodes natively to 799x533. The default 1280x720 wrapper profile
+explicitly resizes it, so those profiles are not native-resolution comparisons;
+use `--size native` for the valid 799x533 native baseline.
 `k230_apriltag_workload` separately compares deterministic instrumented Rust RVV,
 Rust scalar, and prefixed official-C detector builds. Production benchmarks and
 demos continue to link only the pristine production archives.
@@ -102,6 +105,12 @@ Run the untimed workload comparison with the same input and detector options:
 Each selected backend is called twice and the command fails if either its
 detections or counter snapshot changes. The readable table marks unavailable
 fields as `n/a`; stable `WORKLOAD` lines contain the complete schema for scripts.
+Their top-level detector output identity is `result_detections` and
+`result_checksum`. This is a breaking migration for external parsers: replace
+the former top-level `detections` lookup with `result_detections`, and replace
+`checksum` with `result_checksum`. The schema's remaining `detections` field is
+the final decode-work counter, not the top-level result count. Every
+machine-record key occurs exactly once.
 The Rust workload archive serves both RVV and scalar modes. The C workload ABI
 is prefixed, so the workload executable links no production detector archive.
 
@@ -189,6 +198,7 @@ APRILTAG_PROFILE_EVENTS       comma-separated candidate perf events
 APRILTAG_PROFILE_REPEATS      full-mode stat repetitions
 APRILTAG_PROFILE_FREQUENCY    perf record sampling frequency
 APRILTAG_PROFILE_OUTPUT       root for a unique per-run output directory
+APRILTAG_PROFILE_INPUTS       private line-oriented label=path,WIDTHxHEIGHT matrix
 APRILTAG_PROFILE_WARMUP       benchmark warmup calls
 APRILTAG_PROFILE_ITERATIONS   calls per batch
 APRILTAG_PROFILE_BATCHES      measurement batches
@@ -201,6 +211,76 @@ APRILTAG_ABLATION_PERF_WARMUP perf-run warmup calls (defaults to matrix warmup)
 APRILTAG_ABLATION_PERF_ITERATIONS perf-run calls per batch (defaults to 20)
 APRILTAG_ABLATION_PERF_BATCHES perf-run batches (defaults to 5)
 ```
+
+`APRILTAG_PROFILE_INPUTS` enables the multi-input workflow. Each non-empty line
+has the form `label=path,WIDTHxHEIGHT` or `label=path,native`, for example:
+
+```sh
+APRILTAG_PROFILE_INPUTS='scene-a=/root/frames/scene a.jpg,1280x720
+scene-b=/root/frames/scene-b.jpg,native' ./profile_detector.sh fast
+```
+
+Blank and whitespace-only lines are ignored. Other fields are exact and are not
+trimmed. Labels must use only letters, digits, `.`, `_`, and `-`, and may not be
+`.` or `..`. Paths may contain spaces but not commas, backslashes, tabs, newlines,
+or carriage returns.
+Inputs must exist; labels and canonical physical paths must be unique.
+Canonicalization requires a working `readlink -f`;
+`APRILTAG_PROFILE_READLINK` is a private test
+override for that command. The manifest records and executes the resolved
+canonical path rather than the original spelling or symlink. A portable
+option-safe SHA-256 is recorded before profiling and checked again afterward;
+an input that changes during its workflow is fatal and prevents cross-input
+summary publication. The unique run directory contains the validated
+`inputs.tsv`, one complete independent profile under `inputs/<label>/`, and
+`cross-input-summary.txt`. Each input gets its own environment, workload,
+comparison, images, perf profiles, summary, and optional 14-mask ablation
+matrix. Multi-input mode also makes one instrumented Rust-RVV run per input in
+`ccl-profile.log`; this diagnostic run is not an authoritative production
+latency measurement and its mean is reported separately. A failure stops at
+that input and leaves previously completed input directories intact, while the
+top-level cross-input summary is published only after every input succeeds.
+Because the manifest owns input selection and preparation size, multi-input
+mode rejects user benchmark arguments `--input`, `--format`, and `--size`, in
+both separate-value and `--option=value` forms. Other benchmark arguments are
+applied independently to every input. Single-input mode continues to accept
+those options for compatibility.
+Perf event and sampling support are probed once with the first manifest input;
+the selected event sets are then recorded in and reused by every per-input
+environment. This avoids multiplying capability probes by the number of inputs.
+When the variable is unset, the established single-fixture commands, runtime,
+and result layout are unchanged: no instrumented baseline run or `inputs/`
+artifacts are added.
+
+The cross-input summary has one `INPUT` record per manifest row. It includes
+the label, file SHA-256, decoded-pixel `input_hash`, decoded width and height,
+production means and output identity, instrumented mean, and required
+`group_emit` and `root_materialize` mean stage times. It also reports CCL
+`runs`, pending records, accepted grouping records, distinct keys, and emitted
+points. Pending records are the exact decimal sum of `pending_type_0` through
+`pending_type_3`; emitted points are the exact decimal sum of `emitted_type_0`
+through `emitted_type_3`. Those sums must equal the Rust-RVV WORKLOAD
+`pending_boundary_records` and `boundary_points_emitted` fields respectively.
+The file SHA-256 identifies
+the private source file; `input_hash` identifies the prepared decoded pixels and
+can therefore differ. Benchmark, workload, instrumented profile, and perf
+records are checked for a single consistent input hash, dimensions, and output.
+Every consumed field must occur exactly once, and required numeric fields must
+have valid decimal syntax; missing, malformed, or duplicate fields and records
+are fatal. The generic parser does not
+know a private expected hash, so callers can compare either published hash with
+their own inventory.
+
+Each `INPUT` record also includes Rust RVV whole-process
+`cycles_per_call`, `instructions_per_call`, `branches_per_call`, and
+`branch_misses_per_call`. These values are parsed from that input's semicolon
+`rust-rvv.stat` records and normalized by the exact `rust-rvv.log` `RESULT`
+calls + warmup + one validation call. Each required stat event must occur
+exactly once with an unsigned integer or decimal value; missing, duplicate, or
+nonnumeric counters are fatal. Every multi-input `summary.txt` and
+`environment.txt` begins with the input label, canonical path, file SHA-256,
+requested size, and dimensions reported by the native result path. Single-input
+mode leaves the established summary format unchanged.
 
 Every candidate stat event is probed separately and unsupported events are
 omitted with warnings. At least one timing event must work. Sampling first tries

@@ -126,6 +126,7 @@ void validate_workload_pair(const WorkloadResult& a, const WorkloadResult& b)
 void print_workload_report(const BenchmarkConfig& config, const PreparedImage& image,
                            const std::vector<WorkloadResult>& results, std::ostream& out)
 {
+    const std::uint64_t input_hash = checksum_bytes(image.pixels.data(), image.pixels.size());
     out << "K230 AprilTag detector workload\nImage: " << image.width << 'x' << image.height
         << "  Factor: " << config.factor_value << "  Min blob: " << config.min_blob << "\n\n"
         << "Common workload counters\n" << std::left << std::setw(42) << "Metric";
@@ -197,9 +198,11 @@ void print_workload_report(const BenchmarkConfig& config, const PreparedImage& i
                                                 << std::dec << " stages=" << config.rvv_stages;
         else out << (r.kind == BackendKind::RustRvv ? "all stages=all" : "none stages=none");
         out << " schema=" << r.counters.schema_version
+            << " input_hash=" << std::hex << input_hash << std::dec
+            << " width=" << image.width << " height=" << image.height
             << " validity=0x" << std::hex << r.counters.validity << std::dec
-            << " detections=" << r.detection.count
-            << " checksum=" << std::hex << r.detection.checksum << std::dec;
+            << " result_detections=" << r.detection.count
+            << " result_checksum=" << std::hex << r.detection.checksum << std::dec;
 #define PRINT_COUNTER(name) out << " " #name "=" << r.counters.name;
         WORKLOAD_COUNTER_FIELDS(PRINT_COUNTER)
 #undef PRINT_COUNTER

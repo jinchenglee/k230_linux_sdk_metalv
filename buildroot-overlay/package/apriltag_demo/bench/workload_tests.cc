@@ -121,9 +121,27 @@ void test_schema_output()
     CHECK(text.find("Early polarity estimates") != std::string::npos);
     CHECK(text.find("WORKLOAD backend=rust-rvv rvv_mask=all stages=all schema=1") != std::string::npos);
     CHECK(text.find("WORKLOAD backend=c-reference rvv_mask=n/a stages=n/a schema=1") != std::string::npos);
+    CHECK(text.find(" input_hash=") != std::string::npos);
+    CHECK(text.find(" width=8 height=6") != std::string::npos);
     CHECK(text.find("validity=0x3f") != std::string::npos);
     CHECK(text.find("boundary_points_emitted=200") != std::string::npos);
     CHECK(text.find("points_entering_sort=160") != std::string::npos);
+    CHECK(text.find(" result_detections=2 result_checksum=1234") != std::string::npos);
+    const auto workload = text.find("WORKLOAD backend=rust-rvv");
+    const auto workload_end = text.find('\n', workload);
+    const std::string record = text.substr(workload, workload_end - workload);
+    const auto count_field = [&record](const std::string& field) {
+        std::size_t count = 0;
+        for (std::size_t pos = 0; (pos = record.find(" " + field + "=", pos)) != std::string::npos;
+             pos += field.size() + 2) {
+            ++count;
+        }
+        return count;
+    };
+    CHECK(count_field("result_detections") == 1);
+    CHECK(count_field("result_checksum") == 1);
+    CHECK(count_field("detections") == 1);
+    CHECK(count_field("checksum") == 0);
     CHECK(text.find("boundary points emitted: 2.000000x") != std::string::npos);
     CHECK(text.find("clusters after filters: 2.000000x") != std::string::npos);
     CHECK(text.find("points entering sort: 2.000000x") != std::string::npos);

@@ -8,7 +8,9 @@ BENCH=${APRILTAG_PROFILE_BENCH:-"$SCRIPT_DIR/k230_apriltag_bench"}
 STAGE_BENCH=${APRILTAG_PROFILE_STAGE_BENCH:-"$SCRIPT_DIR/k230_apriltag_profile_bench"}
 WORKLOAD=${APRILTAG_PROFILE_WORKLOAD:-"$SCRIPT_DIR/k230_apriltag_workload"}
 PERF=${APRILTAG_PROFILE_PERF:-perf}
+PROFILE_READLINK=${APRILTAG_PROFILE_READLINK:-readlink}
 FIXTURE=${APRILTAG_PROFILE_FIXTURE:-"$SCRIPT_DIR/fixture.jpg"}
+INPUT_SIZE=1280x720
 EVENT_CANDIDATES=${APRILTAG_PROFILE_EVENTS:-task-clock,cycles,instructions,branches,branch-misses,cache-references,cache-misses}
 REPEATS=${APRILTAG_PROFILE_REPEATS:-7}
 FREQUENCY=${APRILTAG_PROFILE_FREQUENCY:-199}
@@ -24,6 +26,12 @@ ABLATION_PERF_ITERATIONS=${APRILTAG_ABLATION_PERF_ITERATIONS:-$ABLATION_ITERATIO
 ABLATION_PERF_BATCHES=${APRILTAG_ABLATION_PERF_BATCHES:-$ABLATION_BATCHES}
 ACTIVE_FIFO=
 ACTIVE_TEE_PID=
+PARSER_INPUTS_TMP=
+PARSER_PATHS_TMP=
+PARSER_LABELS_TMP=
+PARSER_DIR_TMP=
+PARSER_PUBLICATION_ACTIVE=0
+CROSS_SUMMARY_TMP=
 
 cleanup()
 {
@@ -35,6 +43,15 @@ cleanup()
     if [ -n "$ACTIVE_FIFO" ]; then
         rm -f "$ACTIVE_FIFO"
         ACTIVE_FIFO=
+    fi
+    [ -z "$PARSER_INPUTS_TMP" ] || rm -f "$PARSER_INPUTS_TMP"
+    [ -z "$PARSER_PATHS_TMP" ] || rm -f "$PARSER_PATHS_TMP"
+    [ -z "$PARSER_LABELS_TMP" ] || rm -f "$PARSER_LABELS_TMP"
+    [ -z "$PARSER_DIR_TMP" ] || rm -rf "$PARSER_DIR_TMP"
+    [ -z "$CROSS_SUMMARY_TMP" ] || rm -f "$CROSS_SUMMARY_TMP"
+    if [ "$PARSER_PUBLICATION_ACTIVE" -eq 1 ]; then
+        rm -rf "$RESULT_DIR/inputs"
+        rm -f "$RESULT_DIR/inputs.tsv"
     fi
 }
 trap cleanup 0
@@ -83,17 +100,191 @@ valid_uint()
     fi
 }
 
+profile_inputs_error()
+{
+    printf 'error: APRILTAG_PROFILE_INPUTS %s\n' "$*" >&2
+    return 2
+}
+
+profile_inputs_publish_hook()
+{
+    [ -z "${APRILTAG_PROFILE_PUBLISH_HOOK:-}" ] || "$APRILTAG_PROFILE_PUBLISH_HOOK" "$1"
+}
+
+validate_multi_input_args()
+{
+    for arg in "$@"; do
+        case $arg in
+            --input|--input=*|--format|--format=*|--size|--size=*)
+                echo "error: multi-input mode does not accept user --input, --format, or --size options; specify each input in APRILTAG_PROFILE_INPUTS" >&2
+                return 2
+                ;;
+        esac
+    done
+}
+
+parse_profile_inputs()
+{
+    PARSER_INPUTS_TMP=$RESULT_DIR/.inputs.tsv.$$
+    PARSER_PATHS_TMP=$RESULT_DIR/.input-paths.tsv.$$
+    PARSER_LABELS_TMP=$RESULT_DIR/.input-labels.$$
+    PARSER_DIR_TMP=$RESULT_DIR/.inputs.$$
+    tab=$(printf '\t')
+    newline='
+'
+    : >"$PARSER_INPUTS_TMP"
+    : >"$PARSER_PATHS_TMP"
+    : >"$PARSER_LABELS_TMP"
+
+    [ -n "$APRILTAG_PROFILE_INPUTS" ] || profile_inputs_error 'empty matrix'
+    cr=$(printf '\r')
+    case $APRILTAG_PROFILE_INPUTS in
+        *"$cr"*) profile_inputs_error 'carriage return is not allowed';;
+    esac
+    command -v "$PROFILE_READLINK" >/dev/null 2>&1 || \
+        profile_inputs_error "readlink -f command is unavailable: $PROFILE_READLINK"
+
+    line_number=0
+    input_count=0
+    while IFS= read -r input_line || [ -n "$input_line" ]; do
+        line_number=$((line_number + 1))
+        case $input_line in *[!" $tab"]*) ;; *) continue;; esac
+        case $input_line in
+            *=*) label=${input_line%%=*}; input_spec=${input_line#*=};;
+            *) profile_inputs_error "line $line_number is missing label=path,size fields";;
+        esac
+        [ -n "$label" ] || profile_inputs_error "line $line_number has an empty label"
+        case $label in
+            .|..) profile_inputs_error "line $line_number has invalid label '$label'";;
+            *[!A-Za-z0-9._-]*) profile_inputs_error "line $line_number has bad label '$label'";;
+        esac
+        if awk -F '\t' -v label="$label" '$1 == label { found=1 } END { exit !found }' \
+            "$PARSER_INPUTS_TMP"; then
+            profile_inputs_error "line $line_number has duplicate label '$label'"
+        fi
+        case $input_spec in
+            *,*) input_path=${input_spec%,*}; input_size=${input_spec##*,};;
+            *) profile_inputs_error "line $line_number is missing path,size fields";;
+        esac
+        case $input_path in
+            '') profile_inputs_error "line $line_number has missing path";;
+            *,*) profile_inputs_error "line $line_number has comma in path";;
+            *"$tab"*) profile_inputs_error "line $line_number has tab in path";;
+            *\\*) profile_inputs_error "line $line_number has backslash in path";;
+        esac
+        [ -n "$input_size" ] || profile_inputs_error "line $line_number has missing size"
+        case $input_size in
+            native) input_width=; input_height=;;
+            *x*) input_width=${input_size%x*}; input_height=${input_size##*x};;
+            *) profile_inputs_error "line $line_number has invalid WxH '$input_size'";;
+        esac
+        if [ "$input_size" != native ]; then
+            case $input_width in ''|*[!0-9]*) profile_inputs_error "line $line_number has invalid WxH '$input_size'";; esac
+            case $input_height in ''|*[!0-9]*) profile_inputs_error "line $line_number has invalid WxH '$input_size'";; esac
+            [ "$input_width" -gt 0 ] 2>/dev/null || profile_inputs_error "line $line_number has invalid WxH '$input_size'"
+            [ "$input_height" -gt 0 ] 2>/dev/null || profile_inputs_error "line $line_number has invalid WxH '$input_size'"
+        fi
+        [ -f "$input_path" ] || profile_inputs_error "line $line_number path does not exist: $input_path"
+
+        canonical_sentinel=.apriltag-profile-readlink-sentinel
+        if canonical_with_sentinel=$("$PROFILE_READLINK" -f -- "$input_path" 2>/dev/null && \
+            printf '%s' "$canonical_sentinel"); then
+            :
+        else
+            profile_inputs_error "line $line_number cannot canonicalize path with readlink -f: $input_path"
+        fi
+        case $canonical_with_sentinel in
+            *"$canonical_sentinel") canonical_output=${canonical_with_sentinel%"$canonical_sentinel"};;
+            *) profile_inputs_error "line $line_number readlink -f output is malformed: $input_path";;
+        esac
+        case $canonical_output in
+            *"$newline") canonical_path=${canonical_output%"$newline"};;
+            *) profile_inputs_error "line $line_number readlink -f output lacks newline terminator: $input_path";;
+        esac
+        [ -n "$canonical_path" ] || \
+            profile_inputs_error "line $line_number readlink -f returned an empty path: $input_path"
+        case $canonical_path in
+            *,*) profile_inputs_error "line $line_number canonical path contains comma: $canonical_path";;
+            *"$tab"*) profile_inputs_error "line $line_number canonical path contains tab";;
+            *"$cr"*) profile_inputs_error "line $line_number canonical path contains carriage return";;
+            *"$newline"*) profile_inputs_error "line $line_number canonical path contains newline";;
+            *\\*) profile_inputs_error "line $line_number canonical path contains backslash";;
+        esac
+        if awk -F '\t' -v path="$canonical_path" '$1 == path { found=1 } END { exit !found }' \
+            "$PARSER_PATHS_TMP"; then
+            profile_inputs_error "line $line_number has duplicate canonical path: $input_path"
+        fi
+        printf '%s\t%s\n' "$canonical_path" "$label" >>"$PARSER_PATHS_TMP"
+        input_hash=$(hash_file "$canonical_path") || \
+            profile_inputs_error "line $line_number cannot hash path: $input_path"
+        if [ "$input_size" = native ]; then
+            printf '%s\t%s\tnative\t%s\n' "$label" "$canonical_path" "$input_hash" >>"$PARSER_INPUTS_TMP"
+        else
+            printf '%s\t%s\t%s\t%s\t%s\n' "$label" "$canonical_path" "$input_width" "$input_height" "$input_hash" >>"$PARSER_INPUTS_TMP"
+        fi
+        printf '%s\n' "$label" >>"$PARSER_LABELS_TMP"
+        input_count=$((input_count + 1))
+    done <<EOF
+$APRILTAG_PROFILE_INPUTS
+EOF
+    [ "$input_count" -gt 0 ] || profile_inputs_error 'empty matrix'
+
+    mkdir "$PARSER_DIR_TMP"
+    while IFS= read -r label; do
+        mkdir "$PARSER_DIR_TMP/$label"
+    done <"$PARSER_LABELS_TMP"
+    rm -f "$PARSER_PATHS_TMP" "$PARSER_LABELS_TMP"
+    PARSER_PATHS_TMP=
+    PARSER_LABELS_TMP=
+
+    PARSER_PUBLICATION_ACTIVE=1
+    mv "$PARSER_DIR_TMP" "$RESULT_DIR/inputs"
+    PARSER_DIR_TMP=
+    profile_inputs_publish_hook after-inputs
+    mv "$PARSER_INPUTS_TMP" "$RESULT_DIR/inputs.tsv"
+    PARSER_INPUTS_TMP=
+    profile_inputs_publish_hook after-manifest
+    profile_inputs_publish_hook before-commit
+    PARSER_PUBLICATION_ACTIVE=0
+}
+
+split_hash_path()
+{
+    split_path=$1
+    HASH_DIR=${split_path%/*}
+    HASH_BASE=${split_path##*/}
+    if [ "$HASH_DIR" = "$split_path" ]; then
+        HASH_DIR=.
+    elif [ -z "$HASH_DIR" ]; then
+        HASH_DIR=/
+    fi
+}
+
+hash_file()
+{
+    split_hash_path "$1"
+    hash_output=$(CDPATH= cd -- "$HASH_DIR" && sha256sum -- "./$HASH_BASE") || return 1
+    printf '%s\n' "${hash_output%% *}"
+}
+
 bench_defaults()
 {
     # This helper is used only for displaying the effective prefix.
-    printf '%s --input %s --size 1280x720 --warmup %s --iterations %s --batches %s' \
-        "$BENCH" "$FIXTURE" "$WARMUP" "$ITERATIONS" "$BATCHES"
+    printf '%s --input %s --size %s --warmup %s --iterations %s --batches %s' \
+        "$BENCH" "$FIXTURE" "$INPUT_SIZE" "$WARMUP" "$ITERATIONS" "$BATCHES"
 }
 
 capture_environment()
 {
     {
         echo "AprilTag detector profile environment"
+        if [ -n "${CURRENT_INPUT_LABEL:-}" ]; then
+            echo "Input label: $CURRENT_INPUT_LABEL"
+            echo "Canonical path: $CURRENT_INPUT_PATH"
+            echo "File SHA-256: $CURRENT_INPUT_FILE_HASH"
+            echo "Requested size: $CURRENT_INPUT_SIZE"
+            echo "Native RESULT dimensions: $CURRENT_INPUT_WIDTH_IN_RESULT_PATH"
+        fi
         echo "mode=$MODE"
         echo "date=$(date 2>/dev/null || true)"
         echo "kernel=$(uname -a 2>/dev/null || true)"
@@ -135,7 +326,7 @@ probe_events()
         safe_event=$(printf '%s' "$event" | tr -c 'A-Za-z0-9_-' '_')
         probe="$RESULT_DIR/.probe-${safe_event}.stat"
         if "$PERF" stat -x ';' -e "$event" -o "$probe" -- \
-            "$BENCH" --input "$FIXTURE" --size 1280x720 "$@" \
+            "$BENCH" --input "$FIXTURE" --size "$INPUT_SIZE" "$@" \
             --warmup 0 --iterations 1 --batches 1 --backend rust-rvv --no-dump \
             >/dev/null 2>&1; then rc=0; else rc=$?; fi
         if [ "$rc" -eq 0 ] && ! grep -E -q '<not supported>|<not counted>' "$probe" 2>/dev/null; then
@@ -163,7 +354,7 @@ probe_sampling()
         probe="$RESULT_DIR/.probe-sample.data"
         rm -f "$probe"
         if "$PERF" record -q -e "$event" -F "$FREQUENCY" -o "$probe" -- \
-            "$BENCH" --input "$FIXTURE" --size 1280x720 "$@" \
+            "$BENCH" --input "$FIXTURE" --size "$INPUT_SIZE" "$@" \
             --warmup 0 --iterations 1 --batches 1 --backend rust-rvv --no-dump \
             >/dev/null 2>&1; then rc=0; else rc=$?; fi
         if [ "$rc" -eq 0 ] && [ -s "$probe" ]; then
@@ -184,15 +375,23 @@ probe_sampling()
 run_comparison()
 {
     run_logged "$RESULT_DIR/comparison.log" \
-        "$BENCH" --input "$FIXTURE" --size 1280x720 \
+        "$BENCH" --input "$FIXTURE" --size "$INPUT_SIZE" \
         --warmup "$WARMUP" --iterations "$ITERATIONS" --batches "$BATCHES" \
         "$@" --backend all --dump-dir "$RESULT_DIR/images"
+}
+
+run_ccl_profile()
+{
+    run_logged "$RESULT_DIR/ccl-profile.log" \
+        "$STAGE_BENCH" --input "$FIXTURE" --size "$INPUT_SIZE" \
+        --warmup "$WARMUP" --iterations "$ITERATIONS" --batches "$BATCHES" \
+        "$@" --backend rust-rvv --no-dump
 }
 
 run_workload()
 {
     run_logged "$RESULT_DIR/workload.log" \
-        "$WORKLOAD" --input "$FIXTURE" --size 1280x720 "$@" \
+        "$WORKLOAD" --input "$FIXTURE" --size "$INPUT_SIZE" "$@" \
         --backend all --warmup 0 --iterations 1 --batches 1 --no-dump
     awk '
     function field(name,    i,a) { for(i=1;i<=NF;i++){split($i,a,"=");if(a[1]==name)return a[2]} return "" }
@@ -205,7 +404,7 @@ run_workload()
       entering_errors[b]=field("points_entering_errors"); raw_peaks[b]=field("raw_peaks");
       clusters[b]=field("clusters_after_filters"); retained[b]=field("retained_peaks"); quad_attempts[b]=field("quad_fit_attempts");
       quads[b]=field("quads"); decode[b]=field("decode_attempts"); threshold[b]=field("threshold_checksum");
-      detections[b]=field("detections"); checksum[b]=field("checksum")
+      detections[b]=field("result_detections"); checksum[b]=field("result_checksum")
     }
     END {
       print "AprilTag workload ratio summary"
@@ -242,7 +441,7 @@ run_stat()
     # shellcheck disable=SC2086
     run_logged "$RESULT_DIR/$backend.log" "$PERF" stat -x ';' $repeat_args \
         -e "$STAT_EVENTS" -o "$RESULT_DIR/$backend.stat" -- \
-        "$BENCH" --input "$FIXTURE" --size 1280x720 \
+        "$BENCH" --input "$FIXTURE" --size "$INPUT_SIZE" \
         --warmup "$WARMUP" --iterations "$ITERATIONS" --batches "$BATCHES" \
         "$@" --backend "$backend" --no-dump
 }
@@ -254,7 +453,7 @@ record_flat()
     [ -n "$SAMPLE_EVENT" ] || return 0
     run_logged "$RESULT_DIR/$backend-record.log" "$PERF" record -q \
         -e "$SAMPLE_EVENT" -F "$FREQUENCY" -o "$RESULT_DIR/$backend.data" -- \
-        "$BENCH" --input "$FIXTURE" --size 1280x720 \
+        "$BENCH" --input "$FIXTURE" --size "$INPUT_SIZE" \
         --warmup "$WARMUP" --iterations "$ITERATIONS" --batches "$BATCHES" \
         "$@" --backend "$backend" --no-dump
     run_logged "$RESULT_DIR/$backend.report" "$PERF" report \
@@ -269,7 +468,7 @@ record_callgraph()
     data="$RESULT_DIR/$backend-callgraph.data"
     if run_logged "$RESULT_DIR/$backend-callgraph-record.log" "$PERF" record -q \
         -g --call-graph fp -e "$SAMPLE_EVENT" -F "$FREQUENCY" -o "$data" -- \
-        "$BENCH" --input "$FIXTURE" --size 1280x720 \
+        "$BENCH" --input "$FIXTURE" --size "$INPUT_SIZE" \
         --warmup "$WARMUP" --iterations "$ITERATIONS" --batches "$BATCHES" \
         "$@" --backend "$backend" --no-dump; then rc=0; else rc=$?; fi
     if [ "$rc" -eq 0 ]; then
@@ -359,6 +558,13 @@ write_summary()
         if (mismatch) print "WARNING: backend checksums differ; speed comparisons are not equivalent-output."
     }' "$RESULT_DIR/comparison.log" >"$RESULT_DIR/.summary-results"
     {
+        if [ -n "${CURRENT_INPUT_LABEL:-}" ]; then
+            echo "Input label: $CURRENT_INPUT_LABEL"
+            echo "Canonical path: $CURRENT_INPUT_PATH"
+            echo "File SHA-256: $CURRENT_INPUT_FILE_HASH"
+            echo "Requested size: $CURRENT_INPUT_SIZE"
+            echo "Native RESULT dimensions: $CURRENT_INPUT_WIDTH_IN_RESULT_PATH"
+        fi
         cat "$RESULT_DIR/.summary-results"
         echo
         cat "$RESULT_DIR/workload-summary.txt"
@@ -533,21 +739,21 @@ run_ablation_config()
     config_dir="$RESULT_DIR/ablations/$label"
     mkdir "$config_dir"
     run_logged "$config_dir/benchmark.log" \
-        "$BENCH" --input "$FIXTURE" --size 1280x720 \
+        "$BENCH" --input "$FIXTURE" --size "$INPUT_SIZE" \
         --warmup "$ABLATION_WARMUP" --iterations "$ABLATION_ITERATIONS" --batches "$ABLATION_BATCHES" \
         "$@" --backend rust-rvv --rvv-stages "$stages" --no-dump
     run_logged "$config_dir/workload.log" \
-        "$WORKLOAD" --input "$FIXTURE" --size 1280x720 "$@" \
+        "$WORKLOAD" --input "$FIXTURE" --size "$INPUT_SIZE" "$@" \
         --backend rust-rvv --rvv-stages "$stages" \
         --warmup 0 --iterations 1 --batches 1 --no-dump
     run_logged "$config_dir/profile.log" \
-        "$STAGE_BENCH" --input "$FIXTURE" --size 1280x720 \
+        "$STAGE_BENCH" --input "$FIXTURE" --size "$INPUT_SIZE" \
         --warmup "$ABLATION_WARMUP" --iterations "$ABLATION_ITERATIONS" --batches "$ABLATION_BATCHES" \
         "$@" --backend rust-rvv --rvv-stages "$stages" --no-dump
     if [ -n "$STAT_EVENTS" ]; then
         run_logged "$config_dir/perf.log" "$PERF" stat -x ';' \
             -e "$STAT_EVENTS" -o "$config_dir/perf.stat" -- \
-            "$BENCH" --input "$FIXTURE" --size 1280x720 \
+            "$BENCH" --input "$FIXTURE" --size "$INPUT_SIZE" \
             --warmup "$ABLATION_PERF_WARMUP" --iterations "$ABLATION_PERF_ITERATIONS" --batches "$ABLATION_PERF_BATCHES" \
             "$@" --backend rust-rvv --rvv-stages "$stages" --no-dump
     fi
@@ -585,11 +791,11 @@ write_ablation_summary()
         "$RESULT_DIR/ablations/all/benchmark.log")
     scalar_work=$(awk '
       function f(n,i,a){for(i=1;i<=NF;i++){split($i,a,"=");if(a[1]==n)return a[2]}}
-      /^WORKLOAD / {print f("detections"),f("checksum");exit}' \
+      /^WORKLOAD / {print f("result_detections"),f("result_checksum");exit}' \
         "$RESULT_DIR/ablations/scalar/workload.log")
     all_work=$(awk '
       function f(n,i,a){for(i=1;i<=NF;i++){split($i,a,"=");if(a[1]==n)return a[2]}}
-      /^WORKLOAD / {print f("detections"),f("checksum");exit}' \
+      /^WORKLOAD / {print f("result_detections"),f("result_checksum");exit}' \
         "$RESULT_DIR/ablations/all/workload.log")
     ablation_matrix | while IFS=: read -r label stages; do
         dir="$RESULT_DIR/ablations/$label"
@@ -599,7 +805,7 @@ write_ablation_summary()
             "$dir/benchmark.log")
         workload_fields=$(awk '
           function f(n, i,a){for(i=1;i<=NF;i++){split($i,a,"=");if(a[1]==n)return a[2]}return "n/a"}
-          /^WORKLOAD / {print f("detections"),f("checksum"),f("threshold_checksum"),f("stages"),f("rvv_mask"); exit}' "$dir/workload.log")
+          /^WORKLOAD / {print f("result_detections"),f("result_checksum"),f("threshold_checksum"),f("stages"),f("rvv_mask"); exit}' "$dir/workload.log")
         set -- $result_fields
         mean=$1; production_detections=$2; production_checksum=$3
         production_output="$production_detections $production_checksum"
@@ -717,11 +923,223 @@ run_ablations()
     write_ablation_summary
 }
 
+validate_input_records()
+{
+    label=$1 expected_width=$2 expected_height=$3
+    metadata=$(awk -v label="$label" -v ew="$expected_width" -v eh="$expected_height" '
+      function field_exact(n,kind,    i,a,v,hits){
+        for(i=1;i<=NF;i++){split($i,a,"=");if(a[1]==n){hits++;v=a[2]}}
+        if(hits!=1){fail(kind " field " n " must occur exactly once");return ""}
+        return v
+      }
+      function decimal_exact(n,kind,    v){v=field_exact(n,kind);if(v!~/^[0-9]+$/){fail(kind " field " n " is not an unsigned integer");return ""}return normalize_decimal(v)}
+      function mean_exact(n,kind,    v){v=field_exact(n,kind);if(v!~/^[0-9]+([.][0-9]+)?$/){fail(kind " field " n " is not numeric");return ""}return v}
+      function normalize_decimal(v){sub(/^0+/,"",v);return v==""?"0":v}
+      function add_decimal(a,b,    carry,out,i,j,x,y,t){
+        a=normalize_decimal(a);b=normalize_decimal(b);i=length(a);j=length(b)
+        while(i>0||j>0||carry){x=i>0?substr(a,i--,1)+0:0;y=j>0?substr(b,j--,1)+0:0;t=x+y+carry;out=(t%10) out;carry=int(t/10)}
+        return normalize_decimal(out)
+      }
+      function accept_input(kind,    h,w,x){
+        h=field_exact("input_hash",kind);w=decimal_exact("width",kind);x=decimal_exact("height",kind)
+        if(hash==""){hash=h;width=w;height=x}else if(h!=hash||w!=width||x!=height)fail(kind " input metadata differs")
+        if(ew!=""&&(w!=ew||x!=eh))fail(kind " dimensions differ from requested size")
+      }
+      function count(kind,key){seen[kind SUBSEP key]++;if(seen[kind SUBSEP key]>1)fail("duplicate " kind " record: " key)}
+      function profile_metadata(kind,    b,m,s){b=field_exact("backend",kind);m=field_exact("rvv_mask",kind);s=field_exact("stages",kind);if(b!="rust-rvv"||m!=prod_mask||s!=prod_stages)fail(kind " backend/mask/stages differ from production rust-rvv")}
+      function fail(s){print "error: input " label ": " s > "/dev/stderr"; bad=1}
+      FILENAME==ARGV[1]&&/^RESULT / {b=field_exact("backend","benchmark");count("benchmark",b);accept_input("benchmark");mean[b]=mean_exact("mean_ms","benchmark");det[b]=decimal_exact("detections","benchmark");sum[b]=field_exact("checksum","benchmark");if(b=="rust-rvv"){prod_mask=field_exact("rvv_mask","benchmark");prod_stages=field_exact("stages","benchmark")}next}
+      FILENAME==ARGV[2]&&/^WORKLOAD / {b=field_exact("backend","WORKLOAD");count("workload",b);accept_input("WORKLOAD");wd=decimal_exact("result_detections","WORKLOAD");ws=field_exact("result_checksum","WORKLOAD");if(wd!=det[b]||ws!=sum[b])fail("workload output differs from production " b);if(b=="rust-rvv"){field_exact("rvv_mask","WORKLOAD");field_exact("stages","WORKLOAD");work_pending=decimal_exact("pending_boundary_records","WORKLOAD");work_points=decimal_exact("boundary_points_emitted","WORKLOAD")}next}
+      FILENAME==ARGV[3]&&/^RESULT / {b=field_exact("backend","profile RESULT");count("profile-result",b);accept_input("profile RESULT");profile_metadata("profile RESULT");profile_mean=mean_exact("mean_ms","profile RESULT");pd=decimal_exact("detections","profile RESULT");ps=field_exact("checksum","profile RESULT");if(pd!=det["rust-rvv"]||ps!=sum["rust-rvv"])fail("profile output differs from production rust-rvv");next}
+      FILENAME==ARGV[3]&&/^STAGE / {s=field_exact("stage","STAGE");count("stage",s);profile_metadata("STAGE " s);stage_mean=mean_exact("mean_ns","STAGE " s);if(s=="group_emit")group=stage_mean;if(s=="root_materialize")root=stage_mean;next}
+      FILENAME==ARGV[3]&&/^CCL_WORK / {
+        b=field_exact("backend","CCL_WORK");count("ccl-work",b);profile_metadata("CCL_WORK")
+        runs=decimal_exact("runs","CCL_WORK");accepted=decimal_exact("accepted_grouping_records","CCL_WORK");keys=decimal_exact("distinct_keys","CCL_WORK")
+        pending=points="0"
+        for(i=0;i<4;i++){pending=add_decimal(pending,decimal_exact("pending_type_" i,"CCL_WORK"));points=add_decimal(points,decimal_exact("emitted_type_" i,"CCL_WORK"))}
+        if(pending!=work_pending)fail("CCL_WORK pending sum differs from WORKLOAD pending_boundary_records")
+        if(points!=work_points)fail("CCL_WORK emitted sum differs from WORKLOAD boundary_points_emitted")
+        next
+      }
+      FILENAME==ARGV[3]&&/^CCL_TIMER_HEALTH / {b=field_exact("backend","CCL_TIMER_HEALTH");count("timer-health",b);profile_metadata("CCL_TIMER_HEALTH");next}
+      END {
+        split("rust-rvv rust-scalar c-reference",required," ")
+        for(i=1;i<=3;i++){b=required[i];if(seen["benchmark" SUBSEP b]!=1)fail("missing benchmark RESULT for " b);if(seen["workload" SUBSEP b]!=1)fail("missing WORKLOAD for " b)}
+        if(seen["profile-result" SUBSEP "rust-rvv"]!=1)fail("missing profile RESULT")
+        if(group==""||root=="")fail("missing required group_emit/root_materialize STAGE")
+        if(seen["ccl-work" SUBSEP "rust-rvv"]!=1)fail("missing CCL_WORK")
+        if(seen["timer-health" SUBSEP "rust-rvv"]!=1)fail("missing CCL_TIMER_HEALTH")
+        if(!bad)printf "%s %s %s %s %s %s %s %s %s %s %s %s %s %s %s %s\n",hash,width,height,mean["rust-rvv"],mean["rust-scalar"],mean["c-reference"],det["rust-rvv"],sum["rust-rvv"],profile_mean,group,root,runs,pending,accepted,keys,points
+        exit bad
+      }' "$RESULT_DIR/comparison.log" "$RESULT_DIR/workload.log" "$RESULT_DIR/ccl-profile.log") || return 1
+    set -- $metadata
+    [ "$#" -eq 16 ] || { echo "error: input $label: malformed validated metadata" >&2; return 1; }
+    INPUT_HASH=$1; INPUT_WIDTH=$2; INPUT_HEIGHT=$3
+    RVV_MEAN=$4; SCALAR_MEAN=$5; C_MEAN=$6; INPUT_DETECTIONS=$7; INPUT_CHECKSUM=$8
+    PROFILE_MEAN=$9; shift 9
+    GROUP_EMIT_MEAN=$1; ROOT_MATERIALIZE_MEAN=$2; CCL_RUNS=$3; CCL_PENDING=$4
+    CCL_ACCEPTED=$5; CCL_KEYS=$6; CCL_POINTS=$7
+
+    rvv_call_fields=$(awk -v label="$label" '
+      function exact(n,    i,a,v,hits){for(i=1;i<=NF;i++){split($i,a,"=");if(a[1]==n){hits++;v=a[2]}}if(hits!=1)fail("RESULT field " n " must occur exactly once");return v}
+      function uint(n,    v){v=exact(n);if(v!~/^[0-9]+$/)fail("RESULT field " n " is not an unsigned integer");return v}
+      function fail(s){print "error: input " label ": rust-rvv perf stat " s > "/dev/stderr";bad=1}
+      /^RESULT /{backend=exact("backend");if(backend=="rust-rvv"){records++;measured=uint("calls");warmup=uint("warmup")}}
+      END{if(records!=1)fail("requires exactly one rust-rvv RESULT");if(!bad)print measured,warmup;exit bad}' \
+        "$RESULT_DIR/rust-rvv.log") || return 1
+    set -- $rvv_call_fields
+    [ "$#" -eq 2 ] || { echo "error: input $label: malformed rust-rvv RESULT call counts" >&2; return 1; }
+    rvv_total_calls=$(($1 + $2 + 1))
+    RVV_PER_CALL=$(awk -F';' -v label="$label" -v calls="$rvv_total_calls" '
+      function trim(s){gsub(/^[[:space:]]+|[[:space:]]+$/, "", s);return s}
+      function fail(s){print "error: input " label ": rust-rvv perf stat " s > "/dev/stderr";bad=1}
+      {
+        value=trim($1);event=trim($3)
+        if(event=="cycles"||event=="instructions"||event=="branches"||event=="branch-misses"){
+          seen[event]++
+          if(seen[event]>1)fail("duplicate counter " event)
+          if(value!~/^[0-9]+([.][0-9]+)?$/)fail("counter " event " is not numeric")
+          total[event]=value+0
+        }
+      }
+      END{
+        split("cycles instructions branches branch-misses",required," ")
+        for(i=1;i<=4;i++)if(seen[required[i]]!=1)fail("missing counter " required[i])
+        if(!bad)printf "%.6f %.6f %.6f %.6f\n",total["cycles"]/calls,total["instructions"]/calls,total["branches"]/calls,total["branch-misses"]/calls
+        exit bad
+      }' "$RESULT_DIR/rust-rvv.stat") || return 1
+    set -- $RVV_PER_CALL
+    [ "$#" -eq 4 ] || { echo "error: input $label: malformed rust-rvv perf counters" >&2; return 1; }
+    RVV_CYCLES_PER_CALL=$1; RVV_INSTRUCTIONS_PER_CALL=$2
+    RVV_BRANCHES_PER_CALL=$3; RVV_BRANCH_MISSES_PER_CALL=$4
+
+    for backend in rust-rvv rust-scalar c; do
+        case $backend in
+            rust-rvv) record_backend=rust-rvv; expected_detections=$INPUT_DETECTIONS; expected_checksum=$INPUT_CHECKSUM;;
+            rust-scalar) record_backend=rust-scalar; expected_detections=$(awk 'function f(n,i,a){for(i=1;i<=NF;i++){split($i,a,"=");if(a[1]==n)return a[2]}} /^RESULT /&&f("backend")=="rust-scalar"{print f("detections");exit}' "$RESULT_DIR/comparison.log"); expected_checksum=$(awk 'function f(n,i,a){for(i=1;i<=NF;i++){split($i,a,"=");if(a[1]==n)return a[2]}} /^RESULT /&&f("backend")=="rust-scalar"{print f("checksum");exit}' "$RESULT_DIR/comparison.log");;
+            c) record_backend=c-reference; expected_detections=$(awk 'function f(n,i,a){for(i=1;i<=NF;i++){split($i,a,"=");if(a[1]==n)return a[2]}} /^RESULT /&&f("backend")=="c-reference"{print f("detections");exit}' "$RESULT_DIR/comparison.log"); expected_checksum=$(awk 'function f(n,i,a){for(i=1;i<=NF;i++){split($i,a,"=");if(a[1]==n)return a[2]}} /^RESULT /&&f("backend")=="c-reference"{print f("checksum");exit}' "$RESULT_DIR/comparison.log");;
+        esac
+        validate_backend_result_log "$label" "$record_backend" "$expected_detections" \
+            "$expected_checksum" "$RESULT_DIR/$backend.log" "perf stat" || return 1
+        validate_backend_result_log "$label" "$record_backend" "$expected_detections" \
+            "$expected_checksum" "$RESULT_DIR/$backend-record.log" "flat sample" || return 1
+        if [ "$MODE" = full ] && [ -s "$RESULT_DIR/$backend-callgraph.data" ]; then
+            validate_backend_result_log "$label" "$record_backend" "$expected_detections" \
+                "$expected_checksum" "$RESULT_DIR/$backend-callgraph-record.log" "callgraph sample" || return 1
+        fi
+    done
+}
+
+validate_backend_result_log()
+{
+    label=$1 wanted=$2 detections=$3 checksum=$4 log_file=$5 log_kind=$6
+    awk -v label="$label" -v wanted="$wanted" -v hash="$INPUT_HASH" \
+        -v width="$INPUT_WIDTH" -v height="$INPUT_HEIGHT" -v detections="$detections" \
+        -v checksum="$checksum" -v kind="$log_kind" '
+          function exact(name,    i,a,v,hits){for(i=1;i<=NF;i++){split($i,a,"=");if(a[1]==name){hits++;v=a[2]}}if(hits!=1)bad=1;return v}
+          /^RESULT /{backend=exact("backend");if(backend==wanted){n++;if(exact("input_hash")!=hash||exact("width")!=width||exact("height")!=height||exact("detections")!=detections||exact("checksum")!=checksum)bad=1}}
+          END{if(n!=1||bad){print "error: input " label ": " kind " RESULT metadata/output mismatch for " wanted > "/dev/stderr";exit 1}}' \
+        "$log_file"
+}
+
+append_cross_input_record()
+{
+    label=$1 file_hash=$2
+    printf 'INPUT label=%s file_sha256=%s input_hash=%s width=%s height=%s rust_rvv_mean_ms=%s rust_scalar_mean_ms=%s c_reference_mean_ms=%s detections=%s checksum=%s instrumented_mean_ms=%s group_emit_mean_ns=%s root_materialize_mean_ns=%s runs=%s pending=%s accepted=%s keys=%s points=%s cycles_per_call=%s instructions_per_call=%s branches_per_call=%s branch_misses_per_call=%s\n' \
+        "$label" "$file_hash" "$INPUT_HASH" "$INPUT_WIDTH" "$INPUT_HEIGHT" "$RVV_MEAN" \
+        "$SCALAR_MEAN" "$C_MEAN" "$INPUT_DETECTIONS" "$INPUT_CHECKSUM" "$PROFILE_MEAN" \
+        "$GROUP_EMIT_MEAN" "$ROOT_MATERIALIZE_MEAN" "$CCL_RUNS" "$CCL_PENDING" \
+        "$CCL_ACCEPTED" "$CCL_KEYS" "$CCL_POINTS" "$RVV_CYCLES_PER_CALL" \
+        "$RVV_INSTRUCTIONS_PER_CALL" "$RVV_BRANCHES_PER_CALL" \
+        "$RVV_BRANCH_MISSES_PER_CALL" >>"$CROSS_SUMMARY_TMP"
+}
+
+run_profile_workflow()
+{
+    run_workload "$@"
+    run_profile_workflow_after_workload "$@"
+}
+
+run_profile_workflow_after_workload()
+{
+    capture_environment "$@"
+    live_demos=$(pidof apriltag_demo.elf apriltag_c_demo.elf 2>/dev/null || true)
+    [ -z "$live_demos" ] || warn "live AprilTag demos are running (PIDs: $live_demos); stop them for uncontended results"
+    if [ "${MULTI_INPUT:-0}" -eq 0 ] || [ "${MULTI_PROBED:-0}" -eq 0 ]; then
+        probe_events "$@"
+        probe_sampling "$@"
+        [ "${MULTI_INPUT:-0}" -eq 0 ] || MULTI_PROBED=1
+    else
+        echo "stat_events=$STAT_EVENTS" >>"$ENVIRONMENT"
+        echo "sample_event=$SAMPLE_EVENT" >>"$ENVIRONMENT"
+    fi
+    run_comparison "$@"
+    [ "${MULTI_INPUT:-0}" -eq 0 ] || run_ccl_profile "$@"
+    for backend in rust-rvv rust-scalar c; do
+        run_stat "$backend" "$@"
+        record_flat "$backend" "$@"
+        if [ "$MODE" = full ]; then record_callgraph "$backend" "$@"; fi
+    done
+    if [ "$MODE" = full ]; then
+        annotate_full rust-rvv
+        annotate_full c
+    fi
+    if [ "$ABLATIONS" -eq 1 ]; then run_ablations "$@"; fi
+    write_summary
+}
+
+run_input_profile()
+{
+    input_label=$1 input_path=$2 input_size=$3 expected_file_hash=$4 input_dir=$5
+    shift 5
+    FIXTURE=$input_path
+    INPUT_SIZE=$input_size
+    RESULT_DIR=$input_dir
+    ENVIRONMENT=$RESULT_DIR/environment.txt
+    CURRENT_INPUT_LABEL=$input_label
+    CURRENT_INPUT_PATH=$input_path
+    CURRENT_INPUT_FILE_HASH=$expected_file_hash
+    CURRENT_INPUT_SIZE=$input_size
+    CURRENT_INPUT_WIDTH_IN_RESULT_PATH=$(awk '
+      function f(n, i,a){for(i=1;i<=NF;i++){split($i,a,"=");if(a[1]==n)return a[2]}}
+      /^WORKLOAD /&&f("backend")=="rust-rvv"{print f("width") "x" f("height");exit}' \
+        "$RESULT_DIR/workload.log" 2>/dev/null || true)
+    if [ "${MULTI_PROBED:-0}" -eq 0 ]; then
+        STAT_EVENTS=
+        SAMPLE_EVENT=
+        TIMING_EVENTS=0
+    fi
+    echo "Writing input '$input_label' profile to $RESULT_DIR"
+    run_workload "$@"
+    CURRENT_INPUT_WIDTH_IN_RESULT_PATH=$(awk '
+      function f(n, i,a){for(i=1;i<=NF;i++){split($i,a,"=");if(a[1]==n)return a[2]}}
+      /^WORKLOAD /&&f("backend")=="rust-rvv"{print f("width") "x" f("height");exit}' \
+        "$RESULT_DIR/workload.log")
+    run_profile_workflow_after_workload "$@"
+    expected_width= expected_height=
+    if [ "$input_size" != native ]; then expected_width=${input_size%x*}; expected_height=${input_size#*x}; fi
+    validate_input_records "$input_label" "$expected_width" "$expected_height"
+    final_file_hash=$(hash_file "$input_path") || return 1
+    if [ "$final_file_hash" != "$expected_file_hash" ]; then
+        echo "error: input $input_label: input file changed during profiling" >&2
+        return 1
+    fi
+    append_cross_input_record "$input_label" "$expected_file_hash"
+    CURRENT_INPUT_LABEL=
+    CURRENT_INPUT_PATH=
+    CURRENT_INPUT_FILE_HASH=
+    CURRENT_INPUT_SIZE=
+    CURRENT_INPUT_WIDTH_IN_RESULT_PATH=
+}
+
 self_test_profile_detector()
 {
     test_root=${TMPDIR:-/tmp}/profile-detector-self-test.$$
     mkdir "$test_root" "$test_root/bin"
     trap 'rm -rf "$test_root"' 0 HUP INT TERM
+    split_hash_path /image.jpg
+    [ "$HASH_DIR" = / ]
+    [ "$HASH_BASE" = image.jpg ]
     fake_bench="$test_root/fake-bench"
     fake_workload="$test_root/fake-workload"
     fake_profile="$test_root/fake-profile"
@@ -734,6 +1152,7 @@ cat >"$fake_bench" <<'EOF'
 backend=all
 stages=default
 warmup=; iterations=; batches=
+input=; size=; dump_dir=
 for arg in "$@"; do
   prev=${current:-}; current=$arg
   [ "$prev" = --backend ] && backend=$arg
@@ -741,8 +1160,19 @@ for arg in "$@"; do
   [ "$prev" = --warmup ] && warmup=$arg
   [ "$prev" = --iterations ] && iterations=$arg
   [ "$prev" = --batches ] && batches=$arg
+  [ "$prev" = --input ] && input=$arg
+  [ "$prev" = --size ] && size=$arg
+  [ "$prev" = --dump-dir ] && dump_dir=$arg
 done
+[ -z "$dump_dir" ] || mkdir -p "$dump_dir"
+case $input in *second.y8) hash=222;width=640;height=360;detections=9;checksum=cc;; *) hash=111;width=1280;height=720;detections=7;checksum=aa;; esac
+[ "$size" != native ] || { width=640; height=360; }
 echo "bench backend=$backend stages=$stages warmup=$warmup iterations=$iterations batches=$batches" >>"${FAKE_COMMAND_TRACE:-/dev/null}"
+[ "${MUTATE_INPUT:-}" != "$input" ] || [ -e "${MUTATE_SENTINEL:-/dev/null}" ] || {
+  printf mutation >>"$input"
+  : >"$MUTATE_SENTINEL"
+}
+[ "${FAIL_INPUT:-}" != "$input" ] || exit 24
 [ "${FAIL_BENCH:-0}" -eq 0 ] || [ "$backend" != all ] || exit 23
 [ "$backend" = all ] && backends='rust-rvv rust-scalar c-reference' || { [ "$backend" = c ] && backends=c-reference || backends=$backend; }
 for b in $backends; do
@@ -753,27 +1183,45 @@ for b in $backends; do
         decimate,threshold,rle,lfps-tuned,gaussian) m=11.000;; *) m=12.000;;
       esac
       [ "${ZERO_PRODUCTION_MEAN:-0}" -eq 0 ] || [ "$stages" != decimate ] || m=0.000
-      case $stages in threshold) c=prod-mismatch;; *) c=aa;; esac;;
-    rust-scalar) m=20.000;c=aa;; *) m=15.000;c=bb;;
+      case $stages in threshold) c=prod-mismatch;; *) c=$checksum;; esac;;
+    rust-scalar) m=20.000;c=$checksum;; *) m=15.000;[ "$hash" = 222 ] && c=dd || c=bb;;
   esac
   result_stages=$stages
   result_mask=mock
   [ "${FAIL_METADATA:-}" != perf-mask ] || [ -z "${FAKE_UNDER_PERF:-}" ] || result_mask=wrong
+  if [ "${FAKE_PERF_CONTEXT:-}" = stat ] && [ "${MATRIX_FAILURE:-}" = perf-stat-output ] && [ "$b" = rust-rvv ]; then c=perf-wrong; fi
+  if [ "${FAKE_PERF_CONTEXT:-}" = flat ] && [ "${MATRIX_FAILURE:-}" = perf-flat-output ] && [ "$b" = rust-rvv ]; then c=flat-wrong; fi
+  if [ "${FAKE_PERF_CONTEXT:-}" = callgraph ] && [ "${MATRIX_FAILURE:-}" = perf-callgraph-output ] && [ "$b" = rust-rvv ]; then c=callgraph-wrong; fi
   calls=$((iterations * batches))
-  echo "RESULT backend=$b rvv_mask=$result_mask stages=$result_stages calls=$calls mean_ms=$m median_ms=$m detections=7 checksum=$c input_hash=123 build=fake warmup=$warmup iterations=$iterations batches=$batches"
+  result_extra=
+  [ "${MATRIX_FAILURE:-}" != duplicate-result-field ] || [ "$b" != rust-rvv ] || result_extra=' mean_ms=99'
+  [ "${MATRIX_FAILURE:-}" != malformed-result-mean ] || [ "$b" != rust-rvv ] || m=bad
+  [ "${MATRIX_FAILURE:-}" != malformed-result-dimension ] || [ "$b" != rust-rvv ] || width=bad
+  echo "RESULT backend=$b rvv_mask=$result_mask stages=$result_stages calls=$calls mean_ms=$m median_ms=$m detections=$detections checksum=$c input_hash=$hash width=$width height=$height build=fake warmup=$warmup iterations=$iterations batches=$batches$result_extra"
 done
 EOF
     cat >"$fake_profile" <<'EOF'
 #!/bin/sh
 stages=default
 warmup=; iterations=; batches=
+input=; size=
 for arg in "$@"; do
   prev=${current:-}; current=$arg
   [ "$prev" = --rvv-stages ] && stages=$arg
   [ "$prev" = --warmup ] && warmup=$arg
   [ "$prev" = --iterations ] && iterations=$arg
   [ "$prev" = --batches ] && batches=$arg
+  [ "$prev" = --input ] && input=$arg
+  [ "$prev" = --size ] && size=$arg
 done
+case $input in
+  *second.y8) hash=222;width=640;height=360;detections=9;checksum=cc;runs=52;accepted=62;keys=72
+    p0=9007199254740993;p1=0002;p2=3;p3=4;pending=09007199254741002
+    e0=9007199254740995;e1=5;e2=6;e3=7;points=9007199254741013;;
+  *) hash=111;width=1280;height=720;detections=7;checksum=aa;runs=42;accepted=60;keys=70
+    p0=10;p1=20;p2=30;p3=40;pending=100;e0=20;e1=30;e2=40;e3=110;points=200;;
+esac
+[ "$size" != native ] || { width=640; height=360; }
 echo "profile stages=$stages warmup=$warmup iterations=$iterations batches=$batches" >>"${FAKE_COMMAND_TRACE:-/dev/null}"
 [ "${FAIL_PROFILE_STAGE:-}" != "$stages" ] || exit 37
 case $stages in
@@ -785,15 +1233,33 @@ esac
 profile_stages=$stages
 profile_mask=mock
 [ "${FAIL_METADATA:-}" != profile-mask ] || profile_mask=wrong
-profile_checksum=aa
+profile_backend=rust-rvv
+[ "${MATRIX_FAILURE:-}" != profile-backend ] || profile_backend=rust-scalar
+[ "${MATRIX_FAILURE:-}" != profile-mask ] || profile_mask=wrong
+profile_checksum=$checksum
 [ "$stages" != threshold ] || profile_checksum=prod-mismatch
 instrumented_mean=$(awk -v mean="$mean" 'BEGIN {printf "%.3f",mean+2}')
-echo "RESULT backend=rust-rvv rvv_mask=$profile_mask stages=$profile_stages calls=100 mean_ms=$instrumented_mean median_ms=$instrumented_mean detections=7 checksum=$profile_checksum input_hash=123 build=fake-profile warmup=$warmup iterations=$iterations batches=$batches"
+echo "RESULT backend=$profile_backend rvv_mask=$profile_mask stages=$profile_stages calls=100 mean_ms=$instrumented_mean median_ms=$instrumented_mean detections=$detections checksum=$profile_checksum input_hash=$hash width=$width height=$height build=fake-profile warmup=$warmup iterations=$iterations batches=$batches"
 echo "STAGE backend=rust-rvv rvv_mask=$profile_mask stages=$profile_stages stage=total count=100 min_ns=1 median_ns=2 mean_ns=3 p95_ns=4 max_ns=5"
-echo "CCL_WORK backend=rust-rvv rvv_mask=$profile_mask stages=$profile_stages validity=0x1ff runs=42"
+stage_backend=rust-rvv
+[ "${MATRIX_FAILURE:-}" != stage-backend ] || stage_backend=rust-scalar
+stage_extra=
+[ "${MATRIX_FAILURE:-}" != duplicate-stage-field ] || stage_extra=' mean_ns=99'
+stage_mean=30
+[ "${MATRIX_FAILURE:-}" != malformed-stage-mean ] || stage_mean=bad
+[ "${MATRIX_FAILURE:-}" = stage-missing ] || echo "STAGE backend=$stage_backend rvv_mask=$profile_mask stages=$profile_stages stage=group_emit count=100 min_ns=10 median_ns=20 mean_ns=$stage_mean p95_ns=40 max_ns=50$stage_extra"
+echo "STAGE backend=rust-rvv rvv_mask=$profile_mask stages=$profile_stages stage=root_materialize count=100 min_ns=11 median_ns=21 mean_ns=31 p95_ns=41 max_ns=51"
+[ "${MATRIX_FAILURE:-}" != ccl-pending-mismatch ] || p3=41
+[ "${MATRIX_FAILURE:-}" != ccl-emitted-mismatch ] || e3=111
+ccl_extra=
+[ "${MATRIX_FAILURE:-}" != duplicate-ccl-field ] || ccl_extra=' runs=99'
+[ "${MATRIX_FAILURE:-}" != malformed-ccl-counter ] || runs=bad
+[ "${MATRIX_FAILURE:-}" = ccl-work-missing ] || echo "CCL_WORK backend=rust-rvv rvv_mask=$profile_mask stages=$profile_stages validity=0x1ff runs=$runs accepted_grouping_records=$accepted distinct_keys=$keys pending_type_0=$p0 pending_type_1=$p1 pending_type_2=$p2 pending_type_3=$p3 emitted_type_0=$e0 emitted_type_1=$e1 emitted_type_2=$e2 emitted_type_3=$e3$ccl_extra"
 health_warning=0
 [ "$stages" != gaussian ] || health_warning=1
-echo "CCL_TIMER_HEALTH backend=rust-rvv rvv_mask=$profile_mask stages=$profile_stages count=100 diagnostic_included=1 mean_unattributed_ratio_pct=5.000 max_unattributed_ratio_pct=12.000 warning=$health_warning"
+timer_extra=
+[ "${MATRIX_FAILURE:-}" != duplicate-timer-field ] || timer_extra=' backend=rust-rvv'
+[ "${MATRIX_FAILURE:-}" = timer-health-missing ] || echo "CCL_TIMER_HEALTH backend=rust-rvv rvv_mask=$profile_mask stages=$profile_stages count=100 diagnostic_included=1 mean_unattributed_ratio_pct=5.000 max_unattributed_ratio_pct=12.000 warning=$health_warning$timer_extra"
 [ "$health_warning" -eq 0 ] || echo 'WARNING: CCL timer unattributed ratio exceeds 10%'
 EOF
     cat >"$fake_workload" <<'EOF'
@@ -801,6 +1267,7 @@ EOF
 backend=all
 stages=default
 warmup=; iterations=; batches=
+input=; size=
 for arg in "$@"; do
   prev=${current:-}; current=$arg
   [ "$prev" = --backend ] && backend=$arg
@@ -808,19 +1275,30 @@ for arg in "$@"; do
   [ "$prev" = --warmup ] && warmup=$arg
   [ "$prev" = --iterations ] && iterations=$arg
   [ "$prev" = --batches ] && batches=$arg
+  [ "$prev" = --input ] && input=$arg
+  [ "$prev" = --size ] && size=$arg
 done
+case $input in *second.y8) hash=222;width=640;height=360;detections=9;checksum=cc;pending=9007199254741002;points=9007199254741013;; *) hash=111;width=1280;height=720;detections=7;checksum=aa;pending=100;points=200;; esac
+[ "$size" != native ] || { width=640; height=360; }
 echo "workload backend=$backend stages=$stages warmup=$warmup iterations=$iterations batches=$batches" >>"${FAKE_COMMAND_TRACE:-/dev/null}"
 echo workload >>"${FAKE_PERF_TRACE:-/dev/null}"
     rust_validity=0x7f
 [ "${INVALID_FITTING:-0}" -eq 0 ] || rust_validity=0x77
 [ "${INVALID_THRESHOLD:-0}" -eq 0 ] || rust_validity=0x7d
-workload_checksum=aa
+workload_checksum=$checksum
 workload_mask=mock
 [ "${FAIL_METADATA:-}" != workload-mask ] || workload_mask=wrong
 [ "$stages" != decimate,threshold,lfps-tuned,gaussian,gray-model ] || workload_checksum=work-mismatch
-echo "WORKLOAD backend=rust-rvv rvv_mask=$workload_mask stages=$stages schema=1 validity=$rust_validity boundary_points_emitted=200 clusters_after_filters=20 points_entering_sort=160 points_entering_lfps=140 points_entering_errors=130 compute_errors_points=120 raw_peaks=12 retained_peaks=10 quad_fit_attempts=4 quads=8 decode_attempts=5 uf_elements=90 line_fit_queries=40 line_fit_query_points=80 threshold_checksum=10 detections=2 checksum=$workload_checksum"
-echo 'WORKLOAD backend=rust-scalar schema=1 validity=0x7f boundary_points_emitted=200 clusters_after_filters=20 points_entering_sort=160 points_entering_lfps=140 points_entering_errors=130 compute_errors_points=120 raw_peaks=12 retained_peaks=10 quad_fit_attempts=4 quads=8 decode_attempts=5 uf_elements=90 line_fit_queries=40 line_fit_query_points=80 threshold_checksum=10 detections=2 checksum=aa'
-echo 'WORKLOAD backend=c-reference schema=1 validity=0x7f boundary_points_emitted=100 clusters_after_filters=10 points_entering_sort=80 points_entering_lfps=70 points_entering_errors=65 compute_errors_points=60 raw_peaks=6 retained_peaks=5 quad_fit_attempts=2 quads=4 decode_attempts=3 uf_elements=50 line_fit_queries=30 line_fit_query_points=60 threshold_checksum=20 detections=2 checksum=bb'
+[ "${MATRIX_FAILURE:-}" != workload-hash ] || hash=wrong
+[ "${MATRIX_FAILURE:-}" != workload-output ] || workload_checksum=wrong
+workload_extra=
+[ "${MATRIX_FAILURE:-}" != duplicate-workload-field ] || workload_extra=' result_checksum=again'
+[ "${MATRIX_FAILURE:-}" != malformed-workload-counter ] || pending=bad
+[ "${MATRIX_FAILURE:-}" = workload-missing ] || echo "WORKLOAD backend=rust-rvv rvv_mask=$workload_mask stages=$stages schema=1 validity=$rust_validity boundary_points_emitted=$points pending_boundary_records=$pending clusters_after_filters=20 points_entering_sort=160 points_entering_lfps=140 points_entering_errors=130 compute_errors_points=120 raw_peaks=12 retained_peaks=10 quad_fit_attempts=4 quads=8 decode_attempts=5 uf_elements=90 line_fit_queries=40 line_fit_query_points=80 threshold_checksum=10 result_detections=$detections result_checksum=$workload_checksum input_hash=$hash width=$width height=$height detections=$detections$workload_extra"
+[ "${MATRIX_FAILURE:-}" != workload-duplicate ] || echo "WORKLOAD backend=rust-rvv rvv_mask=$workload_mask stages=$stages schema=1 validity=$rust_validity result_detections=$detections result_checksum=$workload_checksum input_hash=$hash width=$width height=$height detections=$detections"
+echo "WORKLOAD backend=rust-scalar schema=1 validity=0x7f boundary_points_emitted=200 clusters_after_filters=20 points_entering_sort=160 points_entering_lfps=140 points_entering_errors=130 compute_errors_points=120 raw_peaks=12 retained_peaks=10 quad_fit_attempts=4 quads=8 decode_attempts=5 uf_elements=90 line_fit_queries=40 line_fit_query_points=80 threshold_checksum=10 result_detections=$detections result_checksum=$checksum input_hash=$hash width=$width height=$height detections=$detections"
+[ "$hash" = 222 ] && c_checksum=dd || c_checksum=bb
+echo "WORKLOAD backend=c-reference schema=1 validity=0x7f boundary_points_emitted=100 clusters_after_filters=10 points_entering_sort=80 points_entering_lfps=70 points_entering_errors=65 compute_errors_points=60 raw_peaks=6 retained_peaks=5 quad_fit_attempts=2 quads=4 decode_attempts=3 uf_elements=50 line_fit_queries=30 line_fit_query_points=60 threshold_checksum=20 result_detections=$detections result_checksum=$c_checksum input_hash=$hash width=$width height=$height detections=$detections"
 EOF
     cat >"$fake_perf" <<'EOF'
 #!/bin/sh
@@ -838,8 +1316,8 @@ while [ $# -gt 0 ]; do
   shift
 done
 case $cmd in
-  stat) echo perf-stat >>"${FAKE_PERF_TRACE:-/dev/null}"; [ "$delimiter" = ';' ] || exit 41; [ "$event" = branches ] && { echo '<not supported>' >"$out"; exit 1; }; FAKE_UNDER_PERF=1 "$@"; rc=$?; { echo '1000;;cycles;100.00;100.00'; echo '2000;;instructions;100.00;100.00'; echo '3.0;msec;task-clock;100.00;100.00'; echo '4;;cache/misses:u;100.00;100.00'; } >"$out"; exit $rc;;
- record) echo perf-record >>"${FAKE_PERF_TRACE:-/dev/null}"; [ "$event" = cycles:u ] && exit 1; [ "$callgraph" -eq 0 ] || [ "${FAIL_CALLGRAPH:-0}" -eq 0 ] || exit 29; "$@"; rc=$?; [ "$rc" -eq 0 ] && echo data >"$out"; exit $rc;;
+  stat) echo perf-stat >>"${FAKE_PERF_TRACE:-/dev/null}"; [ "$delimiter" = ';' ] || exit 41; case " $* " in *'matrix files'*) matrix_stat=1;; *) matrix_stat=0;; esac; [ "$event" != branches ] || [ "$matrix_stat" -eq 1 ] || { echo '<not supported>' >"$out"; exit 1; }; case " $* " in *second.y8*) scale=2;; *) scale=1;; esac; FAKE_UNDER_PERF=1 FAKE_PERF_CONTEXT=stat "$@"; rc=$?; { if [ "${MATRIX_FAILURE:-}" = perf-stat-malformed-counter ]; then echo 'bad;;cycles;100.00;100.00'; else echo "$((1000 * scale));;cycles;100.00;100.00"; fi; echo "$((2000 * scale));;instructions;100.00;100.00"; if [ "$matrix_stat" -eq 1 ]; then [ "${MATRIX_FAILURE:-}" = perf-stat-missing-counter ] || echo "$((300 * scale));;branches;100.00;100.00"; awk -v scale="$scale" 'BEGIN{printf "%.1f;;branch-misses;100.00;100.00\n",30.5*scale}'; [ "${MATRIX_FAILURE:-}" != perf-stat-duplicate-counter ] || echo '31;;branch-misses;100.00;100.00'; fi; echo '3.0;msec;task-clock;100.00;100.00'; echo '4;;cache/misses:u;100.00;100.00'; } >"$out"; exit $rc;;
+ record) echo perf-record >>"${FAKE_PERF_TRACE:-/dev/null}"; [ "$event" = cycles:u ] && exit 1; [ "$callgraph" -eq 0 ] || [ "${FAIL_CALLGRAPH:-0}" -eq 0 ] || exit 29; if [ "$callgraph" -eq 1 ]; then FAKE_PERF_CONTEXT=callgraph "$@"; else FAKE_PERF_CONTEXT=flat "$@"; fi; rc=$?; [ "$rc" -eq 0 ] && echo data >"$out"; exit $rc;;
  report)
    if [ "$callgraph" -ne 0 ]; then
       echo callgraph >>"${FAKE_PERF_TRACE:-/dev/null}"
@@ -871,6 +1349,319 @@ echo '00000000 T apriltag_detector_detect'
 EOF
     chmod +x "$fake_bench" "$fake_profile" "$fake_workload" "$fake_perf" "$fake_tee" "$fake_nm"
     touch "$test_root/fixture"
+    mkdir "$test_root/matrix files"
+    touch "$test_root/matrix files/first image.jpg" "$test_root/matrix files/second.y8" \
+        "$test_root/matrix files/-" "$test_root/matrix files/-leading.jpg"
+    matrix_root="$test_root/matrix-results"
+    whitespace_line=$(printf '\t  ')
+    matrix_inputs="
+$whitespace_line
+first=$test_root/matrix files/first image.jpg,1280x720
+second=$test_root/matrix files/second.y8,native
+$whitespace_line"
+    option_matrix_inputs="
+dash=$test_root/matrix files/-,native
+leading=$test_root/matrix files/-leading.jpg,native
+$whitespace_line"
+    PATH="$test_root/bin:$PATH" FAKE_PERF_TRACE="$test_root/perf-trace" \
+        APRILTAG_PROFILE_INPUTS="$matrix_inputs" \
+        APRILTAG_PROFILE_BENCH="$fake_bench" APRILTAG_PROFILE_STAGE_BENCH="$fake_profile" APRILTAG_PROFILE_WORKLOAD="$fake_workload" \
+        APRILTAG_PROFILE_PERF="$fake_perf" APRILTAG_PROFILE_FIXTURE="$test_root/fixture" \
+        APRILTAG_PROFILE_OUTPUT="$matrix_root" APRILTAG_PROFILE_EVENTS='task-clock,cycles' \
+            "$TEST_SHELL" "$0" fast >"$test_root/matrix-run.log" 2>&1 || {
+                cat "$test_root/matrix-run.log" >&2
+                return 1
+            }
+    matrix_output=$(ls -d "$matrix_root"/run-* 2>/dev/null)
+    tab=$(printf '\t')
+    first_canonical=$(readlink -f "$test_root/matrix files/first image.jpg")
+    second_canonical=$(readlink -f "$test_root/matrix files/second.y8")
+    grep -F -q "first${tab}$first_canonical${tab}1280${tab}720${tab}" \
+        "$matrix_output/inputs.tsv"
+    grep -F -q "second${tab}$second_canonical${tab}native${tab}" \
+        "$matrix_output/inputs.tsv"
+    probe_stats=$(grep -c '^perf-stat$' "$test_root/perf-trace")
+    probe_records=$(grep -c '^perf-record$' "$test_root/perf-trace")
+    [ "$probe_stats" -eq 8 ]
+    [ "$probe_records" -eq 8 ]
+    for label in first second; do
+        for artifact in environment.txt workload.log workload-summary.txt comparison.log images \
+            ccl-profile.log rust-rvv.stat rust-rvv.data rust-rvv.report rust-scalar.stat \
+            rust-scalar.data rust-scalar.report c.stat c.data c.report summary.txt; do
+            [ -e "$matrix_output/inputs/$label/$artifact" ]
+        done
+    done
+    [ -s "$matrix_output/cross-input-summary.txt" ] || { echo 'matrix cross summary missing' >&2; return 1; }
+    grep -q '^INPUT label=first file_sha256=.* input_hash=111 width=1280 height=720 ' "$matrix_output/cross-input-summary.txt"
+    grep -q '^INPUT label=second file_sha256=.* input_hash=222 width=640 height=360 ' "$matrix_output/cross-input-summary.txt"
+    grep -q 'label=first .*group_emit_mean_ns=30 .*root_materialize_mean_ns=31' "$matrix_output/cross-input-summary.txt"
+    grep -q 'label=second .*group_emit_mean_ns=30 .*root_materialize_mean_ns=31' "$matrix_output/cross-input-summary.txt"
+    grep -q 'label=first .*runs=42 pending=100 accepted=60 keys=70 points=200' "$matrix_output/cross-input-summary.txt"
+    grep -q 'label=second .*runs=52 pending=9007199254741002 accepted=62 keys=72 points=9007199254741013' "$matrix_output/cross-input-summary.txt"
+    grep -q 'label=first .*cycles_per_call=1.919386 .*instructions_per_call=3.838772 .*branches_per_call=0.575816 .*branch_misses_per_call=0.058541' "$matrix_output/cross-input-summary.txt"
+    grep -q 'label=second .*cycles_per_call=3.838772 .*instructions_per_call=7.677543 .*branches_per_call=1.151631 .*branch_misses_per_call=0.117083' "$matrix_output/cross-input-summary.txt"
+    grep -F -q 'Input label: first' "$matrix_output/inputs/first/summary.txt"
+    grep -F -q "Canonical path: $first_canonical" "$matrix_output/inputs/first/summary.txt"
+    grep -F -q 'Requested size: 1280x720' "$matrix_output/inputs/first/summary.txt"
+    grep -F -q 'Native RESULT dimensions: 1280x720' "$matrix_output/inputs/first/summary.txt"
+    grep -F -q 'Input label: second' "$matrix_output/inputs/second/environment.txt"
+    grep -F -q "Canonical path: $second_canonical" "$matrix_output/inputs/second/environment.txt"
+    grep -F -q 'Requested size: native' "$matrix_output/inputs/second/environment.txt"
+    grep -F -q 'Native RESULT dimensions: 640x360' "$matrix_output/inputs/second/environment.txt"
+    ! grep -F -q 'Input label: second' "$matrix_output/inputs/first/summary.txt"
+    ! grep -F -q 'Input label: first' "$matrix_output/inputs/second/environment.txt"
+    ! grep -q 'input_hash=222' "$matrix_output/inputs/first/summary.txt"
+    ! grep -q 'input_hash=111' "$matrix_output/inputs/second/summary.txt"
+    option_root="$test_root/option-name-results"
+    PATH="$test_root/bin:$PATH" APRILTAG_PROFILE_INPUTS="$option_matrix_inputs" \
+        APRILTAG_PROFILE_BENCH="$fake_bench" APRILTAG_PROFILE_STAGE_BENCH="$fake_profile" \
+        APRILTAG_PROFILE_WORKLOAD="$fake_workload" APRILTAG_PROFILE_PERF="$fake_perf" \
+        APRILTAG_PROFILE_FIXTURE="$test_root/fixture" APRILTAG_PROFILE_OUTPUT="$option_root" \
+        APRILTAG_PROFILE_EVENTS='task-clock,cycles' "$TEST_SHELL" "$0" fast >/dev/null 2>&1
+    option_output=$(ls -d "$option_root"/run-* 2>/dev/null)
+    [ -s "$option_output/cross-input-summary.txt" ]
+
+    mutation_root="$test_root/mutation-results"
+    set +e
+    MUTATE_INPUT="$second_canonical" MUTATE_SENTINEL="$test_root/mutated" \
+        PATH="$test_root/bin:$PATH" APRILTAG_PROFILE_INPUTS="$matrix_inputs" \
+        APRILTAG_PROFILE_BENCH="$fake_bench" APRILTAG_PROFILE_STAGE_BENCH="$fake_profile" \
+        APRILTAG_PROFILE_WORKLOAD="$fake_workload" APRILTAG_PROFILE_PERF="$fake_perf" \
+        APRILTAG_PROFILE_FIXTURE="$test_root/fixture" APRILTAG_PROFILE_OUTPUT="$mutation_root" \
+        APRILTAG_PROFILE_EVENTS='task-clock,cycles' "$TEST_SHELL" "$0" fast \
+        >"$test_root/mutation.log" 2>&1
+    rc=$?
+    set -e
+    [ "$rc" -ne 0 ]
+    grep -q 'input file changed during profiling' "$test_root/mutation.log"
+    mutation_output=$(ls -d "$mutation_root"/run-* 2>/dev/null)
+    [ ! -e "$mutation_output/cross-input-summary.txt" ]
+    assert_matrix_failure()
+    {
+        failure=$1
+        failure_root="$test_root/matrix-negative-$failure"
+        set +e
+        MATRIX_FAILURE="$failure" PATH="$test_root/bin:$PATH" APRILTAG_PROFILE_INPUTS="$matrix_inputs" \
+            APRILTAG_PROFILE_BENCH="$fake_bench" APRILTAG_PROFILE_STAGE_BENCH="$fake_profile" \
+            APRILTAG_PROFILE_WORKLOAD="$fake_workload" APRILTAG_PROFILE_PERF="$fake_perf" \
+            APRILTAG_PROFILE_FIXTURE="$test_root/fixture" APRILTAG_PROFILE_OUTPUT="$failure_root" \
+            APRILTAG_PROFILE_EVENTS='task-clock,cycles' "$TEST_SHELL" "$0" fast >/dev/null 2>&1
+        rc=$?
+        set -e
+        [ "$rc" -ne 0 ]
+        failure_output=$(ls -d "$failure_root"/run-* 2>/dev/null)
+        [ ! -e "$failure_output/cross-input-summary.txt" ]
+    }
+    for matrix_failure in workload-hash workload-output workload-missing workload-duplicate \
+        profile-backend profile-mask stage-backend stage-missing ccl-work-missing \
+        ccl-pending-mismatch ccl-emitted-mismatch duplicate-result-field \
+        duplicate-workload-field duplicate-stage-field duplicate-ccl-field \
+        duplicate-timer-field malformed-result-mean malformed-result-dimension \
+        malformed-workload-counter malformed-stage-mean malformed-ccl-counter \
+        timer-health-missing perf-stat-output perf-flat-output perf-stat-missing-counter \
+        perf-stat-duplicate-counter perf-stat-malformed-counter; do
+        assert_matrix_failure "$matrix_failure"
+    done
+    failure_root="$test_root/matrix-negative-perf-callgraph-output"
+    set +e
+    MATRIX_FAILURE=perf-callgraph-output PATH="$test_root/bin:$PATH" APRILTAG_PROFILE_INPUTS="$matrix_inputs" \
+        APRILTAG_PROFILE_BENCH="$fake_bench" APRILTAG_PROFILE_STAGE_BENCH="$fake_profile" \
+        APRILTAG_PROFILE_WORKLOAD="$fake_workload" APRILTAG_PROFILE_PERF="$fake_perf" \
+        APRILTAG_PROFILE_FIXTURE="$test_root/fixture" APRILTAG_PROFILE_OUTPUT="$failure_root" \
+        APRILTAG_PROFILE_EVENTS='task-clock,cycles' "$TEST_SHELL" "$0" full >/dev/null 2>&1
+    rc=$?
+    set -e
+    [ "$rc" -ne 0 ]
+    failure_output=$(ls -d "$failure_root"/run-* 2>/dev/null)
+    [ ! -e "$failure_output/cross-input-summary.txt" ]
+
+    for conflicting_args in '--input override.jpg' '--input=override.jpg' '--format raw' \
+        '--format=raw' '--size 1x1' '--size=1x1'; do
+        set +e
+        # Intentional splitting: these fixed test strings exercise both CLI forms.
+        # shellcheck disable=SC2086
+        PATH="$test_root/bin:$PATH" APRILTAG_PROFILE_INPUTS="$matrix_inputs" \
+            APRILTAG_PROFILE_BENCH="$fake_bench" APRILTAG_PROFILE_STAGE_BENCH="$fake_profile" \
+            APRILTAG_PROFILE_WORKLOAD="$fake_workload" APRILTAG_PROFILE_PERF="$fake_perf" \
+            APRILTAG_PROFILE_FIXTURE="$test_root/fixture" APRILTAG_PROFILE_OUTPUT="$test_root/conflict" \
+            APRILTAG_PROFILE_EVENTS='task-clock,cycles' "$TEST_SHELL" "$0" fast $conflicting_args \
+            >"$test_root/conflict.log" 2>&1
+        rc=$?
+        set -e
+        [ "$rc" -eq 2 ]
+        grep -q 'multi-input mode does not accept user --input, --format, or --size options' "$test_root/conflict.log"
+    done
+    fail_matrix_root="$test_root/matrix-failure"
+    set +e
+    FAIL_INPUT="$test_root/matrix files/second.y8" PATH="$test_root/bin:$PATH" \
+        APRILTAG_PROFILE_INPUTS="$matrix_inputs" APRILTAG_PROFILE_BENCH="$fake_bench" \
+        APRILTAG_PROFILE_STAGE_BENCH="$fake_profile" APRILTAG_PROFILE_WORKLOAD="$fake_workload" \
+        APRILTAG_PROFILE_PERF="$fake_perf" APRILTAG_PROFILE_FIXTURE="$test_root/fixture" \
+        APRILTAG_PROFILE_OUTPUT="$fail_matrix_root" APRILTAG_PROFILE_EVENTS='task-clock,cycles' \
+            "$TEST_SHELL" "$0" fast >/dev/null 2>&1
+    rc=$?
+    set -e
+    [ "$rc" -ne 0 ]
+    fail_matrix_output=$(ls -d "$fail_matrix_root"/run-* 2>/dev/null)
+    [ -s "$fail_matrix_output/inputs/first/summary.txt" ]
+    [ -d "$fail_matrix_output/inputs/second" ]
+    [ ! -e "$fail_matrix_output/cross-input-summary.txt" ]
+    [ -z "$(ls "$fail_matrix_output"/.cross-input-summary.txt.* 2>/dev/null || true)" ]
+
+    publish_hook="$test_root/publish-hook"
+    cat >"$publish_hook" <<'EOF'
+#!/bin/sh
+case ${PUBLISH_HOOK_MODE:-}:$1 in
+  fail-inputs:after-inputs|fail-manifest:after-manifest) exit 55;;
+  pause-inputs:after-inputs|pause-before-commit:before-commit)
+    : >"$PUBLISH_HOOK_READY"
+    kill -STOP "$PPID"
+    ;;
+esac
+EOF
+    chmod +x "$publish_hook"
+    for publish_failure in inputs manifest; do
+        failure_root="$test_root/publish-fail-$publish_failure"
+        set +e
+        PATH="$test_root/bin:$PATH" PUBLISH_HOOK_MODE="fail-$publish_failure" \
+            APRILTAG_PROFILE_PUBLISH_HOOK="$publish_hook" APRILTAG_PROFILE_INPUTS="$matrix_inputs" \
+            APRILTAG_PROFILE_BENCH="$fake_bench" APRILTAG_PROFILE_WORKLOAD="$fake_workload" \
+            APRILTAG_PROFILE_PERF="$fake_perf" APRILTAG_PROFILE_FIXTURE="$test_root/fixture" \
+            APRILTAG_PROFILE_OUTPUT="$failure_root" APRILTAG_PROFILE_EVENTS='task-clock,cycles' \
+                "$TEST_SHELL" "$0" fast >/dev/null 2>&1
+        rc=$?
+        set -e
+        [ "$rc" -eq 55 ]
+        failure_output=$(ls -d "$failure_root"/run-* 2>/dev/null)
+        [ ! -e "$failure_output/inputs" ]
+        [ ! -e "$failure_output/inputs.tsv" ]
+        [ -z "$(ls -d "$failure_output"/.inputs* "$failure_output"/.input-* 2>/dev/null || true)" ]
+    done
+
+    for pause_point in inputs before-commit; do
+        term_root="$test_root/publish-term-$pause_point"
+        term_ready="$test_root/publish-term-$pause_point.ready"
+        PATH="$test_root/bin:$PATH" PUBLISH_HOOK_MODE="pause-$pause_point" PUBLISH_HOOK_READY="$term_ready" \
+            APRILTAG_PROFILE_PUBLISH_HOOK="$publish_hook" APRILTAG_PROFILE_INPUTS="$matrix_inputs" \
+            APRILTAG_PROFILE_BENCH="$fake_bench" APRILTAG_PROFILE_WORKLOAD="$fake_workload" \
+            APRILTAG_PROFILE_PERF="$fake_perf" APRILTAG_PROFILE_FIXTURE="$test_root/fixture" \
+            APRILTAG_PROFILE_OUTPUT="$term_root" APRILTAG_PROFILE_EVENTS='task-clock,cycles' \
+                "$TEST_SHELL" "$0" fast >/dev/null 2>&1 &
+        term_pid=$!
+        term_wait=0
+        while [ ! -e "$term_ready" ] && [ "$term_wait" -lt 50 ]; do
+            sleep 1
+            term_wait=$((term_wait + 1))
+        done
+        [ -e "$term_ready" ]
+        kill -TERM "$term_pid"
+        kill -CONT "$term_pid" 2>/dev/null || true
+        set +e
+        wait "$term_pid"
+        rc=$?
+        set -e
+        [ "$rc" -eq 143 ]
+        term_output=$(ls -d "$term_root"/run-* 2>/dev/null)
+        [ ! -e "$term_output/inputs" ]
+        [ ! -e "$term_output/inputs.tsv" ]
+        [ -z "$(ls -d "$term_output"/.inputs* "$term_output"/.input-* 2>/dev/null || true)" ]
+    done
+
+    ln -s "$test_root/matrix files/first image.jpg" "$test_root/matrix files/first-link.jpg"
+    invalid_index=0
+    assert_invalid_input()
+    {
+        description=$1
+        value=$2
+        readlink_command=${3:-readlink}
+        invalid_index=$((invalid_index + 1))
+        invalid_log="$test_root/invalid-input-$invalid_index.log"
+        set +e
+        PATH="$test_root/bin:$PATH" APRILTAG_PROFILE_INPUTS="$value" \
+            APRILTAG_PROFILE_READLINK="$readlink_command" \
+            APRILTAG_PROFILE_BENCH="$fake_bench" APRILTAG_PROFILE_WORKLOAD="$fake_workload" \
+            APRILTAG_PROFILE_PERF="$fake_perf" APRILTAG_PROFILE_FIXTURE="$test_root/fixture" \
+            APRILTAG_PROFILE_OUTPUT="$test_root/invalid-input-$invalid_index" \
+            APRILTAG_PROFILE_EVENTS='task-clock,cycles' \
+                "$TEST_SHELL" "$0" fast >"$invalid_log" 2>&1
+        rc=$?
+        set -e
+        [ "$rc" -ne 0 ]
+        grep -F -q "APRILTAG_PROFILE_INPUTS" "$invalid_log"
+        grep -F -q "$description" "$invalid_log"
+        invalid_output=$(ls -d "$test_root/invalid-input-$invalid_index"/run-* 2>/dev/null)
+        [ ! -e "$invalid_output/inputs.tsv" ]
+        [ ! -e "$invalid_output/inputs" ]
+        [ -z "$(ls -d "$invalid_output"/.inputs* "$invalid_output"/.input-paths* 2>/dev/null || true)" ]
+    }
+    assert_invalid_input 'empty matrix' ''
+    assert_invalid_input 'empty matrix' "$(printf ' \t\n\t  ')"
+    assert_invalid_input 'empty label' \
+        "=$test_root/matrix files/first image.jpg,1x1"
+    assert_invalid_input 'bad label' \
+        "bad label=$test_root/matrix files/first image.jpg,1x1"
+    assert_invalid_input "invalid label '.'" \
+        ".=$test_root/matrix files/first image.jpg,1x1"
+    assert_invalid_input "invalid label '..'" \
+        "..=$test_root/matrix files/first image.jpg,1x1"
+    assert_invalid_input 'bad label' \
+        " leading=$test_root/matrix files/first image.jpg,1x1"
+    assert_invalid_input 'duplicate label' \
+        "same=$test_root/matrix files/first image.jpg,1x1
+same=$test_root/matrix files/second.y8,1x1"
+    assert_invalid_input 'missing path' 'missing=,1x1'
+    assert_invalid_input 'missing size' \
+        "missing=$test_root/matrix files/first image.jpg,"
+    assert_invalid_input 'invalid WxH' \
+        "badsize=$test_root/matrix files/first image.jpg,1X1"
+    assert_invalid_input 'invalid WxH' \
+        "zerosize=$test_root/matrix files/first image.jpg,00x1"
+    assert_invalid_input 'invalid WxH' \
+        "spacesize=$test_root/matrix files/first image.jpg,1x1 "
+    assert_invalid_input 'path does not exist' \
+        "absent=$test_root/matrix files/not-there.jpg,1x1"
+    assert_invalid_input 'path does not exist' \
+        "valid-first=$test_root/matrix files/first image.jpg,1x1
+late-invalid=$test_root/matrix files/not-there.jpg,1x1"
+    tab_path="$test_root/matrix files/tab$(printf '\t')name.jpg"
+    touch "$tab_path"
+    assert_invalid_input 'tab in path' "tab=$tab_path,1x1"
+    backslash_path="$test_root/matrix files/back\\slash.jpg"
+    touch "$backslash_path"
+    assert_invalid_input 'backslash in path' "backslash=$backslash_path,1x1"
+    assert_invalid_input 'duplicate canonical path' \
+        "original=$test_root/matrix files/first image.jpg,1x1
+alias=$test_root/matrix files/first-link.jpg,2x2"
+    assert_invalid_input 'comma in path' \
+        "comma=$test_root/matrix files/first,image.jpg,1x1"
+    assert_invalid_input 'carriage return' \
+        "cr=$test_root/matrix files/first image.jpg,1x1$(printf '\r')"
+    unsafe_target="$test_root/matrix files/canonical$(printf '\t')target.jpg"
+    touch "$unsafe_target"
+    ln -s "$unsafe_target" "$test_root/matrix files/unsafe-link.jpg"
+    assert_invalid_input 'canonical path contains tab' \
+        "unsafe=$test_root/matrix files/unsafe-link.jpg,1x1"
+    ln -s "$backslash_path" "$test_root/matrix files/backslash-link.jpg"
+    assert_invalid_input 'canonical path contains backslash' \
+        "unsafe-backslash=$test_root/matrix files/backslash-link.jpg,1x1"
+    newline_char='
+'
+    newline_target="$test_root/matrix files/canonical-newline$newline_char"
+    touch "$newline_target"
+    ln -s "$newline_target" "$test_root/matrix files/newline-link.jpg"
+    assert_invalid_input 'canonical path contains newline' \
+        "unsafe-newline=$test_root/matrix files/newline-link.jpg,1x1"
+    fake_readlink="$test_root/fake-readlink"
+    cat >"$fake_readlink" <<'EOF'
+#!/bin/sh
+printf '/unsafe/canonical\npath.jpg\n'
+EOF
+    chmod +x "$fake_readlink"
+    assert_invalid_input 'canonical path contains newline' \
+        "unsafe-newline=$test_root/matrix files/first image.jpg,1x1" "$fake_readlink"
+    assert_invalid_input 'readlink -f command is unavailable' \
+        "readlink=$test_root/matrix files/first image.jpg,1x1" \
+        missing-readlink
     for mode in fast full; do
         output_root="$test_root/$mode"
         : >"$test_root/perf-trace"
@@ -882,6 +1673,13 @@ EOF
             "$TEST_SHELL" "$0" "$mode" --size 7x9 >/dev/null 2>&1
         output=$(ls -d "$output_root"/run-* 2>/dev/null)
         grep -q 'sample_event=cpu-clock' "$output/environment.txt"
+        [ ! -e "$output/inputs" ]
+        [ ! -e "$output/inputs.tsv" ]
+        for existing_artifact in environment.txt workload.log workload-summary.txt \
+            comparison.log rust-rvv.stat rust-rvv.data rust-rvv.report \
+            rust-scalar.stat rust-scalar.data rust-scalar.report c.stat c.data c.report summary.txt; do
+            [ -e "$output/$existing_artifact" ]
+        done
         grep -q "event 'branches'.*omitted" "$output/environment.txt"
         grep -q 'RVV scalar gain: 2.00x' "$output/summary.txt"
         grep -q 'c-reference: mean 15.000 ms, median 15.000 ms, calls 2, detections 7, checksum bb' "$output/summary.txt"
@@ -892,7 +1690,7 @@ EOF
         grep -q 'whole-process counters include benchmark setup and teardown' "$output/summary.txt"
         grep -q 'c top sampled symbols' "$output/summary.txt"
         grep -q '20.00% (whole-process normalized sampled estimate 0.100 ms) apriltag_rvv::pipeline::ccl_and_boundary_extract' "$output/summary.txt"
-        grep -q 'Input hash: 123' "$output/summary.txt"
+        grep -q 'Input hash: 111' "$output/summary.txt"
         grep -q 'Build: fake' "$output/summary.txt"
         grep -q 'WARNING: backend checksums differ' "$output/summary.txt"
         grep -q 'Rust RVV/C emitted points: 2.000x' "$output/workload-summary.txt"
@@ -1126,7 +1924,6 @@ case "$ABLATIONS" in 0|1) ;; *) echo "APRILTAG_PROFILE_ABLATIONS must be 0 or 1"
 for command in "$PERF" awk tee; do command -v "$command" >/dev/null 2>&1 || { echo "required command not found: $command" >&2; exit 1; }; done
 [ -x "$BENCH" ] || { echo "benchmark executable not found: $BENCH" >&2; exit 1; }
 [ -x "$WORKLOAD" ] || { echo "workload executable not found: $WORKLOAD" >&2; exit 1; }
-[ "$ABLATIONS" -eq 0 ] || [ -x "$STAGE_BENCH" ] || { echo "profile benchmark executable not found: $STAGE_BENCH" >&2; exit 1; }
 [ -f "$FIXTURE" ] || { echo "default fixture not found: $FIXTURE" >&2; exit 1; }
 if [ -n "${APRILTAG_PROFILE_OUTPUT:-}" ]; then
     OUTPUT_ROOT=$APRILTAG_PROFILE_OUTPUT
@@ -1139,23 +1936,34 @@ mkdir -p "$OUTPUT_ROOT"
 STAMP=$(date +%Y%m%d-%H%M%S)
 RESULT_DIR="$OUTPUT_ROOT/$RUN_PREFIX-$STAMP-$$"
 mkdir "$RESULT_DIR"
+if [ "${APRILTAG_PROFILE_INPUTS+x}" = x ]; then
+    validate_multi_input_args "$@"
+    command -v sha256sum >/dev/null 2>&1 || { echo "required command not found: sha256sum" >&2; exit 1; }
+    parse_profile_inputs
+fi
+[ "$ABLATIONS" -eq 0 ] && [ "${APRILTAG_PROFILE_INPUTS+x}" != x ] || [ -x "$STAGE_BENCH" ] || { echo "profile benchmark executable not found: $STAGE_BENCH" >&2; exit 1; }
 ENVIRONMENT="$RESULT_DIR/environment.txt"
 echo "Writing profile to $RESULT_DIR"
-run_workload "$@"
-capture_environment "$@"
-live_demos=$(pidof apriltag_demo.elf apriltag_c_demo.elf 2>/dev/null || true)
-[ -z "$live_demos" ] || warn "live AprilTag demos are running (PIDs: $live_demos); stop them for uncontended results"
-probe_events "$@"
-probe_sampling "$@"
-run_comparison "$@"
-for backend in rust-rvv rust-scalar c; do
-    run_stat "$backend" "$@"
-    record_flat "$backend" "$@"
-    if [ "$MODE" = full ]; then record_callgraph "$backend" "$@"; fi
-done
-if [ "$MODE" = full ]; then
-    annotate_full rust-rvv
-    annotate_full c
+if [ "${APRILTAG_PROFILE_INPUTS+x}" = x ]; then
+    MULTI_INPUT=1
+    MULTI_PROBED=0
+    MATRIX_RESULT_DIR=$RESULT_DIR
+    CROSS_SUMMARY_TMP="$MATRIX_RESULT_DIR/.cross-input-summary.txt.$$"
+    : >"$CROSS_SUMMARY_TMP"
+    tab=$(printf '\t')
+    while IFS="$tab" read -r input_label input_path input_width input_height input_file_hash; do
+        if [ "$input_width" = native ]; then
+            input_size=native
+            input_file_hash=$input_height
+        else
+            input_size=${input_width}x${input_height}
+        fi
+        run_input_profile "$input_label" "$input_path" "$input_size" "$input_file_hash" \
+            "$MATRIX_RESULT_DIR/inputs/$input_label" "$@"
+    done <"$MATRIX_RESULT_DIR/inputs.tsv"
+    mv "$CROSS_SUMMARY_TMP" "$MATRIX_RESULT_DIR/cross-input-summary.txt"
+    CROSS_SUMMARY_TMP=
+else
+    MULTI_INPUT=0
+    run_profile_workflow "$@"
 fi
-if [ "$ABLATIONS" -eq 1 ]; then run_ablations "$@"; fi
-write_summary

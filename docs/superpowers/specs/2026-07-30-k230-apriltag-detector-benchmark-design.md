@@ -88,10 +88,13 @@ mandatory because dimensions cannot be inferred from packed bytes, and file
 size must equal `width * height` exactly.
 
 The installed default fixture is
-`apriltag-rvv/tests/data/33369213973_9d9bb4cc96_c.jpg`. The wrapper selects
-`--size 1280x720` by default to represent the primary robot workload, while
-users may select native resolution or another size. Direct resizing may alter
-the source aspect ratio, but it is deterministic and outside measurement.
+`apriltag-rvv/tests/data/33369213973_9d9bb4cc96_c.jpg`, whose native decoded
+size is 799x533. The wrapper selects `--size 1280x720` by default to represent
+the primary robot workload, while users may select native resolution or another
+size. Earlier 1280x720 profiles explicitly resized this fixture and therefore
+are not native-resolution comparisons; the 799x533 native baseline is valid.
+Direct resizing may alter the source aspect ratio, but it is deterministic and
+outside measurement.
 
 Users can replace the fixture with a captured packed grayscale frame at any
 supported resolution by supplying its dimensions. The benchmark prints input

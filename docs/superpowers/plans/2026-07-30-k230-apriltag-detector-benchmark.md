@@ -223,7 +223,10 @@ Return 0 on success, 2 for argument errors, and 1 for input/backend/runtime fail
 
 - [ ] **Step 6: Run unit and short smoke tests**
 
-Run `--warmup 1 --iterations 2 --batches 2` for native and 1280x720 JPEG sizes, plus a generated raw fixture.
+Run `--warmup 1 --iterations 2 --batches 2 --size native` for the fixture's
+actual 799x533 native size, then repeat at 1280x720 and with a generated raw
+fixture. Earlier 1280x720 profiles explicitly resized the JPEG and are not
+native-comparable; the 799x533 native baseline is valid.
 
 ## Task 7: CMake and Buildroot Packaging
 
