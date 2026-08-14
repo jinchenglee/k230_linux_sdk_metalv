@@ -29,6 +29,8 @@ define APRILTAG_DEMO_BUILD_RUST_LIB
 	exec 8>$(@D)/lib/.apriltag-rvv-package.lock; flock 8; \
 	if [ ! -f $(@D)/lib/libapriltag_rvv.a ] || \
 	   [ ! -f $(@D)/lib/apriltag_kernel_modes.h ] || \
+	   [ ! -f $(@D)/lib/apriltag_scratch.h ] || \
+	   [ ! -f $(@D)/lib/apriltag_buffer_telemetry.h ] || \
 	   [ ! -f $(@D)/lib/.apriltag_rvv.source-hash ] || \
 	   [ "$$(cat $(@D)/lib/.apriltag_rvv.source-hash 2>/dev/null)" != \
 	     "$(APRILTAG_DEMO_RVV_SOURCE_HASH)" ] || \
@@ -44,6 +46,8 @@ define APRILTAG_DEMO_BUILD_RUST_LIB
 	exec 8>$(@D)/lib/.apriltag-rvv-package.lock; flock 8; \
 	if [ ! -f $(@D)/lib/libapriltag_rvv_workload.a ] || \
 	   [ ! -f $(@D)/lib/apriltag_kernel_modes.h ] || \
+	   [ ! -f $(@D)/lib/apriltag_scratch.h ] || \
+	   [ ! -f $(@D)/lib/apriltag_buffer_telemetry.h ] || \
 	   [ ! -f $(@D)/lib/rust_apriltag_workload.h ] || \
 	   [ ! -f $(@D)/lib/.apriltag_rvv_workload.source-hash ] || \
 	   [ "$$(cat $(@D)/lib/.apriltag_rvv_workload.source-hash 2>/dev/null)" != \
@@ -61,6 +65,9 @@ define APRILTAG_DEMO_BUILD_RUST_LIB
 	if [ ! -f $(@D)/lib/libapriltag_rvv_profile.a ] || \
 	   [ ! -f $(@D)/lib/apriltag_kernel_modes.h ] || \
 	   [ ! -f $(@D)/lib/rust_apriltag_profile.h ] || \
+	   [ ! -f $(@D)/lib/apriltag_scratch.h ] || \
+	   [ ! -f $(@D)/lib/apriltag_buffer_telemetry.h ] || \
+	   [ ! -f $(@D)/lib/apriltag_pending_profile.h ] || \
 	   [ ! -f $(@D)/lib/.apriltag_rvv_profile.source-hash ] || \
 	   [ "$$(cat $(@D)/lib/.apriltag_rvv_profile.source-hash 2>/dev/null)" != \
 	     "$(APRILTAG_DEMO_RVV_PROFILE_SOURCE_HASH)" ] || \
@@ -75,6 +82,14 @@ define APRILTAG_DEMO_BUILD_RUST_LIB
 	fi
 endef
 APRILTAG_DEMO_PRE_CONFIGURE_HOOKS += APRILTAG_DEMO_BUILD_RUST_LIB
+
+define APRILTAG_DEMO_RUN_SEQUENCE_HOST_TESTS
+	CXX="$(HOSTCXX)" bash $(@D)/tests/run_sequence_host_tests.sh
+	CXX="$(HOSTCXX)" bash $(@D)/tests/run_demo_options_host_tests.sh
+	$(HOST_DIR)/bin/cmake -DPACKAGE_DIR=$(@D) \
+		-P $(@D)/tests/verify_sequence_host_tests.cmake
+endef
+APRILTAG_DEMO_POST_BUILD_HOOKS += APRILTAG_DEMO_RUN_SEQUENCE_HOST_TESTS
 
 define APRILTAG_DEMO_BUILD_DEB
 	mkdir -p $(@D)/deb/DEBIAN

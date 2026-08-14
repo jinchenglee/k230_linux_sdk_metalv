@@ -12,6 +12,7 @@
 #include "apriltag_kernel_modes.h"
 #ifdef APRILTAG_BENCH_PROFILE
 #include "rust_apriltag_profile.h"
+#include "apriltag_scratch.h"
 #endif
 
 namespace apriltag_bench {
@@ -21,6 +22,7 @@ constexpr int kMaxDetections = 4096;
 
 enum class BackendKind { RustRvv, CReference, RustScalar };
 enum class InputFormat { Auto, Raw, Jpeg };
+enum class ScratchMode { Reusable, Local };
 
 struct ImageSize {
     bool native = true;
@@ -117,15 +119,19 @@ public:
     virtual DetectionResult detect(const PreparedImage& image) = 0;
     virtual const std::vector<Detection>& detections() const = 0;
 #ifdef APRILTAG_BENCH_PROFILE
-    virtual bool consume_profile(apriltag_ccl_profile_t&) = 0;
+    virtual bool consume_profile(apriltag_ccl_profile_t&,
+                                 apriltag_ccl_scratch_v1_t&) = 0;
 #endif
 };
 
 BenchmarkConfig parse_args(int argc, const char* const argv[]);
+void parse_rvv_stages(const std::string& value, BenchmarkConfig& config);
 void validate_image(std::size_t width, std::size_t height,
                     std::size_t stride, std::size_t storage_size);
 PreparedImage load_raw(const std::string& path, ImageSize size);
 PreparedImage load_image(const BenchmarkConfig& config);
+PreparedImage load_encoded_image(const std::vector<std::uint8_t>& bytes,
+                                 ImageSize size);
 Statistics compute_stats(const std::vector<std::uint64_t>& samples_ns);
 std::uint64_t checksum_bytes(const void* data, std::size_t size);
 std::uint64_t checksum_detections(const Detection* detections,
@@ -148,9 +154,14 @@ const char* backend_name(BackendKind kind);
 std::size_t profile_timing_descriptor_count();
 std::size_t profile_counter_descriptor_count();
 void validate_profile_sequence(const std::vector<apriltag_ccl_profile_t>& profiles);
+void validate_sequence_profile_sequence(
+    const std::vector<apriltag_ccl_profile_t>& profiles,
+    ScratchMode mode = ScratchMode::Reusable);
+void validate_scratch_sequence(const std::vector<apriltag_ccl_scratch_v1_t>& snapshots);
 void print_profile_report(const BenchmarkConfig& config, BackendKind kind,
-                          const std::vector<apriltag_ccl_profile_t>& profiles,
-                          std::ostream& out);
+                           const std::vector<apriltag_ccl_profile_t>& profiles,
+                           const std::vector<apriltag_ccl_scratch_v1_t>& scratches,
+                           std::ostream& out);
 #endif
 void write_visual_dumps(const std::string& directory,
                         const PreparedImage& image,

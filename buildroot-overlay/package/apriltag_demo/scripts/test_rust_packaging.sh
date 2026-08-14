@@ -4,6 +4,14 @@ set -euo pipefail
 PKG_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WORKLOAD_HEADER="${APRILTAG_WORKLOAD_HEADER:-$PKG_DIR/lib/rust_apriltag_workload.h}"
 PROFILE_HEADER="${APRILTAG_PROFILE_HEADER:-$PKG_DIR/lib/rust_apriltag_profile.h}"
+SCRATCH_HEADER="${APRILTAG_SCRATCH_HEADER:-$PKG_DIR/lib/apriltag_scratch.h}"
+BUFFER_HEADER="${APRILTAG_BUFFER_HEADER:-$PKG_DIR/lib/apriltag_buffer_telemetry.h}"
+PENDING_HEADER="${APRILTAG_PENDING_HEADER:-$PKG_DIR/lib/apriltag_pending_profile.h}"
+
+if [ -e "$PKG_DIR/lib/apriltag_grouping.h" ]; then
+    echo "obsolete grouping header is packaged" >&2
+    exit 1
+fi
 
 validate_workload_header_size() (
     local tmp
@@ -42,6 +50,41 @@ EOF
 )
 
 validate_profile_header_size
+validate_pending_header_size() (
+    local tmp
+    tmp="$(mktemp -d)"
+    trap 'rm -rf "$tmp"' EXIT
+    cp "$PENDING_HEADER" "$tmp/apriltag_pending_profile.h"
+    cat >"$tmp/check_pending_size.c" <<'EOF'
+#include "apriltag_pending_profile.h"
+_Static_assert(sizeof(apriltag_ccl_pending_profile_v1_t) == 640,
+               "pending profile ABI must be exactly 640 bytes");
+EOF
+    "${CC:-cc}" -std=c11 -I"$tmp" -c "$tmp/check_pending_size.c" \
+        -o "$tmp/check_pending_size.o"
+)
+validate_pending_header_size
+validate_scratch_header_layout() (
+    local tmp
+    tmp="$(mktemp -d)"
+    trap 'rm -rf "$tmp"' EXIT
+    cp "$SCRATCH_HEADER" "$tmp/apriltag_scratch.h"
+    cp "$BUFFER_HEADER" "$tmp/apriltag_buffer_telemetry.h"
+    cat >"$tmp/check_scratch.cpp" <<'EOF'
+#include "apriltag_scratch.h"
+#include <cstddef>
+static_assert(sizeof(apriltag_buffer_telemetry_t) == 64);
+static_assert(sizeof(apriltag_ccl_scratch_v1_t) == 256);
+static_assert(offsetof(apriltag_ccl_scratch_v1_t, pending) == 16);
+static_assert(offsetof(apriltag_ccl_scratch_v1_t, diagonal_left) == 80);
+static_assert(offsetof(apriltag_ccl_scratch_v1_t, diagonal_right) == 144);
+static_assert(offsetof(apriltag_ccl_scratch_v1_t, reserved) == 208);
+static_assert(APRILTAG_CCL_SCRATCH_MODE_REUSABLE == UINT32_C(0));
+static_assert(APRILTAG_CCL_SCRATCH_MODE_LOCAL == UINT32_C(1));
+EOF
+    "${CXX:-c++}" -std=c++17 -I"$tmp" -c "$tmp/check_scratch.cpp" -o "$tmp/check.o"
+)
+validate_scratch_header_layout
 if [ "${APRILTAG_PACKAGING_HEADER_ONLY:-0}" = 1 ]; then
     exit 0
 fi
@@ -81,10 +124,30 @@ test "$(cat "$PKG_DIR/lib/.apriltag_rvv_profile.source-hash")" = "$profile_befor
 production_symbols="$(nm -g --defined-only "$PKG_DIR/lib/libapriltag_rvv.a")"
 workload_symbols="$(nm -g --defined-only "$PKG_DIR/lib/libapriltag_rvv_workload.a")"
 profile_symbols="$(nm -g --defined-only "$PKG_DIR/lib/libapriltag_rvv_profile.a")"
+has_exact_symbol() {
+    grep -Eq " [A-Za-z] $1$| $1$" <<<"$2"
+}
 grep -Eq ' apriltag_detect$' <<<"$production_symbols"
+grep -Eq ' apriltag_set_ccl_scratch_mode_v1$' <<<"$production_symbols"
 grep -Eq ' apriltag_get_workload_counters$' <<<"$workload_symbols"
+grep -Eq ' apriltag_set_ccl_scratch_mode_v1$' <<<"$workload_symbols"
 grep -Eq ' apriltag_get_ccl_profile_v1$' <<<"$profile_symbols"
+grep -Eq ' apriltag_get_ccl_scratch_v1$' <<<"$profile_symbols"
+has_exact_symbol apriltag_get_ccl_pending_profile_v1 "$profile_symbols"
+grep -Eq ' apriltag_set_ccl_scratch_mode_v1$' <<<"$profile_symbols"
+for symbols in "$production_symbols" "$workload_symbols" "$profile_symbols"; do
+    if grep -Eq ' apriltag_(get_ccl_grouping_profile_v1|set_ccl_grouping_mode_v1)$' <<<"$symbols"; then
+        exit 1
+    fi
+done
 if grep -Eq ' apriltag_get_ccl_profile_v1$' <<<"$production_symbols"; then
+    exit 1
+fi
+if grep -Eq ' apriltag_get_ccl_scratch_v1$' <<<"$production_symbols"; then
+    exit 1
+fi
+if has_exact_symbol apriltag_get_ccl_pending_profile_v1 \
+    "$production_symbols"$'\n'"$workload_symbols"; then
     exit 1
 fi
 if grep -Eq ' apriltag_get_workload_counters$' <<<"$profile_symbols"; then

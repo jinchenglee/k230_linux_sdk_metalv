@@ -61,6 +61,12 @@ cd /root/app/apriltag_c_demo
 Both applications start on CSI. Press `u` for the configured USB camera, `c`
 for CSI, `n` to cycle the identical luma denoise modes, and `q` to quit.
 
+The Rust application retains reusable detector-owned CCL scratch by default.
+Pass `--local-ccl-scratch` to allocate fresh CCL scratch for each detection as
+a production fallback. The startup configuration prints `ccl_scratch=local` or
+`ccl_scratch=reusable`. The official C application rejects this Rust-only
+option with exit status 2.
+
 Use `--upstream-defaults` with the C application to select the upstream
 behavior: minimum blob size 5, two corrected bits, edge refinement on, and
 decode sharpening 0.25. Use `--threads N` to measure the original detector's
@@ -175,7 +181,8 @@ Set `APRILTAG_PROFILE_ABLATIONS=1` to append a long-running 14-configuration
 Rust matrix: scalar, each of the six stages in isolation, all stages, and each
 stage disabled from all. Every label has its own directory under `ablations/`
 with authoritative production `benchmark.log`, Rust `workload.log`,
-instrumented `profile.log` (including `STAGE` and `CCL_WORK` records), and
+instrumented `profile.log` (including `STAGE`, `CCL_WORK`, and `CCL_SCRATCH`
+records), and
 probed `perf.stat`/`perf.log`. The matrix deliberately does not record a flat
 sample profile per mask. Fast and full retain their normal work unchanged;
 full mode does not repeat ablation stats because the matrix is already costly.
@@ -245,6 +252,76 @@ mode rejects user benchmark arguments `--input`, `--format`, and `--size`, in
 both separate-value and `--option=value` forms. Other benchmark arguments are
 applied independently to every input. Single-input mode continues to accept
 those options for compatibility.
+
+Each instrumented profile run emits exactly one `CCL_SCRATCH` record after its
+measured calls. It reports pending, diagonal-left, and diagonal-right lengths,
+capacities, high-water lengths, per-call and cumulative growths, byte totals,
+and target element sizes. Warmup should leave every measured `growths_call` at
+zero and the snapshots stable for a repeated input; cold and mixed-input growth
+belongs in a sequence-oriented tool. Missing, duplicate, malformed, growing,
+or ABI-incompatible records are fatal. Multi-input and ablation summaries keep
+capacity, high-water, cumulative-growth, and byte fields for all three buffers.
+
+### Mixed-input sequence benchmark
+
+`k230_apriltag_sequence_bench` uses one instrumented Rust detector handle across
+an ordered image manifest. `--scratch-mode reusable` (the compatibility default)
+retains detector-owned CCL vectors, while `--scratch-mode local` creates fresh
+vectors for every detector call. The same executable supports direct A/B runs;
+only the scratch-mode argument needs to differ. It makes no validation or warmup
+call before each row: repetition 0 is the first call after the image transition
+and is emitted as `phase=cold`; repetitions 1 through `--warm-repetitions` are
+`phase=warm`.
+Only the detector call is timed, so file I/O, hashing, and native decode are
+excluded. Every call emits exactly one `SEQUENCE`
+record with output identity, exact `scratch_mode=local|reusable`, latency,
+selected CCL stage times, profile/scratch ABI identity, the exact
+`manifest_sha256`, and every field for all three scratch
+buffers. A row's cold snapshot establishes its buffer baseline. Every warm call
+must report zero per-call growth and unchanged capacity, high-water, and
+cumulative-growth fields, length, element size, and byte totals. Those fields
+may increase on a later row's cold call where applicable, but capacity,
+high-water, and cumulative growth may never decrease and element sizes may not
+change across image transitions. In local mode, each buffer's cumulative growth
+equals that call's growth, and capacity, high-water, length, element size, and
+byte totals must remain stable across repeated calls for one row. These fields
+may vary or decrease at the next row. Local repeated calls must also report the
+same profile `pending_growths`; reusable mode permits that counter to differ
+between a growing cold call and stable warm calls. Profile workload counters and
+validity are validated across every repetition before any record is printed;
+timing validity is mandatory.
+
+Encoded images are decoded at native resolution and must match the manifest
+dimensions; the sequence tool never resizes them. All records for all rows are
+buffered until every profile check, repeated-physical-input output check, and
+final file/manifest revalidation succeeds. A failed run emits no `SEQUENCE`
+records. `index` is the zero-based global detector-call order. Record identity
+uses `latency_ns` and `input_sha256`.
+
+The manifest is strict TSV with five fields and no header:
+
+```text
+label<TAB>path<TAB>width<TAB>height<TAB>lowercase-file-sha256
+```
+
+Labels use only letters, digits, `.`, `_`, and `-`; paths may contain spaces.
+Inputs must be regular non-symlink files with unique labels. A physical input may
+repeat under distinct labels only with identical dimensions and SHA-256 metadata;
+this permits deliberate return and ascending/descending sequence transitions.
+The binary validates and hashes all inputs up front, then reads and rehashes an
+input immediately before decoding each logical manifest row. It rehashes every
+input and the manifest again before successful exit.
+
+```sh
+./k230_apriltag_sequence_bench --manifest sequences/selected.tsv \
+    --factor 2 --min-blob 25 --rvv-stages all --warm-repetitions 3 \
+    --scratch-mode reusable
+./k230_apriltag_sequence_bench --manifest sequences/selected.tsv \
+    --factor 2 --min-blob 25 --rvv-stages all --warm-repetitions 3 \
+    --scratch-mode local
+```
+
+`--warm-reps` remains a deprecated alias for `--warm-repetitions`.
 Perf event and sampling support are probed once with the first manifest input;
 the selected event sets are then recorded in and reused by every per-input
 environment. This avoids multiplying capability probes by the number of inputs.

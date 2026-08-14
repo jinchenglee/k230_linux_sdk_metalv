@@ -10,6 +10,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include "apriltag_kernel_modes.h"
+#include "apriltag_scratch.h"
 
 #ifdef __cplusplus
 extern "C" {

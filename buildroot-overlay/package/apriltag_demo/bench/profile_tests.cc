@@ -10,6 +10,16 @@ using namespace apriltag_bench;
 namespace {
 int failures;
 #define CHECK(x) do { if (!(x)) { std::cerr << __LINE__ << ": " #x "\n"; ++failures; } } while (0)
+std::size_t occurrences(const std::string& text, const std::string& needle);
+
+apriltag_ccl_scratch_v1_t valid_scratch()
+{
+    apriltag_ccl_scratch_v1_t scratch{};
+    scratch.version = APRILTAG_CCL_SCRATCH_VERSION;
+    scratch.struct_size = sizeof(scratch);
+    scratch.validity = APRILTAG_CCL_SCRATCH_VALID_ALL;
+    return scratch;
+}
 
 struct ProfileState { int detects = 0; int profiles = 0; int fail_profile = 0; };
 
@@ -37,7 +47,8 @@ public:
     void set_capture_detections(bool) override {}
     DetectionResult detect(const PreparedImage&) override { ++state_->detects; return {1, 7}; }
     const std::vector<Detection>& detections() const override { return detections_; }
-    bool consume_profile(apriltag_ccl_profile_t& profile) override
+    bool consume_profile(apriltag_ccl_profile_t& profile,
+                         apriltag_ccl_scratch_v1_t& scratch) override
     {
         ++state_->profiles;
         if (state_->profiles == state_->fail_profile)
@@ -51,6 +62,13 @@ public:
         profile.unattributed_ns = 90 * state_->profiles;
         profile.runs = 42;
         profile.overlap_comparisons[0] = 9;
+        std::memset(&scratch, 0, sizeof(scratch));
+        scratch.version = APRILTAG_CCL_SCRATCH_VERSION;
+        scratch.struct_size = sizeof(scratch);
+        scratch.validity = APRILTAG_CCL_SCRATCH_VALID_ALL;
+        scratch.pending = {12, 32, 20, 0, 3, 512, 320, 16};
+        scratch.diagonal_left = {4, 8, 6, 0, 2, 192, 144, 24};
+        scratch.diagonal_right = {5, 16, 7, 0, 4, 384, 168, 24};
         return true;
     }
 private:
@@ -92,6 +110,45 @@ void test_collection_and_format()
     CHECK(work.find(" stages=all") != std::string::npos);
     CHECK(work.find(" validity=0x1ff") != std::string::npos);
     CHECK(work.find(" overlap_comparisons_horizontal=9") != std::string::npos);
+    const std::string scratch = record_with(out.str(), "CCL_SCRATCH", "pending_len", "12");
+    CHECK(scratch.find(" version=1 struct_size=256 validity=0x1") != std::string::npos);
+    CHECK(occurrences(scratch, " version=") == 1);
+    CHECK(occurrences(scratch, " struct_size=") == 1);
+    CHECK(occurrences(scratch, " validity=") == 1);
+    CHECK(scratch.find(" pending_capacity=32 pending_high_water=20 pending_growths_call=0 pending_growths_total=3 pending_capacity_bytes=512 pending_high_water_bytes=320 pending_element_size=16") != std::string::npos);
+    CHECK(scratch.find(" diagonal_left_len=4 diagonal_left_capacity=8") != std::string::npos);
+    CHECK(scratch.find(" diagonal_right_len=5 diagonal_right_capacity=16") != std::string::npos);
+    CHECK(occurrences(out.str(), "CCL_SCRATCH backend=") == 1);
+}
+
+void test_scratch_schema_and_stability()
+{
+    apriltag_ccl_scratch_v1_t first{};
+    first.version = APRILTAG_CCL_SCRATCH_VERSION;
+    first.struct_size = sizeof(first);
+    first.validity = APRILTAG_CCL_SCRATCH_VALID_ALL;
+    first.pending = {1, 8, 4, 0, 2, 128, 64, 16};
+    first.diagonal_left = {2, 8, 3, 0, 1, 192, 72, 24};
+    first.diagonal_right = first.diagonal_left;
+    auto changed = first;
+    validate_scratch_sequence({first, changed});
+    changed.pending.capacity++;
+    bool threw = false;
+    try { validate_scratch_sequence({first, changed}); }
+    catch (const std::runtime_error&) { threw = true; }
+    CHECK(threw);
+    changed = first;
+    changed.pending.growths_call = 1;
+    threw = false;
+    try { validate_scratch_sequence({first, changed}); }
+    catch (const std::runtime_error&) { threw = true; }
+    CHECK(threw);
+    changed = first;
+    changed.version++;
+    threw = false;
+    try { validate_scratch_sequence({changed}); }
+    catch (const std::runtime_error&) { threw = true; }
+    CHECK(threw);
 }
 
 std::size_t occurrences(const std::string& text, const std::string& needle)
@@ -131,7 +188,8 @@ void test_exhaustive_profile_keys()
     profile.struct_size = sizeof(profile);
     profile.validity = APRILTAG_CCL_PROFILE_VALID_ALL;
     std::ostringstream out;
-    print_profile_report(BenchmarkConfig{}, BackendKind::RustRvv, {profile}, out);
+    print_profile_report(BenchmarkConfig{}, BackendKind::RustRvv, {profile},
+                         {valid_scratch()}, out);
     const std::string text = out.str();
     for (const char* stage : {"total", "rle", "repack_label", "uf_init",
              "horizontal", "vertical", "diagonal_left", "diagonal_right",
@@ -168,6 +226,10 @@ void test_exhaustive_profile_keys()
     CHECK(profile_counter_descriptor_count() == 77);
     for (const auto& key : keys) CHECK(occurrences(text, " " + key + "=") == 1);
     CHECK(occurrences(text, "CCL_WORK backend=rust-rvv") == 1);
+    const std::string scratch = record_with(text, "CCL_SCRATCH", "version", "1");
+    CHECK(occurrences(scratch, " version=") == 1);
+    CHECK(occurrences(scratch, " struct_size=") == 1);
+    CHECK(occurrences(scratch, " validity=") == 1);
 }
 
 void test_validity_aware_reporting()
@@ -181,7 +243,8 @@ void test_validity_aware_reporting()
     profile.runs = 7;
     profile.overlap_comparisons[0] = 123;
     std::ostringstream out;
-    print_profile_report(BenchmarkConfig{}, BackendKind::RustRvv, {profile}, out);
+    print_profile_report(BenchmarkConfig{}, BackendKind::RustRvv, {profile},
+                         {valid_scratch()}, out);
     const std::string text = out.str();
     const std::string unavailable = record_with(text, "STAGE", "available", "0");
     CHECK(unavailable.find(" backend=rust-rvv") != std::string::npos);
@@ -262,7 +325,7 @@ void test_timer_health_reports_healthy_ratios_and_diagnostic_inclusion()
     const auto second = timing_profile(200, 170, 20, 10);
     std::ostringstream out;
     print_profile_report(BenchmarkConfig{}, BackendKind::RustRvv,
-                         {first, second}, out);
+                         {first, second}, {valid_scratch(), valid_scratch()}, out);
     const std::string health = record_with(out.str(), "CCL_TIMER_HEALTH",
                                            "warning", "0");
     CHECK(health.find(" diagnostic_included=1") != std::string::npos);
@@ -274,7 +337,8 @@ void test_timer_health_warns_above_ten_percent()
 {
     const auto profile = timing_profile(100, 80, 0, 20);
     std::ostringstream out;
-    print_profile_report(BenchmarkConfig{}, BackendKind::RustRvv, {profile}, out);
+    print_profile_report(BenchmarkConfig{}, BackendKind::RustRvv, {profile},
+                         {valid_scratch()}, out);
     CHECK(record_with(out.str(), "CCL_TIMER_HEALTH", "warning", "1")
               .find(" max_unattributed_ratio_pct=20.000") != std::string::npos);
     CHECK(out.str().find("WARNING: CCL timer unattributed ratio exceeds 10%") !=
@@ -335,6 +399,24 @@ void test_counter_instability_rejected()
     CHECK(threw);
 }
 
+void test_generic_profile_validation_keeps_pending_growth_strict()
+{
+    apriltag_ccl_profile_t first{};
+    first.version = APRILTAG_CCL_PROFILE_VERSION;
+    first.struct_size = sizeof(first);
+    first.validity = APRILTAG_CCL_PROFILE_VALID_GROWTH;
+    first.pending_growths = 2;
+    auto second = first;
+    second.pending_growths = 0;
+    bool threw = false;
+    try { validate_profile_sequence({first, second}); }
+    catch (const std::runtime_error& error) {
+        threw = std::string(error.what()) ==
+                "CCL workload counter changed: pending_growths";
+    }
+    CHECK(threw);
+}
+
 void test_profile_configuration()
 {
     const char* defaults_argv[] = {"profile-bench"};
@@ -364,7 +446,9 @@ int main()
     test_fieldwise_stability_honors_validity();
     test_profile_help();
     test_counter_instability_rejected();
+    test_generic_profile_validation_keeps_pending_growth_strict();
     test_profile_configuration();
+    test_scratch_schema_and_stability();
     if (failures) return 1;
     std::cout << "all profile benchmark tests passed\n";
     return 0;

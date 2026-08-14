@@ -24,6 +24,13 @@ public:
             throw std::runtime_error(std::string(backend_name(kind_)) +
                                      " detector construction failed");
         }
+        if (apriltag_set_ccl_scratch_mode_v1(
+                static_cast<apriltag_t*>(handle_),
+                APRILTAG_CCL_SCRATCH_MODE_REUSABLE) != 0) {
+            apriltag_free(handle_);
+            handle_ = nullptr;
+            throw std::runtime_error("failed to configure CCL scratch mode");
+        }
         if (config.rvv_mask_explicit &&
             apriltag_set_kernel_mask_v1(handle_, config.rvv_mask) != 0) {
             apriltag_free(handle_);
@@ -70,11 +77,15 @@ public:
     }
 
 #ifdef APRILTAG_BENCH_PROFILE
-    bool consume_profile(apriltag_ccl_profile_t& profile) override
+    bool consume_profile(apriltag_ccl_profile_t& profile,
+                         apriltag_ccl_scratch_v1_t& scratch) override
     {
         const int result = apriltag_get_ccl_profile_v1(
             static_cast<apriltag_t*>(handle_), &profile, sizeof(profile));
         if (result != 1) throw std::runtime_error("CCL profile getter failed");
+        const int scratch_result = apriltag_get_ccl_scratch_v1(
+            static_cast<apriltag_t*>(handle_), &scratch, sizeof(scratch));
+        if (scratch_result != 1) throw std::runtime_error("CCL scratch getter failed");
         return true;
     }
 #endif

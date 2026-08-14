@@ -123,40 +123,19 @@ if ! command -v flock >/dev/null 2>&1; then
     echo "error: flock is required for package publication" >&2
     exit 1
 fi
-if [ "$MODE" = workload ]; then
-    ARCHIVE_TMP="$(mktemp "$PKG_DIR/lib/.${ARCHIVE}.XXXXXX")"
-    HEADER_TMP="$(mktemp "$PKG_DIR/lib/.rust_apriltag_workload.h.XXXXXX")"
-    STAMP_TMP="$(mktemp "$PKG_DIR/lib/.source-hash.XXXXXX")"
-    cp -f "$SRC_A" "$ARCHIVE_TMP"
-    cp -f "$APRILTAG_RVV_DIR/include/apriltag_workload.h" "$HEADER_TMP"
-    printf '%s\n' "$APRILTAG_WORKLOAD_SOURCE_HASH" >"$STAMP_TMP"
-    HEADER=rust_apriltag_workload.h
-    STAMP=.apriltag_rvv_workload.source-hash
-elif [ "$MODE" = profile ]; then
-    ARCHIVE_TMP="$(mktemp "$PKG_DIR/lib/.${ARCHIVE}.XXXXXX")"
-    HEADER_TMP="$(mktemp "$PKG_DIR/lib/.rust_apriltag_profile.h.XXXXXX")"
-    STAMP_TMP="$(mktemp "$PKG_DIR/lib/.source-hash.XXXXXX")"
-    cp -f "$SRC_A" "$ARCHIVE_TMP"
-    cp -f "$APRILTAG_RVV_DIR/include/apriltag_profile.h" "$HEADER_TMP"
-    printf '%s\n' "$APRILTAG_PROFILE_SOURCE_HASH" >"$STAMP_TMP"
-    HEADER=rust_apriltag_profile.h
-    STAMP=.apriltag_rvv_profile.source-hash
-else
-    ARCHIVE_TMP="$(mktemp "$PKG_DIR/lib/.${ARCHIVE}.XXXXXX")"
-    STAMP_TMP="$(mktemp "$PKG_DIR/lib/.source-hash.XXXXXX")"
-    cp -f "$SRC_A" "$ARCHIVE_TMP"
-    printf '%s\n' "$APRILTAG_SOURCE_HASH" >"$STAMP_TMP"
-    HEADER=
-    HEADER_TMP=
-    STAMP=.apriltag_rvv.source-hash
-fi
-
-chmod 0644 "$ARCHIVE_TMP" "$STAMP_TMP"
-[ -z "$HEADER_TMP" ] || chmod 0644 "$HEADER_TMP"
-KERNEL_HEADER_TMP="$(mktemp "$PKG_DIR/lib/.apriltag_kernel_modes.h.XXXXXX")"
-cp -f "$APRILTAG_RVV_DIR/include/apriltag_kernel_modes.h" "$KERNEL_HEADER_TMP"
-chmod 0644 "$KERNEL_HEADER_TMP"
-BACKUP_DIR="$(mktemp -d "$PKG_DIR/lib/.publish-backup.XXXXXX")"
+ARCHIVE_TMP=
+HEADER=
+HEADER_TMP=
+SCRATCH_HEADER=
+SCRATCH_HEADER_TMP=
+BUFFER_HEADER=
+BUFFER_HEADER_TMP=
+PENDING_HEADER=
+PENDING_HEADER_TMP=
+KERNEL_HEADER_TMP=
+STAMP=
+STAMP_TMP=
+BACKUP_DIR=
 PUBLISHING=0
 ROLLBACK_DONE=0
 rollback_publication() {
@@ -164,7 +143,7 @@ rollback_publication() {
     [ "$ROLLBACK_DONE" -eq 0 ] || return 0
     ROLLBACK_DONE=1
     [ "$PUBLISHING" -eq 1 ] || return 0
-    for destination in "$ARCHIVE" "$HEADER" apriltag_kernel_modes.h "$STAMP"; do
+    for destination in "$ARCHIVE" "$HEADER" "$SCRATCH_HEADER" "$BUFFER_HEADER" apriltag_kernel_modes.h "$PENDING_HEADER" "$STAMP"; do
         [ -n "$destination" ] || continue
         backup="$BACKUP_DIR/$destination"
         if [ -e "$backup" ]; then
@@ -174,34 +153,91 @@ rollback_publication() {
         fi
     done
 }
+cleanup_resources() {
+    rm -f "$ARCHIVE_TMP" "$HEADER_TMP" "$SCRATCH_HEADER_TMP" \
+        "$BUFFER_HEADER_TMP" "$PENDING_HEADER_TMP" "$KERNEL_HEADER_TMP" \
+        "$STAMP_TMP"
+    [ -z "$BACKUP_DIR" ] || rm -rf "$BACKUP_DIR"
+}
 cleanup_publication() {
     local status=$?
     rollback_publication
-    rm -f "$ARCHIVE_TMP" "$STAMP_TMP"
-    [ -z "$HEADER_TMP" ] || rm -f "$HEADER_TMP"
-    rm -f "$KERNEL_HEADER_TMP"
-    rm -rf "$BACKUP_DIR"
+    cleanup_resources
     return "$status"
 }
 signal_publication() {
     local status=$1
     trap - EXIT HUP INT TERM
     rollback_publication
-    rm -f "$ARCHIVE_TMP" "$STAMP_TMP"
-    [ -z "$HEADER_TMP" ] || rm -f "$HEADER_TMP"
-    rm -f "$KERNEL_HEADER_TMP"
-    rm -rf "$BACKUP_DIR"
+    cleanup_resources
     exit "$status"
 }
 trap cleanup_publication EXIT
 trap 'signal_publication 129' HUP
 trap 'signal_publication 130' INT
 trap 'signal_publication 143' TERM
+if [ "$MODE" = workload ]; then
+    ARCHIVE_TMP="$(mktemp "$PKG_DIR/lib/.${ARCHIVE}.XXXXXX")"
+    HEADER_TMP="$(mktemp "$PKG_DIR/lib/.rust_apriltag_workload.h.XXXXXX")"
+    STAMP_TMP="$(mktemp "$PKG_DIR/lib/.source-hash.XXXXXX")"
+    cp -f "$SRC_A" "$ARCHIVE_TMP"
+    cp -f "$APRILTAG_RVV_DIR/include/apriltag_workload.h" "$HEADER_TMP"
+    SCRATCH_HEADER_TMP="$(mktemp "$PKG_DIR/lib/.apriltag_scratch.h.XXXXXX")"
+    cp -f "$APRILTAG_RVV_DIR/include/apriltag_scratch.h" "$SCRATCH_HEADER_TMP"
+    printf '%s\n' "$APRILTAG_WORKLOAD_SOURCE_HASH" >"$STAMP_TMP"
+    HEADER=rust_apriltag_workload.h
+    SCRATCH_HEADER=apriltag_scratch.h
+    STAMP=.apriltag_rvv_workload.source-hash
+elif [ "$MODE" = profile ]; then
+    ARCHIVE_TMP="$(mktemp "$PKG_DIR/lib/.${ARCHIVE}.XXXXXX")"
+    HEADER_TMP="$(mktemp "$PKG_DIR/lib/.rust_apriltag_profile.h.XXXXXX")"
+    SCRATCH_HEADER_TMP="$(mktemp "$PKG_DIR/lib/.apriltag_scratch.h.XXXXXX")"
+    STAMP_TMP="$(mktemp "$PKG_DIR/lib/.source-hash.XXXXXX")"
+    cp -f "$SRC_A" "$ARCHIVE_TMP"
+    cp -f "$APRILTAG_RVV_DIR/include/apriltag_profile.h" "$HEADER_TMP"
+    cp -f "$APRILTAG_RVV_DIR/include/apriltag_scratch.h" "$SCRATCH_HEADER_TMP"
+    BUFFER_HEADER_TMP="$(mktemp "$PKG_DIR/lib/.apriltag_buffer_telemetry.h.XXXXXX")"
+    cp -f "$APRILTAG_RVV_DIR/include/apriltag_buffer_telemetry.h" "$BUFFER_HEADER_TMP"
+    PENDING_HEADER_TMP="$(mktemp "$PKG_DIR/lib/.apriltag_pending_profile.h.XXXXXX")"
+    cp -f "$APRILTAG_RVV_DIR/include/apriltag_pending_profile.h" "$PENDING_HEADER_TMP"
+    printf '%s\n' "$APRILTAG_PROFILE_SOURCE_HASH" >"$STAMP_TMP"
+    HEADER=rust_apriltag_profile.h
+    SCRATCH_HEADER=apriltag_scratch.h
+    BUFFER_HEADER=apriltag_buffer_telemetry.h
+    PENDING_HEADER=apriltag_pending_profile.h
+    STAMP=.apriltag_rvv_profile.source-hash
+else
+    ARCHIVE_TMP="$(mktemp "$PKG_DIR/lib/.${ARCHIVE}.XXXXXX")"
+    STAMP_TMP="$(mktemp "$PKG_DIR/lib/.source-hash.XXXXXX")"
+    cp -f "$SRC_A" "$ARCHIVE_TMP"
+    SCRATCH_HEADER_TMP="$(mktemp "$PKG_DIR/lib/.apriltag_scratch.h.XXXXXX")"
+    cp -f "$APRILTAG_RVV_DIR/include/apriltag_scratch.h" "$SCRATCH_HEADER_TMP"
+    printf '%s\n' "$APRILTAG_SOURCE_HASH" >"$STAMP_TMP"
+    HEADER=
+    HEADER_TMP=
+    SCRATCH_HEADER=apriltag_scratch.h
+    STAMP=.apriltag_rvv.source-hash
+fi
+BUFFER_HEADER=apriltag_buffer_telemetry.h
+if [ -z "${BUFFER_HEADER_TMP:-}" ]; then
+    BUFFER_HEADER_TMP="$(mktemp "$PKG_DIR/lib/.apriltag_buffer_telemetry.h.XXXXXX")"
+    cp -f "$APRILTAG_RVV_DIR/include/apriltag_buffer_telemetry.h" "$BUFFER_HEADER_TMP"
+fi
+
+chmod 0644 "$ARCHIVE_TMP" "$STAMP_TMP"
+[ -z "$HEADER_TMP" ] || chmod 0644 "$HEADER_TMP"
+[ -z "$SCRATCH_HEADER_TMP" ] || chmod 0644 "$SCRATCH_HEADER_TMP"
+[ -z "$BUFFER_HEADER_TMP" ] || chmod 0644 "$BUFFER_HEADER_TMP"
+[ -z "$PENDING_HEADER_TMP" ] || chmod 0644 "$PENDING_HEADER_TMP"
+KERNEL_HEADER_TMP="$(mktemp "$PKG_DIR/lib/.apriltag_kernel_modes.h.XXXXXX")"
+cp -f "$APRILTAG_RVV_DIR/include/apriltag_kernel_modes.h" "$KERNEL_HEADER_TMP"
+chmod 0644 "$KERNEL_HEADER_TMP"
+BACKUP_DIR="$(mktemp -d "$PKG_DIR/lib/.publish-backup.XXXXXX")"
 if [ "${APRILTAG_PACKAGE_LOCK_HELD:-0}" != 1 ]; then
     exec 9>"$PKG_DIR/lib/.apriltag-rvv-package.lock"
     flock 9
 fi
-for current in "$ARCHIVE" "$HEADER" apriltag_kernel_modes.h "$STAMP"; do
+for current in "$ARCHIVE" "$HEADER" "$SCRATCH_HEADER" "$BUFFER_HEADER" apriltag_kernel_modes.h "$PENDING_HEADER" "$STAMP"; do
     [ -n "$current" ] || continue
     [ ! -e "$PKG_DIR/lib/$current" ] || cp -p "$PKG_DIR/lib/$current" "$BACKUP_DIR/$current"
 done
@@ -218,8 +254,21 @@ mv -f "$ARCHIVE_TMP" "$PKG_DIR/lib/$ARCHIVE"
 if [ -n "$HEADER" ]; then
     mv -f "$HEADER_TMP" "$PKG_DIR/lib/$HEADER"
 fi
+[ "${APRILTAG_PACKAGE_TEST_FAIL_STEP:-}" != after_profile_header ] || false
+if [ -n "$SCRATCH_HEADER" ]; then
+    mv -f "$SCRATCH_HEADER_TMP" "$PKG_DIR/lib/$SCRATCH_HEADER"
+fi
+[ "${APRILTAG_PACKAGE_TEST_FAIL_STEP:-}" != after_scratch_header ] || false
+if [ -n "$BUFFER_HEADER" ]; then
+    mv -f "$BUFFER_HEADER_TMP" "$PKG_DIR/lib/$BUFFER_HEADER"
+fi
+[ "${APRILTAG_PACKAGE_TEST_FAIL_STEP:-}" != after_buffer_header ] || false
 mv -f "$KERNEL_HEADER_TMP" "$PKG_DIR/lib/apriltag_kernel_modes.h"
-[ "${APRILTAG_PACKAGE_TEST_FAIL_STEP:-}" != after_header ] || false
+[ "${APRILTAG_PACKAGE_TEST_FAIL_STEP:-}" != after_kernel_header ] || false
+if [ -n "$PENDING_HEADER" ]; then
+    mv -f "$PENDING_HEADER_TMP" "$PKG_DIR/lib/$PENDING_HEADER"
+fi
+[ "${APRILTAG_PACKAGE_TEST_FAIL_STEP:-}" != after_pending_header ] || false
 # The stamp is the commit marker and is always published last. Buildroot holds
 # this lock synchronously and accepts a set only after its stamp hash matches.
 mv -f "$STAMP_TMP" "$PKG_DIR/lib/$STAMP"

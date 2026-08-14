@@ -23,6 +23,7 @@
 #include "sensor_set.h"
 #include "apriltag.h"
 #include "apriltag_draw.h"
+#include "demo_options.h"
 #ifdef APRILTAG_C_BACKEND
 #include "apriltag_c_adapter.h"
 #endif
@@ -37,6 +38,7 @@ static double g_factor_value = 2.0;
 static int    g_mode         = 0;     // FFI: 0=scalar 1=rvv
 static uint32_t g_min_blob   = 25;
 static bool g_debug_enabled  = false;
+static bool g_local_ccl_scratch = false;
 static std::atomic<int> g_debug_stage(0);
 static std::atomic<int> g_input_source(0); // 0=CSI, 1=USB
 static std::atomic<int> g_denoise_mode(0);  // 0=off, 1=median3, 2=gaussian3
@@ -95,12 +97,14 @@ static void print_usage(const char* name)
 {
     cout << "Usage: " << name;
 #ifndef APRILTAG_C_BACKEND
-    cout << " [--rvv]";
+    cout << " [--rvv] [--local-ccl-scratch]";
 #endif
     cout << " [--factor 1|1.5|2] [--min-blob N]"
             " [--csi-size WxH] [--usb-video X] [--debug]" << endl;
 #ifndef APRILTAG_C_BACKEND
     cout << "  --rvv         use RVV kernels (default: scalar)" << endl;
+    cout << "  --local-ccl-scratch  allocate CCL scratch per detection"
+            " (default: reusable)" << endl;
 #else
     cout << "  --threads N   C detector worker threads (default: 1)" << endl;
     cout << "  --bits-corrected N  accepted bit errors, 0..2 (default: 0)"
@@ -215,9 +219,17 @@ static void detect_proc(int video_device)
                 static_cast<double>(tpf.denominator) / tpf.numerator);
     }
 
-    void* det = apriltag_new(g_min_blob);
+    void* det = nullptr;
+#ifdef APRILTAG_C_BACKEND
+    det = apriltag_new(g_min_blob);
+#else
+    det = create_configured_detector(g_min_blob, g_local_ccl_scratch,
+                                     apriltag_new,
+                                     apriltag_set_ccl_scratch_mode_v1,
+                                     apriltag_free);
+#endif
     if (!det) {
-        cerr << "detect: apriltag_new failed" << endl;
+        cerr << "detect: cannot create/configure detector" << endl;
         v4l2_drm_stop(&context);
         return;
     }
@@ -636,7 +648,21 @@ static void parse_args(int argc, char* argv[])
 {
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
-        if (a == "--rvv") {
+        std::string scratch_error;
+        const int scratch_option = parse_ccl_scratch_option(
+            a,
+#ifdef APRILTAG_C_BACKEND
+            true,
+#else
+            false,
+#endif
+            g_local_ccl_scratch, scratch_error);
+        if (scratch_option < 0) {
+            cerr << scratch_error << endl;
+            exit(2);
+        } else if (scratch_option > 0) {
+            continue;
+        } else if (a == "--rvv") {
 #ifdef APRILTAG_C_BACKEND
             cerr << "--rvv is only valid for apriltag_demo; "
                     "apriltag_c_demo uses the upstream C detector" << endl;
@@ -738,6 +764,7 @@ int main(int argc, char* argv[])
          << " decode_sharpening=" << g_c_decode_sharpening
 #else
     cout << "mode=" << (g_mode ? "rvv" : "scalar")
+         << " ccl_scratch=" << ccl_scratch_mode_name(g_local_ccl_scratch)
 #endif
          << " factor=" << g_factor_value
          << " min_blob=" << g_min_blob

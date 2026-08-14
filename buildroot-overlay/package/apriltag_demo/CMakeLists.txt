@@ -7,6 +7,7 @@ message("CMAKE_TOOLCHAIN_FILE:" ${CMAKE_TOOLCHAIN_FILE})
 set(common_src
     src/main.cc
     src/apriltag_draw.cc
+    src/demo_options.cc
 )
 set(rvv_bin apriltag_demo.elf)
 set(c_bin apriltag_c_demo.elf)
@@ -16,6 +17,7 @@ set(profile_bench_bin k230_apriltag_profile_bench)
 set(profile_test_bin apriltag_profile_bench_tests)
 set(workload_bin k230_apriltag_workload)
 set(workload_test_bin apriltag_workload_format_tests)
+set(sequence_bin k230_apriltag_sequence_bench)
 set(APRILTAG_RVV_GIT_ID "unversioned" CACHE STRING "apriltag-rvv git identity")
 set(APRILTAG_SDK_GIT_ID "unversioned" CACHE STRING "SDK git identity")
 set(APRILTAG_RVV_LIB ${CMAKE_CURRENT_SOURCE_DIR}/lib/libapriltag_rvv.a)
@@ -63,6 +65,13 @@ target_compile_definitions(${workload_test_bin} PRIVATE
     APRILTAG_BENCH_NO_OPENCV APRILTAG_BENCH_CORE_ONLY)
 target_compile_definitions(${workload_bin} PRIVATE APRILTAG_BENCH_CORE_ONLY)
 target_include_directories(${workload_bin} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/lib)
+add_executable(${sequence_bin}
+    bench/sequence_main.cc bench/sequence.cc bench/benchmark.cc
+    bench/profile_format.cc bench/visual_dump.cc)
+target_compile_definitions(${sequence_bin} PRIVATE APRILTAG_BENCH_PROFILE
+    APRILTAG_BENCH_CORE_ONLY)
+target_include_directories(${sequence_bin} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/lib)
+target_compile_options(${sequence_bin} PRIVATE -fno-omit-frame-pointer)
 target_compile_options(${bench_bin} PRIVATE -fno-omit-frame-pointer)
 target_compile_definitions(${bench_test_bin} PRIVATE
     APRILTAG_BENCH_BACKEND_TESTS
@@ -100,7 +109,7 @@ include_directories(
 )
 
 foreach(bin IN ITEMS ${rvv_bin} ${c_bin} ${bench_bin} ${bench_test_bin}
-                     ${profile_bench_bin} ${workload_bin})
+                     ${profile_bench_bin} ${workload_bin} ${sequence_bin})
     target_link_directories(${bin} PRIVATE
         ${usr_root}/lib
         ${CMAKE_SYSROOT}
@@ -122,8 +131,13 @@ file(SHA256 "${APRILTAG_C_LIB}" APRILTAG_C_LIB_SHA256)
 file(SHA256 "${CMAKE_CURRENT_SOURCE_DIR}/src/apriltag.h" APRILTAG_ABI_SHA256)
 file(SHA256 "${CMAKE_CURRENT_SOURCE_DIR}/lib/rust_apriltag_profile.h"
      APRILTAG_PROFILE_ABI_SHA256)
+file(SHA256 "${CMAKE_CURRENT_SOURCE_DIR}/lib/apriltag_pending_profile.h"
+     APRILTAG_PENDING_ABI_SHA256)
 file(SHA256 "${CMAKE_CURRENT_SOURCE_DIR}/lib/apriltag_kernel_modes.h"
      APRILTAG_KERNEL_ABI_SHA256)
+file(SHA256 "${CMAKE_CURRENT_SOURCE_DIR}/lib/apriltag_scratch.h"
+     APRILTAG_SCRATCH_ABI_SHA256)
+file(SHA256 "${CMAKE_CURRENT_SOURCE_DIR}/lib/apriltag_buffer_telemetry.h" APRILTAG_BUFFER_ABI_SHA256)
 set(APRILTAG_BENCH_SOURCE_FILES
     "${CMAKE_CURRENT_SOURCE_DIR}/bench/main.cc"
     "${CMAKE_CURRENT_SOURCE_DIR}/bench/benchmark.cc"
@@ -158,14 +172,36 @@ foreach(source_file IN LISTS APRILTAG_PROFILE_SOURCE_FILES)
         "${source_name}\n${source_contents}\n")
 endforeach()
 string(SHA256 APRILTAG_PROFILE_SOURCE_SHA256 "${APRILTAG_PROFILE_SOURCE_CONTENTS}")
+set(APRILTAG_SEQUENCE_SOURCE_FILES
+    "${CMAKE_CURRENT_SOURCE_DIR}/bench/benchmark.cc"
+    "${CMAKE_CURRENT_SOURCE_DIR}/bench/benchmark.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/bench/profile_format.cc"
+    "${CMAKE_CURRENT_SOURCE_DIR}/bench/sequence.cc"
+    "${CMAKE_CURRENT_SOURCE_DIR}/bench/sequence.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/bench/sequence_main.cc"
+    "${CMAKE_CURRENT_SOURCE_DIR}/bench/visual_dump.cc"
+    "${CMAKE_CURRENT_SOURCE_DIR}/CMakeLists.txt")
+list(SORT APRILTAG_SEQUENCE_SOURCE_FILES)
+set(APRILTAG_SEQUENCE_SOURCE_CONTENTS "")
+foreach(source_file IN LISTS APRILTAG_SEQUENCE_SOURCE_FILES)
+    file(READ "${source_file}" source_contents)
+    file(RELATIVE_PATH source_name "${CMAKE_CURRENT_SOURCE_DIR}" "${source_file}")
+    string(APPEND APRILTAG_SEQUENCE_SOURCE_CONTENTS
+        "${source_name}\n${source_contents}\n")
+endforeach()
+string(SHA256 APRILTAG_SEQUENCE_SOURCE_SHA256 "${APRILTAG_SEQUENCE_SOURCE_CONTENTS}")
 string(SUBSTRING "${APRILTAG_RVV_LIB_SHA256}" 0 12 APRILTAG_RVV_LIB_HASH)
 string(SUBSTRING "${APRILTAG_RVV_PROFILE_LIB_SHA256}" 0 12 APRILTAG_RVV_PROFILE_LIB_HASH)
 string(SUBSTRING "${APRILTAG_C_LIB_SHA256}" 0 12 APRILTAG_C_LIB_HASH)
 string(SUBSTRING "${APRILTAG_ABI_SHA256}" 0 12 APRILTAG_ABI_HASH)
 string(SUBSTRING "${APRILTAG_PROFILE_ABI_SHA256}" 0 12 APRILTAG_PROFILE_ABI_HASH)
+string(SUBSTRING "${APRILTAG_PENDING_ABI_SHA256}" 0 12 APRILTAG_PENDING_ABI_HASH)
 string(SUBSTRING "${APRILTAG_KERNEL_ABI_SHA256}" 0 12 APRILTAG_KERNEL_ABI_HASH)
+string(SUBSTRING "${APRILTAG_SCRATCH_ABI_SHA256}" 0 12 APRILTAG_SCRATCH_ABI_HASH)
+string(SUBSTRING "${APRILTAG_BUFFER_ABI_SHA256}" 0 12 APRILTAG_BUFFER_ABI_HASH)
 string(SUBSTRING "${APRILTAG_BENCH_SOURCE_SHA256}" 0 12 APRILTAG_BENCH_SOURCE_HASH)
 string(SUBSTRING "${APRILTAG_PROFILE_SOURCE_SHA256}" 0 12 APRILTAG_PROFILE_SOURCE_HASH)
+string(SUBSTRING "${APRILTAG_SEQUENCE_SOURCE_SHA256}" 0 12 APRILTAG_SEQUENCE_SOURCE_HASH)
 set(APRILTAG_COMPILER_ID "${CMAKE_CXX_COMPILER_ID}${CMAKE_CXX_COMPILER_VERSION}")
 string(REGEX REPLACE "[^A-Za-z0-9._-]" "-" APRILTAG_COMPILER_ID
     "${APRILTAG_COMPILER_ID}")
@@ -175,10 +211,15 @@ string(REGEX REPLACE "[^A-Za-z0-9._-]" "-" APRILTAG_BENCH_BUILD_ID
     "${APRILTAG_BENCH_BUILD_ID}")
 message(STATUS "AprilTag benchmark build ID: ${APRILTAG_BENCH_BUILD_ID}")
 set(APRILTAG_PROFILE_BENCH_BUILD_ID
-    "profile-rvv-${APRILTAG_RVV_GIT_ID}_sdk-${APRILTAG_SDK_GIT_ID}_lib-${APRILTAG_RVV_PROFILE_LIB_HASH}_profile-${APRILTAG_PROFILE_SOURCE_HASH}_abi-${APRILTAG_ABI_HASH}_profileabi-${APRILTAG_PROFILE_ABI_HASH}_kernelabi-${APRILTAG_KERNEL_ABI_HASH}_cc-${APRILTAG_COMPILER_ID}")
+    "profile-rvv-${APRILTAG_RVV_GIT_ID}_sdk-${APRILTAG_SDK_GIT_ID}_lib-${APRILTAG_RVV_PROFILE_LIB_HASH}_profile-${APRILTAG_PROFILE_SOURCE_HASH}_abi-${APRILTAG_ABI_HASH}_profileabi-${APRILTAG_PROFILE_ABI_HASH}_pendingabi-${APRILTAG_PENDING_ABI_HASH}_scratchabi-${APRILTAG_SCRATCH_ABI_HASH}_bufferabi-${APRILTAG_BUFFER_ABI_HASH}_kernelabi-${APRILTAG_KERNEL_ABI_HASH}_cc-${APRILTAG_COMPILER_ID}")
 string(REGEX REPLACE "[^A-Za-z0-9._-]" "-" APRILTAG_PROFILE_BENCH_BUILD_ID
     "${APRILTAG_PROFILE_BENCH_BUILD_ID}")
 message(STATUS "AprilTag profile benchmark build ID: ${APRILTAG_PROFILE_BENCH_BUILD_ID}")
+set(APRILTAG_SEQUENCE_BENCH_BUILD_ID
+    "sequence-rvv-${APRILTAG_RVV_GIT_ID}_sdk-${APRILTAG_SDK_GIT_ID}_lib-${APRILTAG_RVV_PROFILE_LIB_HASH}_sequence-${APRILTAG_SEQUENCE_SOURCE_HASH}_abi-${APRILTAG_ABI_HASH}_profileabi-${APRILTAG_PROFILE_ABI_HASH}_pendingabi-${APRILTAG_PENDING_ABI_HASH}_scratchabi-${APRILTAG_SCRATCH_ABI_HASH}_bufferabi-${APRILTAG_BUFFER_ABI_HASH}_kernelabi-${APRILTAG_KERNEL_ABI_HASH}_cc-${APRILTAG_COMPILER_ID}")
+string(REGEX REPLACE "[^A-Za-z0-9._-]" "-" APRILTAG_SEQUENCE_BENCH_BUILD_ID
+    "${APRILTAG_SEQUENCE_BENCH_BUILD_ID}")
+message(STATUS "AprilTag sequence benchmark build ID: ${APRILTAG_SEQUENCE_BENCH_BUILD_ID}")
 foreach(bin IN ITEMS ${bench_bin} ${bench_test_bin})
     target_compile_definitions(${bin} PRIVATE
         APRILTAG_BENCH_BUILD_ID="${APRILTAG_BENCH_BUILD_ID}"
@@ -186,6 +227,8 @@ foreach(bin IN ITEMS ${bench_bin} ${bench_test_bin})
 endforeach()
 target_compile_definitions(${profile_bench_bin} PRIVATE
     APRILTAG_BENCH_BUILD_ID="${APRILTAG_PROFILE_BENCH_BUILD_ID}")
+target_compile_definitions(${sequence_bin} PRIVATE
+    APRILTAG_BENCH_BUILD_ID="${APRILTAG_SEQUENCE_BENCH_BUILD_ID}")
 
 # --start-group/--end-group resolves the mutual deps between the OpenCV/K230
 # static libs and the rust-std symbols pulled by libapriltag_rvv.a.
@@ -258,16 +301,27 @@ target_link_libraries(${profile_bench_bin}
     ${APRILTAG_RVV_PROFILE_LIB}
     opencv_imgcodecs opencv_imgproc opencv_core pthread dl m rt
     -Wl,--end-group)
+target_link_libraries(${sequence_bin}
+    -Wl,--start-group
+    ${APRILTAG_RVV_PROFILE_LIB}
+    opencv_imgcodecs opencv_imgproc opencv_core pthread dl m rt
+    -Wl,--end-group)
 add_custom_target(apriltag_benchmark_build_verification ALL
     COMMAND ${CMAKE_COMMAND}
         -DPRODUCTION=$<TARGET_FILE:${bench_bin}>
         -DPROFILE=$<TARGET_FILE:${profile_bench_bin}>
+        -DSEQUENCE=$<TARGET_FILE:${sequence_bin}>
+        -DWORKLOAD=$<TARGET_FILE:${workload_bin}>
+        -DDEMO=$<TARGET_FILE:${rvv_bin}>
+        -DC_DEMO=$<TARGET_FILE:${c_bin}>
         -DNM=${CMAKE_NM}
         -DSTRINGS=strings
         -DPRODUCTION_ID=${APRILTAG_BENCH_BUILD_ID}
         -DPROFILE_ID=${APRILTAG_PROFILE_BENCH_BUILD_ID}
+        -DSEQUENCE_ID=${APRILTAG_SEQUENCE_BENCH_BUILD_ID}
         -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/verify_benchmark_build.cmake
-    DEPENDS ${bench_bin} ${profile_bench_bin}
+    DEPENDS ${rvv_bin} ${c_bin} ${bench_bin} ${profile_bench_bin} ${sequence_bin}
+            ${workload_bin}
     VERBATIM)
 target_link_libraries(${workload_bin}
     -Wl,--start-group
@@ -283,12 +337,12 @@ if(CMAKE_TOOLCHAIN_FILE MATCHES "buildroot/toolchainfile.cmake")
     install(TARGETS ${c_bin} DESTINATION /root/app/apriltag_c_demo)
     install(DIRECTORY utils_c/ DESTINATION /root/app/apriltag_c_demo USE_SOURCE_PERMISSIONS)
     install(DIRECTORY utils_profile/ DESTINATION /root/app/apriltag_profile USE_SOURCE_PERMISSIONS)
-    install(TARGETS ${bench_bin} ${profile_bench_bin} ${workload_bin}
+    install(TARGETS ${bench_bin} ${profile_bench_bin} ${workload_bin} ${sequence_bin}
         DESTINATION /root/app/apriltag_bench)
     install(FILES bench/fixture.jpg DESTINATION /root/app/apriltag_bench)
     install(DIRECTORY utils_bench/ DESTINATION /root/app/apriltag_bench USE_SOURCE_PERMISSIONS)
 else()
     message(STATUS "Standalone build -> ./bin/")
     install(TARGETS ${rvv_bin} ${c_bin} ${bench_bin} ${profile_bench_bin}
-        ${workload_bin} DESTINATION bin)
+        ${workload_bin} ${sequence_bin} DESTINATION bin)
 endif()

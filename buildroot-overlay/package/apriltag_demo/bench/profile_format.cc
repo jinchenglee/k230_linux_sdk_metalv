@@ -114,19 +114,10 @@ long double unattributed_ratio(const apriltag_ccl_profile_t& profile)
     return profile.total_ns
         ? static_cast<long double>(profile.unattributed_ns) / profile.total_ns : 0;
 }
-}
 
-std::size_t profile_timing_descriptor_count() { return std::size(kTimingFields); }
-
-std::size_t profile_counter_descriptor_count()
-{
-    std::size_t count = 0;
-    apriltag_ccl_profile_t profile{};
-    visit_counters(profile, [&](const char*, std::uint64_t, std::uint64_t) { ++count; });
-    return count;
-}
-
-void validate_profile_sequence(const std::vector<apriltag_ccl_profile_t>& profiles)
+void validate_profile_sequence_with_allowed_variation(
+    const std::vector<apriltag_ccl_profile_t>& profiles,
+    const std::initializer_list<const char*> allowed_vary)
 {
     if (profiles.empty()) throw std::runtime_error("no CCL profile snapshots");
     for (const auto& profile : profiles) {
@@ -146,17 +137,87 @@ void validate_profile_sequence(const std::vector<apriltag_ccl_profile_t>& profil
         visit_counters(current, [&](const char* name, std::uint64_t value,
                                     std::uint64_t validity) {
             if ((first.validity & validity) != validity) return;
-            if (value != expected[index++])
+            const std::uint64_t expected_value = expected[index++];
+            const bool may_vary = std::any_of(
+                allowed_vary.begin(), allowed_vary.end(),
+                [&](const char* allowed) { return std::string(name) == allowed; });
+            if (!may_vary && value != expected_value)
                 throw std::runtime_error(std::string("CCL workload counter changed: ") + name);
         });
     }
 }
+}
+
+std::size_t profile_timing_descriptor_count() { return std::size(kTimingFields); }
+
+std::size_t profile_counter_descriptor_count()
+{
+    std::size_t count = 0;
+    apriltag_ccl_profile_t profile{};
+    visit_counters(profile, [&](const char*, std::uint64_t, std::uint64_t) { ++count; });
+    return count;
+}
+
+void validate_profile_sequence(const std::vector<apriltag_ccl_profile_t>& profiles)
+{
+    validate_profile_sequence_with_allowed_variation(profiles, {});
+}
+
+void validate_sequence_profile_sequence(
+    const std::vector<apriltag_ccl_profile_t>& profiles, ScratchMode mode)
+{
+    if (mode == ScratchMode::Reusable)
+        validate_profile_sequence_with_allowed_variation(profiles, {"pending_growths"});
+    else
+        validate_profile_sequence_with_allowed_variation(profiles, {});
+}
+
+void validate_scratch_sequence(const std::vector<apriltag_ccl_scratch_v1_t>& snapshots)
+{
+    if (snapshots.empty()) throw std::runtime_error("no CCL scratch snapshots");
+    const auto validate = [](const apriltag_ccl_scratch_v1_t& snapshot) {
+        if (snapshot.version != APRILTAG_CCL_SCRATCH_VERSION ||
+            snapshot.struct_size != sizeof(snapshot))
+            throw std::runtime_error("incompatible CCL scratch schema");
+        if (snapshot.validity & ~APRILTAG_CCL_SCRATCH_VALID_ALL)
+            throw std::runtime_error("CCL scratch contains unknown validity bits");
+        if ((snapshot.validity & APRILTAG_CCL_SCRATCH_VALID_ALL) !=
+            APRILTAG_CCL_SCRATCH_VALID_ALL)
+            throw std::runtime_error("CCL scratch buffer telemetry is invalid");
+    };
+    const auto equal = [](const apriltag_buffer_telemetry_t& a,
+                          const apriltag_buffer_telemetry_t& b) {
+        return a.len == b.len && a.capacity == b.capacity &&
+               a.high_water == b.high_water && a.growths_call == b.growths_call &&
+               a.growths_total == b.growths_total &&
+               a.capacity_bytes == b.capacity_bytes &&
+               a.high_water_bytes == b.high_water_bytes &&
+               a.element_size == b.element_size;
+    };
+    validate(snapshots.front());
+    if (snapshots.front().pending.growths_call ||
+        snapshots.front().diagonal_left.growths_call ||
+        snapshots.front().diagonal_right.growths_call)
+        throw std::runtime_error("CCL scratch grew during measured calls");
+    for (std::size_t i = 1; i < snapshots.size(); ++i) {
+        validate(snapshots[i]);
+        if (snapshots[i].validity != snapshots.front().validity ||
+            !equal(snapshots[i].pending, snapshots.front().pending) ||
+            !equal(snapshots[i].diagonal_left, snapshots.front().diagonal_left) ||
+            !equal(snapshots[i].diagonal_right, snapshots.front().diagonal_right))
+            throw std::runtime_error("CCL scratch telemetry changed across measured calls");
+    }
+}
 
 void print_profile_report(const BenchmarkConfig& config, BackendKind kind,
-                          const std::vector<apriltag_ccl_profile_t>& profiles,
-                          std::ostream& out)
+                           const std::vector<apriltag_ccl_profile_t>& profiles,
+                           const std::vector<apriltag_ccl_scratch_v1_t>& scratches,
+                           std::ostream& out)
 {
     validate_profile_sequence(profiles);
+    validate_scratch_sequence(scratches);
+    if (scratches.size() != profiles.size())
+        throw std::runtime_error("CCL profile and scratch snapshot counts differ");
     long double ratio_total = 0;
     long double ratio_max = 0;
     for (const auto& profile : profiles) {
@@ -221,6 +282,28 @@ void print_profile_report(const BenchmarkConfig& config, BackendKind kind,
                                 std::uint64_t validity) {
         if ((profile.validity & validity) == validity) out << ' ' << name << '=' << value;
     });
+    out << '\n';
+    const auto& scratch = scratches.back();
+    out << "CCL_SCRATCH backend=" << backend_key(kind) << " rvv_mask=";
+    if (config.rvv_mask_explicit) out << "0x" << std::hex << config.rvv_mask << std::dec;
+    else out << "all";
+    out << " stages=" << (config.rvv_mask_explicit ? config.rvv_stages : "all")
+        << " version=" << scratch.version << " struct_size=" << scratch.struct_size
+        << " validity=0x" << std::hex
+        << scratch.validity << std::dec;
+    const auto emit = [&](const char* prefix, const apriltag_buffer_telemetry_t& b) {
+        out << ' ' << prefix << "_len=" << b.len
+            << ' ' << prefix << "_capacity=" << b.capacity
+            << ' ' << prefix << "_high_water=" << b.high_water
+            << ' ' << prefix << "_growths_call=" << b.growths_call
+            << ' ' << prefix << "_growths_total=" << b.growths_total
+            << ' ' << prefix << "_capacity_bytes=" << b.capacity_bytes
+            << ' ' << prefix << "_high_water_bytes=" << b.high_water_bytes
+            << ' ' << prefix << "_element_size=" << b.element_size;
+    };
+    emit("pending", scratch.pending);
+    emit("diagonal_left", scratch.diagonal_left);
+    emit("diagonal_right", scratch.diagonal_right);
     out << '\n';
 }
 }  // namespace apriltag_bench

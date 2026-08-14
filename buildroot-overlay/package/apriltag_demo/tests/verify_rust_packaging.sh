@@ -9,10 +9,11 @@ TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
 RVV="$TMP/apriltag-rvv"
+ASYNC_RVV="$TMP/async-rvv"
 BUILDROOT="$TMP/sdk/output/buildroot"
 COPIED="$TMP/build/apriltag_demo"
 mkdir -p "$RVV/src" "$RVV/include" "$RVV/scripts" "$RVV/.cargo" \
-    "$BUILDROOT/package" "$COPIED/lib" "$COPIED/scripts"
+    "$ASYNC_RVV/src" "$BUILDROOT/package" "$COPIED/lib" "$COPIED/scripts"
 printf '%s\n' '[package]' 'name = "fixture"' >"$RVV/Cargo.toml"
 printf '%s\n' '# fixture lockfile' >"$RVV/Cargo.lock"
 printf '%s\n' 'fn main() {}' >"$RVV/build.rs"
@@ -21,7 +22,10 @@ printf '%s\n' '[build]' 'rustflags = []' >"$RVV/.cargo/config.toml"
 printf '%s\n' 'pub fn fixture() {}' >"$RVV/src/lib.rs"
 printf '%s\n' 'pub fn pipeline() {}' >"$RVV/src/pipeline.rs"
 printf '%s\n' 'pub fn profile() {}' >"$RVV/src/profile.rs"
+printf '%s\n' 'pub fn pending_profile() {}' >"$RVV/src/pending_profile.rs"
 printf '%s\n' '#!/bin/sh' >"$RVV/scripts/build-capi.sh"
+printf '%s\n' '[package]' 'name = "async-fixture"' >"$ASYNC_RVV/Cargo.toml"
+printf '%s\n' 'pub fn async_fixture() {}' >"$ASYNC_RVV/src/lib.rs"
 cat >"$RVV/include/apriltag_kernel_modes.h" <<'EOF'
 #ifndef APRILTAG_KERNEL_MODES_H
 #define APRILTAG_KERNEL_MODES_H
@@ -51,10 +55,62 @@ typedef struct apriltag_ccl_profile {
 } apriltag_ccl_profile_t;
 #endif
 EOF
-
+cat >"$RVV/include/apriltag_pending_profile.h" <<'EOF'
+#ifndef APRILTAG_PENDING_PROFILE_H
+#define APRILTAG_PENDING_PROFILE_H
+#include <stddef.h>
+typedef void apriltag_t;
+typedef struct apriltag_ccl_pending_profile_v1 {
+    unsigned char payload[640];
+} apriltag_ccl_pending_profile_v1_t;
+int apriltag_get_ccl_pending_profile_v1(apriltag_t *,
+                                        apriltag_ccl_pending_profile_v1_t *, size_t);
+#endif
+EOF
+cat >"$RVV/include/apriltag_scratch.h" <<'EOF'
+#ifndef APRILTAG_SCRATCH_H
+#define APRILTAG_SCRATCH_H
+#include <stddef.h>
+#include <stdint.h>
+#include "apriltag_buffer_telemetry.h"
+#define APRILTAG_CCL_SCRATCH_VERSION UINT32_C(1)
+#define APRILTAG_CCL_SCRATCH_SIZE 256
+#define APRILTAG_CCL_SCRATCH_MODE_REUSABLE UINT32_C(0)
+#define APRILTAG_CCL_SCRATCH_MODE_LOCAL UINT32_C(1)
+typedef void apriltag_t;
+typedef struct apriltag_ccl_scratch_v1 {
+    uint32_t version, struct_size;
+    uint64_t validity;
+    apriltag_buffer_telemetry_t pending, diagonal_left, diagonal_right;
+    uint64_t reserved[6];
+} apriltag_ccl_scratch_v1_t;
+int apriltag_get_ccl_scratch_v1(apriltag_t *, apriltag_ccl_scratch_v1_t *, size_t);
+int apriltag_set_ccl_scratch_mode_v1(apriltag_t *, uint32_t);
+#endif
+EOF
+cat >"$RVV/include/apriltag_buffer_telemetry.h" <<'EOF'
+#ifndef APRILTAG_BUFFER_TELEMETRY_H
+#define APRILTAG_BUFFER_TELEMETRY_H
+#include <stdint.h>
+typedef struct apriltag_buffer_telemetry {
+    uint64_t len, capacity, high_water, growths_call, growths_total;
+    uint64_t capacity_bytes, high_water_bytes, element_size;
+} apriltag_buffer_telemetry_t;
+#endif
+EOF
 hash_mode() {
     "$HASH_SCRIPT" "$RVV" "$1"
 }
+
+mkdir -p "$TMP/links"
+ln -s "$RVV" "$TMP/links/apriltag-rvv"
+for mode in production workload profile; do
+    absolute_hash="$($HASH_SCRIPT "$RVV" "$mode")"
+    relative_hash="$(cd "$TMP" && "$HASH_SCRIPT" apriltag-rvv "$mode")"
+    symlink_hash="$($HASH_SCRIPT "$TMP/links/apriltag-rvv" "$mode")"
+    test "$relative_hash" = "$absolute_hash"
+    test "$symlink_hash" = "$absolute_hash"
+done
 
 production_hash="$(hash_mode production)"
 workload_hash="$(hash_mode workload)"
@@ -89,9 +145,36 @@ test "$(hash_mode production)" = "$production_pipeline_hash"
 test "$(hash_mode workload)" = "$workload_hash"
 test "$(hash_mode profile)" != "$profile_pipeline_hash"
 profile_pipeline_hash="$(hash_mode profile)"
+production_pending_source_hash="$(hash_mode production)"
+workload_pending_source_hash="$(hash_mode workload)"
+profile_pending_source_hash="$(hash_mode profile)"
+printf '%s\n' '// pending profile implementation change' >>"$RVV/src/pending_profile.rs"
+test "$(hash_mode production)" = "$production_pending_source_hash"
+test "$(hash_mode workload)" = "$workload_pending_source_hash"
+test "$(hash_mode profile)" != "$profile_pending_source_hash"
+profile_pipeline_hash="$(hash_mode profile)"
 printf '%s\n' '/* profile ABI change */' >>"$RVV/include/apriltag_profile.h"
 test "$(hash_mode production)" = "$production_pipeline_hash"
 test "$(hash_mode profile)" != "$profile_pipeline_hash"
+profile_scratch_hash="$(hash_mode profile)"
+production_pending_hash="$(hash_mode production)"
+workload_pending_hash="$(hash_mode workload)"
+profile_pending_hash="$(hash_mode profile)"
+printf '%s\n' '/* pending profile ABI change */' >>"$RVV/include/apriltag_pending_profile.h"
+test "$(hash_mode production)" = "$production_pending_hash"
+test "$(hash_mode workload)" = "$workload_pending_hash"
+test "$(hash_mode profile)" != "$profile_pending_hash"
+printf '%s\n' '/* scratch ABI change */' >>"$RVV/include/apriltag_scratch.h"
+test "$(hash_mode production)" != "$production_pipeline_hash"
+test "$(hash_mode workload)" != "$workload_hash"
+test "$(hash_mode profile)" != "$profile_scratch_hash"
+production_buffer_hash="$(hash_mode production)"
+workload_buffer_hash="$(hash_mode workload)"
+profile_buffer_hash="$(hash_mode profile)"
+printf '%s\n' '/* shared telemetry ABI change */' >>"$RVV/include/apriltag_buffer_telemetry.h"
+test "$(hash_mode production)" != "$production_buffer_hash"
+test "$(hash_mode workload)" != "$workload_buffer_hash"
+test "$(hash_mode profile)" != "$profile_buffer_hash"
 
 profile_hash="$(hash_mode profile)"
 workload_hash="$(hash_mode workload)"
@@ -150,6 +233,9 @@ $snapshot_pkg/run:
 	@printf archive >$snapshot_pkg/lib/libapriltag_rvv_profile.a
 	@printf header >$snapshot_pkg/lib/rust_apriltag_workload.h
 	@printf header >$snapshot_pkg/lib/rust_apriltag_profile.h
+	@printf header >$snapshot_pkg/lib/apriltag_pending_profile.h
+	@printf header >$snapshot_pkg/lib/apriltag_scratch.h
+	@printf header >$snapshot_pkg/lib/apriltag_buffer_telemetry.h
 	@printf header >$snapshot_pkg/lib/apriltag_kernel_modes.h
 	@printf '%s\\n' '\$(APRILTAG_DEMO_RVV_SOURCE_HASH)' >$snapshot_pkg/lib/.apriltag_rvv.source-hash
 	@printf '%s\\n' '\$(APRILTAG_DEMO_RVV_WORKLOAD_SOURCE_HASH)' >$snapshot_pkg/lib/.apriltag_rvv_workload.source-hash
@@ -160,6 +246,7 @@ $snapshot_pkg/run:
 EOF
 rm -f "$TMP/hash-calls" "$TMP/snapshot-build.log"
 make -s -f "$TMP/snapshot.mk" "$snapshot_pkg/run"
+test ! -e "$snapshot_pkg/lib/apriltag_grouping.h"
 for mode in production workload profile; do
     test "$(grep -c "^$mode$" "$TMP/hash-calls")" -eq 1
 done
@@ -234,7 +321,8 @@ for ignored in \
     git -C "$TMP/ignore-sdk" check-ignore -q \
         "buildroot-overlay/package/apriltag_demo/$ignored"
 done
-for tracked in lib/.apriltag_rvv_profile.source-hash lib/rust_apriltag_profile.h; do
+for tracked in lib/.apriltag_rvv_profile.source-hash lib/rust_apriltag_profile.h \
+    lib/apriltag_pending_profile.h; do
     printf generated >"$ignore_pkg/$tracked"
     if git -C "$TMP/ignore-sdk" check-ignore -q \
         "buildroot-overlay/package/apriltag_demo/$tracked"; then
@@ -295,6 +383,66 @@ for args in '--profile-only --workload-only' '--workload-only --profile-only'; d
     fi
 done
 
+# Every standalone mode must publish scratch and its buffer-header dependency
+# from an otherwise clean package directory.
+for mode in production workload profile; do
+    clean_pkg="$TMP/clean-$mode-package"
+    mkdir -p "$clean_pkg/scripts" "$clean_pkg/lib"
+    cp "$BUILD_SCRIPT" "$clean_pkg/scripts/build_rust_lib.sh"
+    cp "$HASH_SCRIPT" "$clean_pkg/scripts/rust_source_hash.sh"
+    case "$mode" in
+        production)
+            args=(); hash_env=(APRILTAG_SOURCE_HASH="$production_hash")
+            archive=libapriltag_rvv.a; header=; stamp=.apriltag_rvv.source-hash
+            ;;
+        workload)
+            args=(--workload-only); hash_env=(APRILTAG_WORKLOAD_SOURCE_HASH="$workload_hash")
+            archive=libapriltag_rvv_workload.a; header=rust_apriltag_workload.h
+            stamp=.apriltag_rvv_workload.source-hash
+            ;;
+        profile)
+            args=(--profile-only); hash_env=(APRILTAG_PROFILE_SOURCE_HASH="$profile_hash")
+            archive=libapriltag_rvv_profile.a; header=rust_apriltag_profile.h
+            stamp=.apriltag_rvv_profile.source-hash
+            ;;
+    esac
+    BUILD_SCRIPT_TEST_LOG="$TMP/docker.log" PATH="$fake_bin:$PATH" \
+        APRILTAG_RVV_DIR="$RVV" env "${hash_env[@]}" \
+        bash "$clean_pkg/scripts/build_rust_lib.sh" "${args[@]}" >/dev/null
+    cmp "$RVV/include/apriltag_scratch.h" "$clean_pkg/lib/apriltag_scratch.h"
+    cmp "$RVV/include/apriltag_buffer_telemetry.h" \
+        "$clean_pkg/lib/apriltag_buffer_telemetry.h"
+    if [ "$mode" = profile ]; then
+        cmp "$RVV/include/apriltag_pending_profile.h" \
+            "$clean_pkg/lib/apriltag_pending_profile.h"
+        test "$(stat -c '%a' "$clean_pkg/lib/apriltag_pending_profile.h")" = 644
+    else
+        test ! -e "$clean_pkg/lib/apriltag_pending_profile.h"
+    fi
+
+    printf old-archive >"$clean_pkg/lib/$archive"
+    test -z "$header" || printf old-header >"$clean_pkg/lib/$header"
+    printf old-scratch >"$clean_pkg/lib/apriltag_scratch.h"
+    printf old-kernel >"$clean_pkg/lib/apriltag_kernel_modes.h"
+    test "$mode" != profile || rm -f "$clean_pkg/lib/apriltag_pending_profile.h"
+    printf '%s\n' old-stamp >"$clean_pkg/lib/$stamp"
+    rm "$clean_pkg/lib/apriltag_buffer_telemetry.h"
+    if BUILD_SCRIPT_TEST_LOG="$TMP/docker.log" PATH="$fake_bin:$PATH" \
+        APRILTAG_RVV_DIR="$RVV" APRILTAG_PACKAGE_TEST_FAIL_STEP=after_buffer_header \
+        env "${hash_env[@]}" bash "$clean_pkg/scripts/build_rust_lib.sh" \
+        "${args[@]}" >/dev/null 2>&1; then
+        echo "missing-buffer rollback unexpectedly succeeded: $mode" >&2
+        exit 1
+    fi
+    test "$(cat "$clean_pkg/lib/$archive")" = old-archive
+    test -z "$header" || test "$(cat "$clean_pkg/lib/$header")" = old-header
+    test "$(cat "$clean_pkg/lib/apriltag_scratch.h")" = old-scratch
+    test "$(cat "$clean_pkg/lib/apriltag_kernel_modes.h")" = old-kernel
+    test "$(cat "$clean_pkg/lib/$stamp")" = old-stamp
+    test ! -e "$clean_pkg/lib/apriltag_buffer_telemetry.h"
+    test "$mode" != profile || test ! -e "$clean_pkg/lib/apriltag_pending_profile.h"
+done
+
 BUILD_SCRIPT_TEST_LOG="$TMP/docker.log" PATH="$fake_bin:$PATH" \
     APRILTAG_RVV_DIR="$RVV" APRILTAG_CAPI_OUTPUT_ROOT="$RVV/custom output" \
     APRILTAG_PROFILE_SOURCE_HASH="$profile_hash" \
@@ -303,15 +451,51 @@ grep -q -- '--ccl-profile' "$TMP/docker.log"
 grep -q 'APRILTAG_CAPI_OUTPUT_ROOT=custom\\ output' "$TMP/docker.log"
 test "$(cat "$script_pkg/lib/.apriltag_rvv_profile.source-hash")" = "$profile_hash"
 cmp "$RVV/include/apriltag_profile.h" "$script_pkg/lib/rust_apriltag_profile.h"
+cmp "$RVV/include/apriltag_scratch.h" "$script_pkg/lib/apriltag_scratch.h"
+cmp "$RVV/include/apriltag_buffer_telemetry.h" "$script_pkg/lib/apriltag_buffer_telemetry.h"
 cmp "$RVV/include/apriltag_kernel_modes.h" "$script_pkg/lib/apriltag_kernel_modes.h"
+cmp "$RVV/include/apriltag_pending_profile.h" "$script_pkg/lib/apriltag_pending_profile.h"
 test "$(cat "$script_pkg/lib/libapriltag_rvv_profile.a")" = libapriltag_rvv_profile.a
 test "$(sha256sum "$script_pkg/lib/libapriltag_rvv.a")" = "$production_archive_before"
 test "$(sha256sum "$script_pkg/lib/libapriltag_rvv_workload.a")" = "$workload_archive_before"
-for generated in libapriltag_rvv_profile.a rust_apriltag_profile.h \
+for generated in libapriltag_rvv_profile.a rust_apriltag_profile.h apriltag_scratch.h \
+    apriltag_buffer_telemetry.h apriltag_kernel_modes.h \
+    apriltag_pending_profile.h \
     .apriltag_rvv_profile.source-hash; do
     test "$(stat -c '%a' "$script_pkg/lib/$generated")" = 644
 done
+test ! -e "$script_pkg/lib/apriltag_grouping.h"
 test -z "$(find "$script_pkg/lib" -maxdepth 1 -name '.*.??????' -print -quit)"
+
+# A profile staging failure must clean every temporary resource without
+# touching existing destinations or the package lock.
+printf old-archive >"$script_pkg/lib/libapriltag_rvv_profile.a"
+printf old-header >"$script_pkg/lib/rust_apriltag_profile.h"
+printf old-scratch >"$script_pkg/lib/apriltag_scratch.h"
+printf old-buffer >"$script_pkg/lib/apriltag_buffer_telemetry.h"
+printf old-kernel >"$script_pkg/lib/apriltag_kernel_modes.h"
+printf old-pending >"$script_pkg/lib/apriltag_pending_profile.h"
+printf '%s\n' old-stamp >"$script_pkg/lib/.apriltag_rvv_profile.source-hash"
+mv "$RVV/include/apriltag_pending_profile.h" \
+    "$RVV/include/apriltag_pending_profile.h.unavailable"
+if BUILD_SCRIPT_TEST_LOG="$TMP/docker.log" PATH="$fake_bin:$PATH" \
+    APRILTAG_RVV_DIR="$RVV" APRILTAG_PROFILE_SOURCE_HASH="$profile_hash" \
+    bash "$script_pkg/scripts/build_rust_lib.sh" --profile-only >/dev/null 2>&1; then
+    echo "missing pending source header unexpectedly staged" >&2
+    exit 1
+fi
+mv "$RVV/include/apriltag_pending_profile.h.unavailable" \
+    "$RVV/include/apriltag_pending_profile.h"
+test "$(cat "$script_pkg/lib/libapriltag_rvv_profile.a")" = old-archive
+test "$(cat "$script_pkg/lib/rust_apriltag_profile.h")" = old-header
+test "$(cat "$script_pkg/lib/apriltag_scratch.h")" = old-scratch
+test "$(cat "$script_pkg/lib/apriltag_buffer_telemetry.h")" = old-buffer
+test "$(cat "$script_pkg/lib/apriltag_kernel_modes.h")" = old-kernel
+test "$(cat "$script_pkg/lib/apriltag_pending_profile.h")" = old-pending
+test "$(cat "$script_pkg/lib/.apriltag_rvv_profile.source-hash")" = old-stamp
+test -e "$script_pkg/lib/.apriltag-rvv-package.lock"
+test -z "$(find "$script_pkg/lib" -maxdepth 1 \
+    \( -name '.*.??????' -o -name '.publish-backup.??????' \) -print -quit)"
 
 for unsafe_root in "$TMP/outside" "$RVV/quote'output"; do
     if BUILD_SCRIPT_TEST_LOG="$TMP/docker.log" PATH="$fake_bin:$PATH" \
@@ -325,6 +509,9 @@ done
 
 printf old-archive >"$script_pkg/lib/libapriltag_rvv_profile.a"
 printf old-header >"$script_pkg/lib/rust_apriltag_profile.h"
+printf old-scratch >"$script_pkg/lib/apriltag_scratch.h"
+printf old-buffer >"$script_pkg/lib/apriltag_buffer_telemetry.h"
+printf old-pending >"$script_pkg/lib/apriltag_pending_profile.h"
 printf '%s\n' old-stamp >"$script_pkg/lib/.apriltag_rvv_profile.source-hash"
 if BUILD_SCRIPT_TEST_LOG="$TMP/docker.log" FAIL_BUILD=1 PATH="$fake_bin:$PATH" \
     APRILTAG_RVV_DIR="$RVV" APRILTAG_PROFILE_SOURCE_HASH="$profile_hash" \
@@ -334,11 +521,65 @@ if BUILD_SCRIPT_TEST_LOG="$TMP/docker.log" FAIL_BUILD=1 PATH="$fake_bin:$PATH" \
 fi
 test "$(cat "$script_pkg/lib/libapriltag_rvv_profile.a")" = old-archive
 test "$(cat "$script_pkg/lib/rust_apriltag_profile.h")" = old-header
+test "$(cat "$script_pkg/lib/apriltag_scratch.h")" = old-scratch
+test "$(cat "$script_pkg/lib/apriltag_buffer_telemetry.h")" = old-buffer
+test "$(cat "$script_pkg/lib/apriltag_pending_profile.h")" = old-pending
+test "$(cat "$script_pkg/lib/.apriltag_rvv_profile.source-hash")" = old-stamp
+test -z "$(find "$script_pkg/lib" -maxdepth 1 -name '.apriltag_buffer_telemetry.h.??????' -print -quit)"
+
+# A destination absent before publication must remain absent after rollback,
+# while destinations with prior contents are restored.
+printf old-archive >"$script_pkg/lib/libapriltag_rvv_profile.a"
+printf old-header >"$script_pkg/lib/rust_apriltag_profile.h"
+printf old-scratch >"$script_pkg/lib/apriltag_scratch.h"
+rm -f "$script_pkg/lib/apriltag_buffer_telemetry.h"
+rm -f "$script_pkg/lib/apriltag_pending_profile.h"
+printf '%s\n' old-stamp >"$script_pkg/lib/.apriltag_rvv_profile.source-hash"
+if BUILD_SCRIPT_TEST_LOG="$TMP/docker.log" PATH="$fake_bin:$PATH" \
+    APRILTAG_RVV_DIR="$RVV" APRILTAG_PROFILE_SOURCE_HASH="$profile_hash" \
+    APRILTAG_PACKAGE_TEST_FAIL_STEP=after_kernel_header \
+    bash "$script_pkg/scripts/build_rust_lib.sh" --profile-only >/dev/null 2>&1; then
+    echo "missing-artifact publication failure unexpectedly succeeded" >&2
+    exit 1
+fi
+test "$(cat "$script_pkg/lib/libapriltag_rvv_profile.a")" = old-archive
+test "$(cat "$script_pkg/lib/rust_apriltag_profile.h")" = old-header
+test "$(cat "$script_pkg/lib/apriltag_scratch.h")" = old-scratch
+test ! -e "$script_pkg/lib/apriltag_buffer_telemetry.h"
+test ! -e "$script_pkg/lib/apriltag_pending_profile.h"
 test "$(cat "$script_pkg/lib/.apriltag_rvv_profile.source-hash")" = old-stamp
 
-for failure_step in after_archive after_header after_stamp; do
+# If pending was absent before publication, failure after publishing it must
+# remove it while restoring every pre-existing profile artifact.
+printf old-archive >"$script_pkg/lib/libapriltag_rvv_profile.a"
+printf old-header >"$script_pkg/lib/rust_apriltag_profile.h"
+printf old-scratch >"$script_pkg/lib/apriltag_scratch.h"
+printf old-buffer >"$script_pkg/lib/apriltag_buffer_telemetry.h"
+printf old-kernel >"$script_pkg/lib/apriltag_kernel_modes.h"
+rm -f "$script_pkg/lib/apriltag_pending_profile.h"
+printf '%s\n' old-stamp >"$script_pkg/lib/.apriltag_rvv_profile.source-hash"
+if BUILD_SCRIPT_TEST_LOG="$TMP/docker.log" PATH="$fake_bin:$PATH" \
+    APRILTAG_RVV_DIR="$RVV" APRILTAG_PROFILE_SOURCE_HASH="$profile_hash" \
+    APRILTAG_PACKAGE_TEST_FAIL_STEP=after_pending_header \
+    bash "$script_pkg/scripts/build_rust_lib.sh" --profile-only >/dev/null 2>&1; then
+    echo "absent pending-header rollback unexpectedly succeeded" >&2
+    exit 1
+fi
+test "$(cat "$script_pkg/lib/libapriltag_rvv_profile.a")" = old-archive
+test "$(cat "$script_pkg/lib/rust_apriltag_profile.h")" = old-header
+test "$(cat "$script_pkg/lib/apriltag_scratch.h")" = old-scratch
+test "$(cat "$script_pkg/lib/apriltag_buffer_telemetry.h")" = old-buffer
+test "$(cat "$script_pkg/lib/apriltag_kernel_modes.h")" = old-kernel
+test ! -e "$script_pkg/lib/apriltag_pending_profile.h"
+test "$(cat "$script_pkg/lib/.apriltag_rvv_profile.source-hash")" = old-stamp
+
+for failure_step in after_archive after_profile_header after_scratch_header \
+    after_buffer_header after_kernel_header after_pending_header after_stamp; do
     printf old-archive >"$script_pkg/lib/libapriltag_rvv_profile.a"
     printf old-header >"$script_pkg/lib/rust_apriltag_profile.h"
+    printf old-scratch >"$script_pkg/lib/apriltag_scratch.h"
+    printf old-buffer >"$script_pkg/lib/apriltag_buffer_telemetry.h"
+    printf old-pending >"$script_pkg/lib/apriltag_pending_profile.h"
     printf '%s\n' old-stamp >"$script_pkg/lib/.apriltag_rvv_profile.source-hash"
     if BUILD_SCRIPT_TEST_LOG="$TMP/docker.log" PATH="$fake_bin:$PATH" \
         APRILTAG_RVV_DIR="$RVV" APRILTAG_PROFILE_SOURCE_HASH="$profile_hash" \
@@ -349,11 +590,17 @@ for failure_step in after_archive after_header after_stamp; do
     fi
     test "$(cat "$script_pkg/lib/libapriltag_rvv_profile.a")" = old-archive
     test "$(cat "$script_pkg/lib/rust_apriltag_profile.h")" = old-header
+    test "$(cat "$script_pkg/lib/apriltag_scratch.h")" = old-scratch
+    test "$(cat "$script_pkg/lib/apriltag_buffer_telemetry.h")" = old-buffer
+    test "$(cat "$script_pkg/lib/apriltag_pending_profile.h")" = old-pending
     test "$(cat "$script_pkg/lib/.apriltag_rvv_profile.source-hash")" = old-stamp
 done
 
 printf old-archive >"$script_pkg/lib/libapriltag_rvv_profile.a"
 printf old-header >"$script_pkg/lib/rust_apriltag_profile.h"
+printf old-scratch >"$script_pkg/lib/apriltag_scratch.h"
+printf old-buffer >"$script_pkg/lib/apriltag_buffer_telemetry.h"
+printf old-pending >"$script_pkg/lib/apriltag_pending_profile.h"
 printf '%s\n' old-stamp >"$script_pkg/lib/.apriltag_rvv_profile.source-hash"
 signal_ready="$TMP/signal-ready"
 BUILD_SCRIPT_TEST_LOG="$TMP/docker.log" PATH="$fake_bin:$PATH" \
@@ -374,6 +621,9 @@ if wait "$signal_pid"; then
 fi
 test "$(cat "$script_pkg/lib/libapriltag_rvv_profile.a")" = old-archive
 test "$(cat "$script_pkg/lib/rust_apriltag_profile.h")" = old-header
+test "$(cat "$script_pkg/lib/apriltag_scratch.h")" = old-scratch
+test "$(cat "$script_pkg/lib/apriltag_buffer_telemetry.h")" = old-buffer
+test "$(cat "$script_pkg/lib/apriltag_pending_profile.h")" = old-pending
 test "$(cat "$script_pkg/lib/.apriltag_rvv_profile.source-hash")" = old-stamp
 
 # A reader honoring the package lock cannot observe the invalidated stamp or
@@ -409,6 +659,9 @@ unset APRILTAG_PACKAGE_TEST_RELEASE_FILE
 
 APRILTAG_PACKAGING_HEADER_ONLY=1 APRILTAG_WORKLOAD_HEADER="$RVV/include/apriltag_workload.h" \
     APRILTAG_PROFILE_HEADER="$RVV/include/apriltag_profile.h" \
+    APRILTAG_PENDING_HEADER="$RVV/include/apriltag_pending_profile.h" \
+    APRILTAG_SCRATCH_HEADER="$RVV/include/apriltag_scratch.h" \
+    APRILTAG_BUFFER_HEADER="$RVV/include/apriltag_buffer_telemetry.h" \
     bash "$PKG_DIR/scripts/test_rust_packaging.sh"
 
 # Verify copied-package freshness and force semantics with a fully isolated fake
@@ -417,6 +670,7 @@ cat >"$COPIED/scripts/build_rust_lib.sh" <<'EOF'
 #!/bin/bash
 set -euo pipefail
 pkg_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+scratch_header=
 printf '%s\n' "${*:-production}" >>"$PACKAGING_TEST_LOG"
 test "${APRILTAG_PACKAGE_LOCK_HELD:-0}" = 1
 if flock -n "$pkg_dir/lib/.apriltag-rvv-package.lock" true; then
@@ -427,24 +681,37 @@ case "${1:-}" in
     --workload-only)
         archive=libapriltag_rvv_workload.a
         header=rust_apriltag_workload.h
+        scratch_header=apriltag_scratch.h
+        buffer_header=apriltag_buffer_telemetry.h
         stamp=.apriltag_rvv_workload.source-hash
         hash=$APRILTAG_WORKLOAD_SOURCE_HASH
         ;;
     --profile-only)
         archive=libapriltag_rvv_profile.a
         header=rust_apriltag_profile.h
+        scratch_header=apriltag_scratch.h
+        buffer_header=apriltag_buffer_telemetry.h
+        pending_header=apriltag_pending_profile.h
         stamp=.apriltag_rvv_profile.source-hash
         hash=$APRILTAG_PROFILE_SOURCE_HASH
         ;;
     *)
         archive=libapriltag_rvv.a
         header=
+        scratch_header=apriltag_scratch.h
+        buffer_header=apriltag_buffer_telemetry.h
         stamp=.apriltag_rvv.source-hash
         hash=$APRILTAG_SOURCE_HASH
         ;;
 esac
 printf '%s' "$archive" >"$pkg_dir/lib/$archive"
 test -z "$header" || printf '%s' "$header" >"$pkg_dir/lib/$header"
+test -z "$scratch_header" || cp "$APRILTAG_RVV_DIR/include/apriltag_scratch.h" \
+    "$pkg_dir/lib/$scratch_header"
+test -z "${buffer_header:-}" || cp "$APRILTAG_RVV_DIR/include/apriltag_buffer_telemetry.h" \
+    "$pkg_dir/lib/$buffer_header"
+test -z "${pending_header:-}" || cp "$APRILTAG_RVV_DIR/include/apriltag_pending_profile.h" \
+    "$pkg_dir/lib/$pending_header"
 cp "$APRILTAG_RVV_DIR/include/apriltag_kernel_modes.h" \
     "$pkg_dir/lib/apriltag_kernel_modes.h"
 printf '%s\n' "$hash" >"$pkg_dir/lib/$stamp"
@@ -455,9 +722,15 @@ chmod +x "$COPIED/scripts/build_rust_lib.sh"
 printf production >"$COPIED/lib/libapriltag_rvv.a"
 printf workload >"$COPIED/lib/libapriltag_rvv_workload.a"
 printf workload-header >"$COPIED/lib/rust_apriltag_workload.h"
+printf profile >"$COPIED/lib/libapriltag_rvv_profile.a"
+printf profile-header >"$COPIED/lib/rust_apriltag_profile.h"
+cp "$RVV/include/apriltag_scratch.h" "$COPIED/lib/apriltag_scratch.h"
+cp "$RVV/include/apriltag_buffer_telemetry.h" "$COPIED/lib/apriltag_buffer_telemetry.h"
 cp "$RVV/include/apriltag_kernel_modes.h" "$COPIED/lib/apriltag_kernel_modes.h"
+cp "$RVV/include/apriltag_pending_profile.h" "$COPIED/lib/apriltag_pending_profile.h"
 printf '%s\n' "$production_hash" >"$COPIED/lib/.apriltag_rvv.source-hash"
 printf '%s\n' "$workload_hash" >"$COPIED/lib/.apriltag_rvv_workload.source-hash"
+printf '%s\n' "$profile_hash" >"$COPIED/lib/.apriltag_rvv_profile.source-hash"
 cat >>"$TMP/hash.mk" <<EOF
 PACKAGING_TEST_LOG := $TMP/build.log
 export PACKAGING_TEST_LOG
@@ -473,8 +746,15 @@ $COPIED/run-force-profile-hook:
 	\$(eval APRILTAG_DEMO_FORCE_PROFILE_REBUILD := YES)
 	\$(APRILTAG_DEMO_BUILD_RUST_LIB)
 EOF
+rm "$COPIED/lib/apriltag_pending_profile.h"
+production_before="$(sha256sum "$COPIED/lib/libapriltag_rvv.a")"
+workload_before="$(sha256sum "$COPIED/lib/libapriltag_rvv_workload.a")"
 make -s -f "$TMP/hash.mk" "$COPIED/run-hook"
 test "$(cat "$TMP/build.log")" = --profile-only
+test "$(sha256sum "$COPIED/lib/libapriltag_rvv.a")" = "$production_before"
+test "$(sha256sum "$COPIED/lib/libapriltag_rvv_workload.a")" = "$workload_before"
+cmp "$RVV/include/apriltag_pending_profile.h" \
+    "$COPIED/lib/apriltag_pending_profile.h"
 test "$(cat "$COPIED/lib/.apriltag_rvv_profile.source-hash")" = "$profile_hash"
 make -s -f "$TMP/hash.mk" "$COPIED/run-hook"
 test "$(wc -l <"$TMP/build.log")" -eq 1
@@ -487,5 +767,7 @@ test "$(wc -l <"$TMP/build.log")" -eq 3
 make -s -f "$TMP/hash.mk" "$COPIED/run-force-profile-hook"
 test "$(tail -n 1 "$TMP/build.log")" = --profile-only
 test "$(wc -l <"$TMP/build.log")" -eq 4
+
+bash "$PKG_DIR/tests/test_verify_benchmark_build.sh"
 
 echo "Rust production/workload/profile packaging tests passed"

@@ -770,11 +770,37 @@ validate_ablation_log()
     awk -v stages="$stages" -v mask="$expected_mask" -v detections="$expected_detections" \
         -v checksum="$expected_checksum" -v profile="$require_profile" '
       function f(n,i,a){for(i=1;i<=NF;i++){split($i,a,"=");if(a[1]==n)return a[2]}return ""}
+      function fail(){bad=1}
+      function exact(n,kind,    i,a,v,hits){for(i=1;i<=NF;i++){split($i,a,"=");if(a[1]==n){hits++;v=a[2]}}if(hits!=1)fail();return v}
+      function uint(n,kind,    v){v=exact(n,kind);if(v!~/^[0-9]+$/){fail();return ""}return norm(v)}
+      function norm(v){sub(/^0+/,"",v);return v==""?"0":v}
+      function less(a,b){a=norm(a);b=norm(b);return length(a)<length(b)||(length(a)==length(b)&&a<b)}
+      function mul_decimal(a,b,    i,j,carry,out,digit,product){
+        a=norm(a);b=norm(b);delete product
+        for(i=length(a);i>0;i--)for(j=length(b);j>0;j--)product[i+j]+=substr(a,i,1)*substr(b,j,1)
+        carry=0;out=""
+        for(i=length(a)+length(b);i>1;i--){digit=product[i]+carry;out=(digit%10) out;carry=int(digit/10)}
+        while(carry){out=(carry%10) out;carry=int(carry/10)}
+        return norm(out)
+      }
       /^RESULT / {results++; if(f("backend")!="rust-rvv"||f("stages")!=stages||f("rvv_mask")!=mask||f("detections")!=detections||f("checksum")!=checksum)bad=1}
       /^STAGE / {stage++; if(f("backend")!="rust-rvv"||f("stages")!=stages||f("rvv_mask")!=mask)bad=1}
       /^CCL_WORK / {work++; if(f("backend")!="rust-rvv"||f("stages")!=stages||f("rvv_mask")!=mask)bad=1}
+      /^CCL_SCRATCH / {
+        scratch++
+        if(exact("backend","CCL_SCRATCH")!="rust-rvv"||exact("stages","CCL_SCRATCH")!=stages||exact("rvv_mask","CCL_SCRATCH")!=mask||uint("version","CCL_SCRATCH")!="1"||uint("struct_size","CCL_SCRATCH")!="256"||exact("validity","CCL_SCRATCH")!="0x1")fail()
+        split("pending diagonal_left diagonal_right",buffers," ")
+        for(j=1;j<=3;j++){
+          p=buffers[j];len[p]=uint(p "_len","CCL_SCRATCH");cap[p]=uint(p "_capacity","CCL_SCRATCH");high[p]=uint(p "_high_water","CCL_SCRATCH")
+          growth[p]=uint(p "_growths_call","CCL_SCRATCH");total[p]=uint(p "_growths_total","CCL_SCRATCH");cap_bytes[p]=uint(p "_capacity_bytes","CCL_SCRATCH");high_bytes[p]=uint(p "_high_water_bytes","CCL_SCRATCH");element[p]=uint(p "_element_size","CCL_SCRATCH")
+          if(growth[p]!="0"||element[p]=="0"||less(cap[p],len[p])||less(cap[p],high[p])||less(high[p],len[p])||cap_bytes[p]!=mul_decimal(cap[p],element[p])||high_bytes[p]!=mul_decimal(high[p],element[p]))fail()
+        }
+      }
       /^CCL_TIMER_HEALTH / {health++; if(f("backend")!="rust-rvv"||f("stages")!=stages||f("rvv_mask")!=mask||f("diagnostic_included")!="1")bad=1}
-      END {exit !(results==1&&!bad&&(!profile||(stage>0&&work==1&&health==1)))}' "$file"
+      END {
+        if(!(results==1&&!bad&&(!profile||(stage>0&&work==1&&scratch==1&&health==1))))exit 1
+        if(profile)printf "%s %s %s %s %s %s %s %s %s %s %s %s %s %s %s\n",cap["pending"],high["pending"],total["pending"],cap_bytes["pending"],high_bytes["pending"],cap["diagonal_left"],high["diagonal_left"],total["diagonal_left"],cap_bytes["diagonal_left"],high_bytes["diagonal_left"],cap["diagonal_right"],high["diagonal_right"],total["diagonal_right"],cap_bytes["diagonal_right"],high_bytes["diagonal_right"]
+      }' "$file"
 }
 
 write_ablation_summary()
@@ -817,11 +843,14 @@ write_ablation_summary()
             echo "error: $label output metadata does not match configured stages '$stages'" >&2
             return 1
         fi
-        validate_ablation_log "$dir/profile.log" "$stages" "$production_mask" \
+        scratch_fields=$(validate_ablation_log "$dir/profile.log" "$stages" "$production_mask" \
             "$production_detections" "$production_checksum" 1 || {
             echo "error: $label profile metadata/output does not match production benchmark" >&2
             return 1
-        }
+        })
+        set -- $scratch_fields
+        [ "$#" -eq 15 ] || { echo "error: $label malformed validated CCL_SCRATCH summary" >&2; return 1; }
+        validated_scratch_fields=$*
         instrumented_mean=$(awk '
           function f(n,i,a){for(i=1;i<=NF;i++){split($i,a,"=");if(a[1]==n)return a[2]}}
           /^RESULT / {print f("mean_ms");exit}' "$dir/profile.log")
@@ -874,6 +903,9 @@ write_ablation_summary()
             "${1:-n/a}" "${2:-n/a}" "$threshold_checksum" >>"$summary"
         printf ' timer_mean_unattributed_ratio_pct=%s timer_max_unattributed_ratio_pct=%s timer_warning=%s' \
             "$timer_mean" "$timer_max" "$timer_warning" >>"$summary"
+        set -- $validated_scratch_fields
+        printf ' pending_capacity=%s pending_high_water=%s pending_growths_total=%s pending_capacity_bytes=%s pending_high_water_bytes=%s left_capacity=%s left_high_water=%s left_growths_total=%s left_capacity_bytes=%s left_high_water_bytes=%s right_capacity=%s right_high_water=%s right_growths_total=%s right_capacity_bytes=%s right_high_water_bytes=%s' \
+            "$@" >>"$summary"
         perf_fields=$(awk '/^RESULT / { for(i=1;i<=NF;i++){split($i,a,"=");if(a[1]=="calls")m=a[2];if(a[1]=="warmup")w=a[2]} print m,w; exit}' "$dir/perf.log" 2>/dev/null || true)
         set -- $perf_fields
         perf_measured=${1:-0}; perf_warmup=${2:-0}
@@ -935,6 +967,15 @@ validate_input_records()
       function decimal_exact(n,kind,    v){v=field_exact(n,kind);if(v!~/^[0-9]+$/){fail(kind " field " n " is not an unsigned integer");return ""}return normalize_decimal(v)}
       function mean_exact(n,kind,    v){v=field_exact(n,kind);if(v!~/^[0-9]+([.][0-9]+)?$/){fail(kind " field " n " is not numeric");return ""}return v}
       function normalize_decimal(v){sub(/^0+/,"",v);return v==""?"0":v}
+      function decimal_less(a,b){a=normalize_decimal(a);b=normalize_decimal(b);return length(a)<length(b)||(length(a)==length(b)&&a<b)}
+      function mul_decimal(a,b,    i,j,carry,out,digit,product){
+        a=normalize_decimal(a);b=normalize_decimal(b);delete product
+        for(i=length(a);i>0;i--)for(j=length(b);j>0;j--)product[i+j]+=substr(a,i,1)*substr(b,j,1)
+        carry=0;out=""
+        for(i=length(a)+length(b);i>1;i--){digit=product[i]+carry;out=(digit%10) out;carry=int(digit/10)}
+        while(carry){out=(carry%10) out;carry=int(carry/10)}
+        return normalize_decimal(out)
+      }
       function add_decimal(a,b,    carry,out,i,j,x,y,t){
         a=normalize_decimal(a);b=normalize_decimal(b);i=length(a);j=length(b)
         while(i>0||j>0||carry){x=i>0?substr(a,i--,1)+0:0;y=j>0?substr(b,j--,1)+0:0;t=x+y+carry;out=(t%10) out;carry=int(t/10)}
@@ -961,6 +1002,24 @@ validate_input_records()
         if(points!=work_points)fail("CCL_WORK emitted sum differs from WORKLOAD boundary_points_emitted")
         next
       }
+      FILENAME==ARGV[3]&&/^CCL_SCRATCH / {
+        b=field_exact("backend","CCL_SCRATCH");count("ccl-scratch",b);profile_metadata("CCL_SCRATCH")
+        if(decimal_exact("version","CCL_SCRATCH")!="1"||decimal_exact("struct_size","CCL_SCRATCH")!="256"||field_exact("validity","CCL_SCRATCH")!="0x1")fail("CCL_SCRATCH ABI is incompatible")
+        split("pending diagonal_left diagonal_right",buffers," ")
+        for(i=1;i<=3;i++){
+          p=buffers[i]
+          scratch_len[p]=decimal_exact(p "_len","CCL_SCRATCH")
+          scratch_capacity[p]=decimal_exact(p "_capacity","CCL_SCRATCH")
+          scratch_high_water[p]=decimal_exact(p "_high_water","CCL_SCRATCH")
+          if(decimal_exact(p "_growths_call","CCL_SCRATCH")!="0")fail("CCL_SCRATCH " p " grew during measured calls")
+          scratch_growths[p]=decimal_exact(p "_growths_total","CCL_SCRATCH")
+          scratch_capacity_bytes[p]=decimal_exact(p "_capacity_bytes","CCL_SCRATCH")
+          scratch_high_water_bytes[p]=decimal_exact(p "_high_water_bytes","CCL_SCRATCH")
+          scratch_element[p]=decimal_exact(p "_element_size","CCL_SCRATCH")
+          if(scratch_element[p]=="0"||decimal_less(scratch_capacity[p],scratch_len[p])||decimal_less(scratch_capacity[p],scratch_high_water[p])||decimal_less(scratch_high_water[p],scratch_len[p])||scratch_capacity_bytes[p]!=mul_decimal(scratch_capacity[p],scratch_element[p])||scratch_high_water_bytes[p]!=mul_decimal(scratch_high_water[p],scratch_element[p]))fail("CCL_SCRATCH " p " capacity/byte invariant failed")
+        }
+        next
+      }
       FILENAME==ARGV[3]&&/^CCL_TIMER_HEALTH / {b=field_exact("backend","CCL_TIMER_HEALTH");count("timer-health",b);profile_metadata("CCL_TIMER_HEALTH");next}
       END {
         split("rust-rvv rust-scalar c-reference",required," ")
@@ -968,17 +1027,25 @@ validate_input_records()
         if(seen["profile-result" SUBSEP "rust-rvv"]!=1)fail("missing profile RESULT")
         if(group==""||root=="")fail("missing required group_emit/root_materialize STAGE")
         if(seen["ccl-work" SUBSEP "rust-rvv"]!=1)fail("missing CCL_WORK")
+        if(seen["ccl-scratch" SUBSEP "rust-rvv"]!=1)fail("missing CCL_SCRATCH")
         if(seen["timer-health" SUBSEP "rust-rvv"]!=1)fail("missing CCL_TIMER_HEALTH")
-        if(!bad)printf "%s %s %s %s %s %s %s %s %s %s %s %s %s %s %s %s\n",hash,width,height,mean["rust-rvv"],mean["rust-scalar"],mean["c-reference"],det["rust-rvv"],sum["rust-rvv"],profile_mean,group,root,runs,pending,accepted,keys,points
+        if(!bad)printf "%s %s %s %s %s %s %s %s %s %s %s %s %s %s %s %s %s %s %s %s %s %s %s %s %s %s %s %s %s %s %s\n",hash,width,height,mean["rust-rvv"],mean["rust-scalar"],mean["c-reference"],det["rust-rvv"],sum["rust-rvv"],profile_mean,group,root,runs,pending,accepted,keys,points,scratch_capacity["pending"],scratch_high_water["pending"],scratch_growths["pending"],scratch_capacity_bytes["pending"],scratch_high_water_bytes["pending"],scratch_capacity["diagonal_left"],scratch_high_water["diagonal_left"],scratch_growths["diagonal_left"],scratch_capacity_bytes["diagonal_left"],scratch_high_water_bytes["diagonal_left"],scratch_capacity["diagonal_right"],scratch_high_water["diagonal_right"],scratch_growths["diagonal_right"],scratch_capacity_bytes["diagonal_right"],scratch_high_water_bytes["diagonal_right"]
         exit bad
       }' "$RESULT_DIR/comparison.log" "$RESULT_DIR/workload.log" "$RESULT_DIR/ccl-profile.log") || return 1
     set -- $metadata
-    [ "$#" -eq 16 ] || { echo "error: input $label: malformed validated metadata" >&2; return 1; }
+    [ "$#" -eq 31 ] || { echo "error: input $label: malformed validated metadata" >&2; return 1; }
     INPUT_HASH=$1; INPUT_WIDTH=$2; INPUT_HEIGHT=$3
     RVV_MEAN=$4; SCALAR_MEAN=$5; C_MEAN=$6; INPUT_DETECTIONS=$7; INPUT_CHECKSUM=$8
     PROFILE_MEAN=$9; shift 9
     GROUP_EMIT_MEAN=$1; ROOT_MATERIALIZE_MEAN=$2; CCL_RUNS=$3; CCL_PENDING=$4
     CCL_ACCEPTED=$5; CCL_KEYS=$6; CCL_POINTS=$7
+    shift 7
+    PENDING_CAPACITY=$1; PENDING_HIGH_WATER=$2; PENDING_GROWTHS_TOTAL=$3
+    PENDING_CAPACITY_BYTES=$4; PENDING_HIGH_WATER_BYTES=$5
+    LEFT_CAPACITY=$6; LEFT_HIGH_WATER=$7; LEFT_GROWTHS_TOTAL=$8
+    LEFT_CAPACITY_BYTES=$9; shift 9
+    LEFT_HIGH_WATER_BYTES=$1; RIGHT_CAPACITY=$2; RIGHT_HIGH_WATER=$3
+    RIGHT_GROWTHS_TOTAL=$4; RIGHT_CAPACITY_BYTES=$5; RIGHT_HIGH_WATER_BYTES=$6
 
     rvv_call_fields=$(awk -v label="$label" '
       function exact(n,    i,a,v,hits){for(i=1;i<=NF;i++){split($i,a,"=");if(a[1]==n){hits++;v=a[2]}}if(hits!=1)fail("RESULT field " n " must occur exactly once");return v}
@@ -1045,11 +1112,15 @@ validate_backend_result_log()
 append_cross_input_record()
 {
     label=$1 file_hash=$2
-    printf 'INPUT label=%s file_sha256=%s input_hash=%s width=%s height=%s rust_rvv_mean_ms=%s rust_scalar_mean_ms=%s c_reference_mean_ms=%s detections=%s checksum=%s instrumented_mean_ms=%s group_emit_mean_ns=%s root_materialize_mean_ns=%s runs=%s pending=%s accepted=%s keys=%s points=%s cycles_per_call=%s instructions_per_call=%s branches_per_call=%s branch_misses_per_call=%s\n' \
+    printf 'INPUT label=%s file_sha256=%s input_hash=%s width=%s height=%s rust_rvv_mean_ms=%s rust_scalar_mean_ms=%s c_reference_mean_ms=%s detections=%s checksum=%s instrumented_mean_ms=%s group_emit_mean_ns=%s root_materialize_mean_ns=%s runs=%s pending=%s accepted=%s keys=%s points=%s pending_capacity=%s pending_high_water=%s pending_growths_total=%s pending_capacity_bytes=%s pending_high_water_bytes=%s left_capacity=%s left_high_water=%s left_growths_total=%s left_capacity_bytes=%s left_high_water_bytes=%s right_capacity=%s right_high_water=%s right_growths_total=%s right_capacity_bytes=%s right_high_water_bytes=%s cycles_per_call=%s instructions_per_call=%s branches_per_call=%s branch_misses_per_call=%s\n' \
         "$label" "$file_hash" "$INPUT_HASH" "$INPUT_WIDTH" "$INPUT_HEIGHT" "$RVV_MEAN" \
         "$SCALAR_MEAN" "$C_MEAN" "$INPUT_DETECTIONS" "$INPUT_CHECKSUM" "$PROFILE_MEAN" \
         "$GROUP_EMIT_MEAN" "$ROOT_MATERIALIZE_MEAN" "$CCL_RUNS" "$CCL_PENDING" \
-        "$CCL_ACCEPTED" "$CCL_KEYS" "$CCL_POINTS" "$RVV_CYCLES_PER_CALL" \
+        "$CCL_ACCEPTED" "$CCL_KEYS" "$CCL_POINTS" "$PENDING_CAPACITY" "$PENDING_HIGH_WATER" \
+        "$PENDING_GROWTHS_TOTAL" "$PENDING_CAPACITY_BYTES" "$PENDING_HIGH_WATER_BYTES" \
+        "$LEFT_CAPACITY" "$LEFT_HIGH_WATER" "$LEFT_GROWTHS_TOTAL" "$LEFT_CAPACITY_BYTES" \
+        "$LEFT_HIGH_WATER_BYTES" "$RIGHT_CAPACITY" "$RIGHT_HIGH_WATER" "$RIGHT_GROWTHS_TOTAL" \
+        "$RIGHT_CAPACITY_BYTES" "$RIGHT_HIGH_WATER_BYTES" "$RVV_CYCLES_PER_CALL" \
         "$RVV_INSTRUCTIONS_PER_CALL" "$RVV_BRANCHES_PER_CALL" \
         "$RVV_BRANCH_MISSES_PER_CALL" >>"$CROSS_SUMMARY_TMP"
 }
@@ -1249,6 +1320,28 @@ stage_mean=30
 [ "${MATRIX_FAILURE:-}" != malformed-stage-mean ] || stage_mean=bad
 [ "${MATRIX_FAILURE:-}" = stage-missing ] || echo "STAGE backend=$stage_backend rvv_mask=$profile_mask stages=$profile_stages stage=group_emit count=100 min_ns=10 median_ns=20 mean_ns=$stage_mean p95_ns=40 max_ns=50$stage_extra"
 echo "STAGE backend=rust-rvv rvv_mask=$profile_mask stages=$profile_stages stage=root_materialize count=100 min_ns=11 median_ns=21 mean_ns=31 p95_ns=41 max_ns=51"
+case $input in
+  *second.y8) pc=9007199254741003;ph=9007199254741002;plen=9007199254741001;pg=7;pcb=144115188075856048;phb=144115188075856032;lc=102;lh=82;lg=5;lcb=2448;lhb=1968;rc=112;rh=92;rg=6;rcb=2688;rhb=2208;;
+  *) pc=201;ph=181;pg=4;pcb=3216;phb=2896;lc=101;lh=81;lg=2;lcb=2424;lhb=1944;rc=111;rh=91;rg=3;rcb=2664;rhb=2184;;
+esac
+scratch_extra=
+[ "${MATRIX_FAILURE:-}" != duplicate-scratch-field ] || scratch_extra=' pending_capacity=999'
+[ "${MATRIX_FAILURE:-}" != malformed-scratch-field ] || pc=bad
+[ "${MATRIX_FAILURE:-}" != scratch-abi ] || scratch_version=2
+[ "${MATRIX_FAILURE:-}" != scratch-size ] || scratch_size=255
+[ "${MATRIX_FAILURE:-}" != scratch-growth ] || pending_growth=1
+[ "${MATRIX_FAILURE:-}" != scratch-capacity-len ] || pc=99
+[ "${MATRIX_FAILURE:-}" != scratch-capacity-high-water ] || ph=202
+[ "${MATRIX_FAILURE:-}" != scratch-element-zero ] || pending_element=0
+[ "${MATRIX_FAILURE:-}" != scratch-high-water-len ] || { ph=99; phb=1584; }
+[ "${MATRIX_FAILURE:-}" != scratch-capacity-bytes ] || pcb=3217
+[ "${MATRIX_FAILURE:-}" != scratch-high-water-bytes ] || phb=2897
+: "${scratch_version:=1}"
+: "${scratch_size:=256}" "${pending_growth:=0}" "${pending_element:=16}" "${plen:=100}"
+scratch_record="CCL_SCRATCH backend=rust-rvv rvv_mask=$profile_mask stages=$profile_stages version=$scratch_version struct_size=$scratch_size validity=0x1 pending_len=$plen pending_capacity=$pc pending_high_water=$ph pending_growths_call=$pending_growth pending_growths_total=$pg pending_capacity_bytes=$pcb pending_high_water_bytes=$phb pending_element_size=$pending_element diagonal_left_len=40 diagonal_left_capacity=$lc diagonal_left_high_water=$lh diagonal_left_growths_call=0 diagonal_left_growths_total=$lg diagonal_left_capacity_bytes=$lcb diagonal_left_high_water_bytes=$lhb diagonal_left_element_size=24 diagonal_right_len=41 diagonal_right_capacity=$rc diagonal_right_high_water=$rh diagonal_right_growths_call=0 diagonal_right_growths_total=$rg diagonal_right_capacity_bytes=$rcb diagonal_right_high_water_bytes=$rhb diagonal_right_element_size=24$scratch_extra"
+[ "${MATRIX_FAILURE:-}" != scratch-field-missing ] || scratch_record=${scratch_record% diagonal_right_element_size=*}
+[ "${MATRIX_FAILURE:-}" = scratch-missing ] || echo "$scratch_record"
+[ "${MATRIX_FAILURE:-}" != scratch-duplicate ] || echo "$scratch_record"
 [ "${MATRIX_FAILURE:-}" != ccl-pending-mismatch ] || p3=41
 [ "${MATRIX_FAILURE:-}" != ccl-emitted-mismatch ] || e3=111
 ccl_extra=
@@ -1398,6 +1491,8 @@ $whitespace_line"
     grep -q 'label=second .*group_emit_mean_ns=30 .*root_materialize_mean_ns=31' "$matrix_output/cross-input-summary.txt"
     grep -q 'label=first .*runs=42 pending=100 accepted=60 keys=70 points=200' "$matrix_output/cross-input-summary.txt"
     grep -q 'label=second .*runs=52 pending=9007199254741002 accepted=62 keys=72 points=9007199254741013' "$matrix_output/cross-input-summary.txt"
+    grep -q 'label=first .*pending_capacity=201 pending_high_water=181 pending_growths_total=4 pending_capacity_bytes=3216 pending_high_water_bytes=2896 .*left_capacity=101 left_high_water=81 left_growths_total=2 left_capacity_bytes=2424 left_high_water_bytes=1944 .*right_capacity=111 right_high_water=91 right_growths_total=3 right_capacity_bytes=2664 right_high_water_bytes=2184' "$matrix_output/cross-input-summary.txt"
+    grep -q 'label=second .*pending_capacity=9007199254741003 pending_high_water=9007199254741002 pending_growths_total=7 pending_capacity_bytes=144115188075856048 pending_high_water_bytes=144115188075856032 .*left_capacity=102 left_high_water=82 left_growths_total=5 left_capacity_bytes=2448 left_high_water_bytes=1968 .*right_capacity=112 right_high_water=92 right_growths_total=6 right_capacity_bytes=2688 right_high_water_bytes=2208' "$matrix_output/cross-input-summary.txt"
     grep -q 'label=first .*cycles_per_call=1.919386 .*instructions_per_call=3.838772 .*branches_per_call=0.575816 .*branch_misses_per_call=0.058541' "$matrix_output/cross-input-summary.txt"
     grep -q 'label=second .*cycles_per_call=3.838772 .*instructions_per_call=7.677543 .*branches_per_call=1.151631 .*branch_misses_per_call=0.117083' "$matrix_output/cross-input-summary.txt"
     grep -F -q 'Input label: first' "$matrix_output/inputs/first/summary.txt"
@@ -1458,9 +1553,43 @@ $whitespace_line"
         duplicate-workload-field duplicate-stage-field duplicate-ccl-field \
         duplicate-timer-field malformed-result-mean malformed-result-dimension \
         malformed-workload-counter malformed-stage-mean malformed-ccl-counter \
+        scratch-missing scratch-duplicate duplicate-scratch-field malformed-scratch-field scratch-abi \
+        scratch-size scratch-growth scratch-capacity-len scratch-capacity-high-water \
+        scratch-element-zero scratch-field-missing scratch-high-water-len \
+        scratch-capacity-bytes scratch-high-water-bytes \
         timer-health-missing perf-stat-output perf-flat-output perf-stat-missing-counter \
         perf-stat-duplicate-counter perf-stat-malformed-counter; do
         assert_matrix_failure "$matrix_failure"
+    done
+    assert_ablation_scratch_failure()
+    {
+        failure=$1
+        failure_root="$test_root/ablation-scratch-negative-$failure"
+        failure_log="$test_root/ablation-scratch-negative-$failure.log"
+        set +e
+        MATRIX_FAILURE="$failure" PATH="$test_root/bin:$PATH" \
+            APRILTAG_PROFILE_ABLATIONS=1 APRILTAG_ABLATION_WARMUP=0 \
+            APRILTAG_ABLATION_ITERATIONS=1 APRILTAG_ABLATION_BATCHES=1 \
+            APRILTAG_ABLATION_PERF_WARMUP=0 APRILTAG_ABLATION_PERF_ITERATIONS=1 \
+            APRILTAG_ABLATION_PERF_BATCHES=1 \
+            APRILTAG_PROFILE_BENCH="$fake_bench" APRILTAG_PROFILE_STAGE_BENCH="$fake_profile" \
+            APRILTAG_PROFILE_WORKLOAD="$fake_workload" APRILTAG_PROFILE_PERF="$fake_perf" \
+            APRILTAG_PROFILE_FIXTURE="$test_root/fixture" APRILTAG_PROFILE_OUTPUT="$failure_root" \
+            APRILTAG_PROFILE_EVENTS='task-clock,cycles' "$TEST_SHELL" "$0" fast \
+            >"$failure_log" 2>&1
+        rc=$?
+        set -e
+        [ "$rc" -ne 0 ]
+        grep -q 'profile metadata/output does not match production benchmark' "$failure_log"
+        failure_output=$(ls -d "$failure_root"/run-* 2>/dev/null)
+        [ -d "$failure_output/ablations" ]
+    }
+    for scratch_failure in scratch-missing scratch-duplicate duplicate-scratch-field \
+        malformed-scratch-field scratch-abi scratch-size scratch-growth \
+        scratch-capacity-len scratch-capacity-high-water scratch-element-zero \
+        scratch-field-missing scratch-high-water-len scratch-capacity-bytes \
+        scratch-high-water-bytes; do
+        assert_ablation_scratch_failure "$scratch_failure"
     done
     failure_root="$test_root/matrix-negative-perf-callgraph-output"
     set +e

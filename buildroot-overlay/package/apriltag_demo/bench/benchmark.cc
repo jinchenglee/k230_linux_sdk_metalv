@@ -68,7 +68,7 @@ ImageSize parse_size(const char* value)
     return ImageSize::explicit_size(width, height);
 }
 
-void parse_rvv_stages(const std::string& value, BenchmarkConfig& config)
+void parse_rvv_stages_impl(const std::string& value, BenchmarkConfig& config)
 {
     struct Stage { const char* name; std::uint64_t bit; };
     static constexpr Stage stages[] = {
@@ -186,6 +186,11 @@ ImageSize ImageSize::explicit_size(std::size_t width, std::size_t height)
     return {false, width, height};
 }
 
+void parse_rvv_stages(const std::string& value, BenchmarkConfig& config)
+{
+    parse_rvv_stages_impl(value, config);
+}
+
 int validate_detection_count(int count)
 {
     if (count < 0) throw std::runtime_error("detect failed");
@@ -241,7 +246,7 @@ BenchmarkConfig parse_args(int argc, const char* const argv[])
                 throw ArgumentError("--factor must be 1, 1.5, or 2");
             }
         } else if (option == "--rvv-stages") {
-            parse_rvv_stages(require_value(argc, argv, i), config);
+            parse_rvv_stages_impl(require_value(argc, argv, i), config);
         } else if (option == "--min-blob") {
             config.min_blob = parse_integer<std::uint32_t>(
                 require_value(argc, argv, i), "--min-blob", 1);
@@ -358,6 +363,44 @@ PreparedImage load_image(const BenchmarkConfig& config)
         std::memcpy(image.pixels.data() + row * image.width,
                     gray.ptr(static_cast<int>(row)), image.width);
     }
+    validate_image(image.width, image.height, image.stride, image.pixels.size());
+    return image;
+#endif
+}
+
+PreparedImage load_encoded_image(const std::vector<std::uint8_t>& bytes,
+                                 ImageSize size)
+{
+#ifdef APRILTAG_BENCH_NO_OPENCV
+    (void)bytes;
+    (void)size;
+    throw InputError("encoded-image support is unavailable in this build");
+#else
+    if (bytes.empty()) throw InputError("cannot decode empty encoded input");
+    if (bytes.size() > static_cast<std::size_t>(std::numeric_limits<int>::max()))
+        throw InputError("encoded sequence input is too large");
+    const cv::Mat encoded(1, static_cast<int>(bytes.size()), CV_8UC1,
+                          const_cast<std::uint8_t*>(bytes.data()));
+    cv::Mat gray = cv::imdecode(encoded, cv::IMREAD_GRAYSCALE);
+    if (gray.empty()) throw InputError("cannot decode sequence input");
+    if (!size.native) {
+        if (size.width > static_cast<std::size_t>(std::numeric_limits<int>::max()) ||
+            size.height > static_cast<std::size_t>(std::numeric_limits<int>::max()))
+            throw InputError("requested sequence dimensions are too large");
+        cv::Mat resized;
+        cv::resize(gray, resized,
+                   cv::Size(static_cast<int>(size.width), static_cast<int>(size.height)),
+                   0, 0, cv::INTER_LINEAR);
+        gray = resized;
+    }
+    PreparedImage image;
+    image.width = static_cast<std::size_t>(gray.cols);
+    image.height = static_cast<std::size_t>(gray.rows);
+    image.stride = image.width;
+    image.pixels.resize(image.width * image.height);
+    for (std::size_t row = 0; row < image.height; ++row)
+        std::memcpy(image.pixels.data() + row * image.width,
+                    gray.ptr(static_cast<int>(row)), image.width);
     validate_image(image.width, image.height, image.stride, image.pixels.size());
     return image;
 #endif
@@ -505,6 +548,7 @@ int run_benchmark(const BenchmarkConfig& config,
     std::vector<std::vector<std::uint64_t>> samples(backends.size());
 #ifdef APRILTAG_BENCH_PROFILE
     std::vector<std::vector<apriltag_ccl_profile_t>> profiles(backends.size());
+    std::vector<std::vector<apriltag_ccl_scratch_v1_t>> scratches(backends.size());
 #endif
     std::vector<std::vector<double>> batch_means(
         static_cast<std::size_t>(config.batches),
@@ -559,9 +603,12 @@ int run_benchmark(const BenchmarkConfig& config,
                 const std::uint64_t finish = monotonic_raw_ns();
 #ifdef APRILTAG_BENCH_PROFILE
                 apriltag_ccl_profile_t profile{};
+                apriltag_ccl_scratch_v1_t scratch{};
                 try {
-                    if (backends[index]->consume_profile(profile))
+                    if (backends[index]->consume_profile(profile, scratch)) {
                         profiles[index].push_back(profile);
+                        scratches[index].push_back(scratch);
+                    }
                 } catch (const std::exception& error) {
                     throw std::runtime_error(
                         std::string(backends[index]->name()) + " (" +
@@ -702,7 +749,8 @@ int run_benchmark(const BenchmarkConfig& config,
             << " iterations=" << config.iterations
              << " batches=" << config.batches << '\n';
 #ifdef APRILTAG_BENCH_PROFILE
-        if (!profiles[i].empty()) print_profile_report(config, backends[i]->kind(), profiles[i], out);
+        if (!profiles[i].empty()) print_profile_report(
+            config, backends[i]->kind(), profiles[i], scratches[i], out);
 #endif
     }
     out << std::flush;
