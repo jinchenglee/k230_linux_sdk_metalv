@@ -1,0 +1,16 @@
+config BR2_PACKAGE_TINYTAG_DETECT
+    bool "tinytag_detect"
+    select BR2_PACKAGE_GSL_LITE
+    select BR2_PACKAGE_COMMON
+    select BR2_PACKAGE_DISPLAY
+    select BR2_PACKAGE_APRILTAG
+    help
+        AprilTag detector using a small neural network (TinyTag) to propose
+        candidate tag ROIs, then the standard AprilTag C library to decode
+        each ROI crop -- see experimental/tinytag-v4c and
+        experimental/tinytag-v6 (HEADS_AND_POSTPROCESSING.md) in the repo
+        root for the model and its training-side design notes.
+
+        Only the trained heatmap/offset/scale channels (0-4 of the kmodel's
+        21-channel output) are used; corner/visibility channels (5-20) are
+        untrained and deliberately ignored.
