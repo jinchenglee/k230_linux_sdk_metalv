@@ -1,4 +1,5 @@
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
@@ -159,12 +160,34 @@ cv::Mat osd_frame;
 // buffer identity, is the whole fix below -- see the comment at its use.
 static std::atomic<uint64_t> g_overlay_generation(0);
 
+// Latest once-a-second camera/AI fps, for the on-screen "cam:/det:" HUD
+// text (drawn from ai_proc, right after the detection overlay). Written
+// by frame_handler()'s existing FPS block below, which already computes
+// both numbers for its stderr line -- these stores are just an extra
+// write of values it already has, no new computation. Mirrors
+// apriltag_demo.elf's g_cam_fps/g_det_fps (same pattern, same reasoning).
+static std::atomic<double> g_cam_fps(0.0);
+static std::atomic<double> g_det_fps(0.0);
+
 // Box-level IoU suppression threshold (see TinyTagDet's constructor doc).
 // ai_proc only receives `argv`, not `argc`, so it can't tell whether the
 // optional trailing arg was supplied -- main() resolves it once and parks it
 // here rather than duplicating that logic.
 constexpr float kDefaultRoiIouThres = 0.5f;
 static float g_roi_iou_thres = kDefaultRoiIouThres;
+
+// Draw a compact "cam: X.XX, det: X.XX" status line at the bottom-left of
+// the OSD, yellow -- mirrors apriltag_demo.elf's draw_fps_stats(). Values
+// are passed in already computed (see the once-a-second FPS block in
+// frame_handler below), so this is one cheap putText riding along
+// whatever redraw is already happening, no new per-frame computation.
+static void draw_fps_stats(cv::Mat &osd, double cam_fps, double det_fps)
+{
+    char label[64];
+    std::snprintf(label, sizeof(label), "cam: %.2f, det: %.2f", cam_fps, det_fps);
+    cv::putText(osd, label, cv::Point(12, osd.rows - 12), cv::FONT_HERSHEY_SIMPLEX, 0.65,
+                cv::Scalar(0, 255, 255, 255), 2, cv::LINE_8, false);
+}
 
 // CSI capture + inference thread. Mirrors object_detect_yolov8n's ai_proc.
 // Feeds the raw sensor-resolution (1280x720) luma plane straight into
@@ -299,6 +322,8 @@ void ai_proc(char *argv[], int video_device)
         // CV decoder rejected is still visible, not hidden behind nothing.
         TinyTagDet::draw_proposals_scaled(osd_frame, proposals, csi_width, csi_height);
         TinyTagDet::draw_detections_scaled(osd_frame, results, csi_width, csi_height);
+        draw_fps_stats(osd_frame, g_cam_fps.load(std::memory_order_relaxed),
+                       g_det_fps.load(std::memory_order_relaxed));
         g_overlay_generation.fetch_add(1, std::memory_order_release);
         result_mutex.unlock();
 
@@ -422,12 +447,18 @@ int frame_handler(struct v4l2_drm_context *context, bool displayed)
             fprintf(stderr, "display: %.2f, ", display_frame_count * 1000000. / duration);
             display_frame_count = 0;
         }
-        fprintf(stderr, "camera: %.2f, ", context[0].frame_count * 1000000. / duration);
+        double cam_fps = context[0].frame_count * 1000000. / duration;
+        fprintf(stderr, "camera: %.2f, ", cam_fps);
         context[0].frame_count = 0;
-        fprintf(stderr, "AI: %.2f, ", ai_frame_count * 1000000. / duration);
+        double det_fps = ai_frame_count * 1000000. / duration;
+        fprintf(stderr, "AI: %.2f, ", det_fps);
         ai_frame_count = 0;
         fprintf(stderr, "osd: %.2f", osd_staged_count * 1000000. / duration);
         osd_staged_count = 0;
+        // Feed the on-screen "cam:/det:" HUD (drawn from ai_proc) -- same
+        // numbers just printed above, no new work.
+        g_cam_fps.store(cam_fps, std::memory_order_relaxed);
+        g_det_fps.store(det_fps, std::memory_order_relaxed);
         fprintf(stderr, "          \r");
         fflush(stderr);
         gettimeofday(&tv, NULL);

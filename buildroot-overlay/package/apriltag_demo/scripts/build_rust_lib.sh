@@ -97,14 +97,29 @@ case "$OUTPUT_REAL" in
 esac
 
 echo "Building libapriltag_rvv.a in $RVV_DOCKER_IMAGE ..."
+# Cargo registry/git cache: mounted read-write from the host's own cache
+# (the same one `rvv-shell` uses interactively), so repeat builds reuse
+# already-downloaded crates instead of re-fetching them inside a fresh,
+# throwaway container every time -- matters when the network can't reach
+# crates.io from here at all, not just for speed. Runs as the host UID/GID
+# (like `rvv-shell`) rather than root+chown-afterward, so anything cargo
+# writes into that shared cache keeps the host user's ownership -- the
+# previous root+chown approach only fixed ownership on the build output,
+# not on cache writes, which would otherwise leave root-owned files behind
+# for any later non-docker/`rvv-shell` use of the same cache.
+mkdir -p "$HOME/.cargo/registry" "$HOME/.cargo/git"
 docker run --rm \
+    -u "$UID_HOST:$GID_HOST" \
+    -v /etc/passwd:/etc/passwd:ro \
+    -v /etc/group:/etc/group:ro \
     -v "$PARENT":"$PARENT" \
+    -v "$HOME/.cargo/registry":/usr/local/cargo/registry \
+    -v "$HOME/.cargo/git":/usr/local/cargo/git \
     -w "$APRILTAG_RVV_DIR" \
+    -e "HOME=$APRILTAG_RVV_DIR" \
     -e "APRILTAG_CAPI_OUTPUT_ROOT=$OUTPUT_RELATIVE" \
-    -e "APRILTAG_BUILD_UID=$UID_HOST" \
-    -e "APRILTAG_BUILD_GID=$GID_HOST" \
     "$RVV_DOCKER_IMAGE" \
-    bash -c 'set -e; rustup target add riscv64gc-unknown-linux-gnu >/dev/null 2>&1 || true; bash scripts/build-capi.sh "$@"; chown -R "$APRILTAG_BUILD_UID:$APRILTAG_BUILD_GID" "$APRILTAG_CAPI_OUTPUT_ROOT"' \
+    bash -c 'set -e; rustup target add riscv64gc-unknown-linux-gnu >/dev/null 2>&1 || true; bash scripts/build-capi.sh "$@"' \
     bash "${RVV_ARGS[@]}"
 
 case "$MODE" in

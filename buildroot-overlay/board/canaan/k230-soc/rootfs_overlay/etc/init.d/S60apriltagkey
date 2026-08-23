@@ -1,0 +1,218 @@
+#!/bin/sh
+#
+# Watches the 01studio board's physical "KEY" button and uses it to pick
+# between the two on-device AprilTag demos, plus (while apriltag_demo is
+# the one running) cycle its live pipeline view:
+#   - single press:
+#       - nothing running, or tinytag_detect running: launch
+#         tinytag_detect.elf (no-op if it's already running)
+#       - apriltag_demo running: advance its live pipeline view (normal ->
+#         debug 1 -> 2 -> 3 -> 4 -> 5 -> normal -> ...) via SIGUSR1 --
+#         does NOT switch apps
+#   - double-click: launch apriltag_demo.elf (no-op if already running)
+#   - long press (held >= LONG_PRESS_S): stop whichever is running
+# Launching one app always stops the other first -- only one can hold the
+# camera/display at a time. apriltag_demo is launched with --debug so its
+# view-cycling is actually enabled (see main.cc's
+# handle_view_cycle_signal(), the SIGUSR1 handler this script drives).
+#
+# GPIO fact (from the 01studio schematic, confirmed live on a board): the
+# KEY switch is wired to gpiochip0 line 21, idle-high via a pull-up,
+# pulled to GND while pressed -- i.e. an active-low edge.
+#
+# 01studio only -- see is_01studio() below; this file is installed via
+# the SHARED board/canaan/k230-soc/rootfs_overlay, so every defconfig
+# using that overlay boots it, but it's a silent no-op everywhere else.
+#
+# No auto-login is needed for this to work: it's a normal root-owned
+# background service started from init, entirely independent of any
+# interactive console session. Both apps degrade gracefully with no
+# controlling terminal (their TerminalRawMode-style helper only activates
+# when stdin is a tty), so launched this way they just lose their
+# interactive keyboard shortcuts -- irrelevant here, since the KEY button
+# drives them instead.
+
+APRILTAG_DIR=/root/app/apriltag_demo
+APRILTAG_BIN=./apriltag_demo.elf
+APRILTAG_ARGS="--rvv --factor 2 --debug"
+APRILTAG_PIDFILE=/var/run/apriltag_demo.pid
+APRILTAG_LOGFILE=/var/log/apriltag_demo.log
+
+TINYTAG_DIR=/root/app/tinytag_detect
+TINYTAG_BIN=./tinytag_detect.elf
+TINYTAG_ARGS="tinytag-v11_k230-v4c.int8.kmodel None 0.20 20 1.5 0"
+TINYTAG_PIDFILE=/var/run/tinytag_detect.pid
+TINYTAG_LOGFILE=/var/log/tinytag_detect.log
+
+WATCH_PIDFILE=/var/run/apriltag_key_watch.pid
+GPIOCHIP=gpiochip0
+GPIOLINE=21
+LONG_PRESS_S=0.8
+DOUBLE_CLICK_S=0.4
+
+is_01studio() {
+    grep -q 01studio /proc/device-tree/compatible 2>/dev/null
+}
+
+is_running() {
+    [ -f "$1" ] && kill -0 "$(cat "$1")" 2>/dev/null
+}
+
+# Stop whatever's tracked in the given pidfile, waiting (briefly) for a
+# clean exit so the camera/display are released before anything else
+# tries to open them.
+stop_one() {
+    pidfile=$1
+    if is_running "$pidfile"; then
+        pid="$(cat "$pidfile")"
+        kill "$pid" 2>/dev/null
+        i=0
+        while [ $i -lt 20 ] && kill -0 "$pid" 2>/dev/null; do
+            sleep 0.1
+            i=$((i + 1))
+        done
+    fi
+    rm -f "$pidfile"
+}
+
+stop_current() {
+    stop_one "$APRILTAG_PIDFILE"
+    stop_one "$TINYTAG_PIDFILE"
+}
+
+launch_tinytag() {
+    is_running "$TINYTAG_PIDFILE" && return
+    stop_one "$APRILTAG_PIDFILE"
+    rm -f "$TINYTAG_PIDFILE"
+    # The `exec` inside the subshell replaces the subshell's own process
+    # image with the app itself, so `$!` below is the app's own pid (not
+    # a wrapper shell's) -- needed for kill/kill -0 to find the right
+    # process.
+    (cd "$TINYTAG_DIR" && exec "$TINYTAG_BIN" $TINYTAG_ARGS) >>"$TINYTAG_LOGFILE" 2>&1 &
+    echo $! >"$TINYTAG_PIDFILE"
+}
+
+launch_apriltag() {
+    is_running "$APRILTAG_PIDFILE" && return
+    stop_one "$TINYTAG_PIDFILE"
+    rm -f "$APRILTAG_PIDFILE"
+    (cd "$APRILTAG_DIR" && exec "$APRILTAG_BIN" $APRILTAG_ARGS) >>"$APRILTAG_LOGFILE" 2>&1 &
+    echo $! >"$APRILTAG_PIDFILE"
+}
+
+watch_loop() {
+    while true; do
+        if ! gpiomon --bias=pull-up --edges=falling --num-events=1 \
+                -c "$GPIOCHIP" "$GPIOLINE" >/dev/null 2>&1; then
+            # gpiomon failed outright (e.g. the GPIO line is already held
+            # by another process -- this has happened in practice when a
+            # previous instance of this same script wasn't fully killed
+            # before a restart). Without this check the loop would spin
+            # as fast as gpiomon can fail, flooding the process table
+            # with debounce/timer sleep children instead of just waiting
+            # quietly for the line to free up.
+            sleep 1
+            continue
+        fi
+
+        # Long-press detection without needing sub-second-precision
+        # timestamps: race a blocking wait-for-release against a
+        # fixed-length background timer. Whichever finishes first wins;
+        # the loser is killed. See the double-click race just below for
+        # the same pattern applied to the OTHER gesture.
+        gpiomon --bias=pull-up --edges=rising --num-events=1 \
+            -c "$GPIOCHIP" "$GPIOLINE" >/dev/null 2>&1 &
+        release_pid=$!
+        (sleep "$LONG_PRESS_S"; kill -TERM "$release_pid" 2>/dev/null) &
+        timer_pid=$!
+        wait "$release_pid"
+        release_rc=$?
+        kill "$timer_pid" 2>/dev/null
+        wait "$timer_pid" 2>/dev/null
+
+        if [ "$release_rc" -ne 0 ]; then
+            # Still held past the threshold: a long press.
+            stop_current
+            # The button is still physically held; block until the real
+            # release so the line is free again before the next loop
+            # iteration re-claims it.
+            gpiomon --bias=pull-up --edges=rising --num-events=1 \
+                -c "$GPIOCHIP" "$GPIOLINE" >/dev/null 2>&1
+            sleep 0.3
+            continue
+        fi
+
+        # Released before the long-press threshold: this was a quick
+        # click. Race a second press against the double-click window to
+        # tell a single click from a double-click.
+        gpiomon --bias=pull-up --edges=falling --num-events=1 \
+            -c "$GPIOCHIP" "$GPIOLINE" >/dev/null 2>&1 &
+        second_press_pid=$!
+        (sleep "$DOUBLE_CLICK_S"; kill -TERM "$second_press_pid" 2>/dev/null) &
+        dc_timer_pid=$!
+        wait "$second_press_pid"
+        second_press_rc=$?
+        kill "$dc_timer_pid" 2>/dev/null
+        wait "$dc_timer_pid" 2>/dev/null
+
+        if [ "$second_press_rc" -eq 0 ]; then
+            # A second press started within the window: a double-click.
+            # Consume its release too before acting, so the line is
+            # clean for the next loop iteration.
+            gpiomon --bias=pull-up --edges=rising --num-events=1 \
+                -c "$GPIOCHIP" "$GPIOLINE" >/dev/null 2>&1
+            launch_apriltag
+        elif is_running "$APRILTAG_PIDFILE"; then
+            # A single click while apriltag_demo is the one running means
+            # "cycle its view", not "switch apps".
+            kill -USR1 "$(cat "$APRILTAG_PIDFILE")" 2>/dev/null
+        else
+            launch_tinytag
+        fi
+        # Software debounce for the mechanical switch.
+        sleep 0.3
+    done
+}
+
+case "$1" in
+  start)
+    is_01studio || exit 0
+    printf "Starting apriltag KEY watcher: "
+    # Self-healing guard: if an earlier "stop" didn't fully clean up (this
+    # has happened in practice, from an older version of this script that
+    # didn't kill gpiomon's own children), a stray watcher would still be
+    # holding the GPIO line -- a second instance started on top of it
+    # can't get the line either and busy-loops instead of blocking. Belt
+    # and suspenders: explicitly kill anything matching this script or
+    # gpiomon on this line before starting a fresh instance.
+    pkill -9 -f "$0 run" 2>/dev/null
+    pkill -9 -f "gpiomon .*-c $GPIOCHIP $GPIOLINE" 2>/dev/null
+    rm -f "$WATCH_PIDFILE"
+    # setsid makes this watcher (and anything it forks, e.g. gpiomon)
+    # its own session/process-group leader, so "stop" below can reliably
+    # kill the whole group in one shot -- otherwise a plain kill on just
+    # the tracked pid orphans its currently-blocking gpiomon child, which
+    # keeps holding the GPIO line and wedges the next "start".
+    start-stop-daemon -S -b -m -p "$WATCH_PIDFILE" --exec /usr/bin/setsid -- "$0" run
+    echo "OK"
+    ;;
+  stop)
+    printf "Stopping apriltag KEY watcher: "
+    if [ -f "$WATCH_PIDFILE" ]; then
+        wpid="$(cat "$WATCH_PIDFILE")"
+        kill -TERM "-$wpid" 2>/dev/null
+        rm -f "$WATCH_PIDFILE"
+    fi
+    stop_current
+    echo "OK"
+    ;;
+  run)
+    # Internal: the actual watch loop, invoked via start-stop-daemon
+    # above (through setsid). Not meant to be run directly.
+    watch_loop
+    ;;
+  *)
+    echo "Usage: $0 {start|stop}"
+    exit 1
+    ;;
+esac

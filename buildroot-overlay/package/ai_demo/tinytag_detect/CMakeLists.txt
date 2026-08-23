@@ -51,14 +51,20 @@ if(CMAKE_TOOLCHAIN_FILE MATCHES "buildroot/toolchainfile.cmake")
         -Wl,--end-group
     )
 
-    # Both kmodels ship side by side -- same binary auto-detects whichever
-    # dtype a kmodel declares (AIBase::set_input_init already reads
-    # desc.datatype), so testing int8 vs float is just pointing <kmodel> at
-    # a different file, no separate build.
-    install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/utils/tinytag-v4c-context.float.kmodel
-                  ${CMAKE_CURRENT_SOURCE_DIR}/utils/tinytag-v4c-context.int8.kmodel
-                  ${CMAKE_CURRENT_SOURCE_DIR}/utils/tinytag-v4c-context.5ch.int8.kmodel
-                  ${CMAKE_CURRENT_SOURCE_DIR}/utils/tinytag-v4c-context.int16.kmodel
+    # tinytag-v11_k230-v4c.int8.kmodel is the K230-safe build: the
+    # previous tinytag-v4c-context.* kmodels (removed from utils/ here) hit
+    # a known nncase-Simulator-vs-real-KPU execution mismatch on this
+    # hardware. On real hardware this wasn't just wrong detections: it
+    # corrupted device memory badly enough to segfault unrelated processes
+    # (observed live on a 01studio board, 2026-08-22 -- kernel log showed
+    # garbage-register SIGSEGVs in `sleep` and an init.d script, not just
+    # the AI process). v11_k230-v4c
+    # (experimental/tinytag/runs/tinytag-v11_k230-v4c-80ep/) is confirmed
+    # safe on real K230 hardware and is a drop-in replacement -- no
+    # app-code changes were needed, just this kmodel swap. Do not swap in
+    # a different/older kmodel here without first confirming on real
+    # hardware that it doesn't reproduce this corruption.
+    install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/utils/tinytag-v11_k230-v4c.int8.kmodel
             DESTINATION /root/app/${PROJECT_NAME}/)
 else()
     message(FATAL_ERROR

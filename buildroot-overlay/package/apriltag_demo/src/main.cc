@@ -16,6 +16,7 @@
 #include <thread>
 #include <string>
 #include <cstring>
+#include <csignal>
 #include <pthread.h>
 #include <termios.h>
 #include <sys/ioctl.h>
@@ -71,6 +72,71 @@ static struct timeval tv, tv2;
 static struct display* display;
 struct display_buffer* draw_buffer;
 cv::Mat draw_frame;
+
+// ── LCD-only fast path (physically-sideways-mounted panels, e.g. 01studio's
+// ST7701) ────────────────────────────────────────────────────────────────
+//
+// `draw_frame` above is always LANDSCAPE-shaped (see display_proc()), even
+// on a portrait panel, because draw_detections() only knows how to draw
+// into a landscape-oriented canvas. For a landscape display that is
+// exactly what's needed; for a portrait display, frame_handler() used to
+// take that finished landscape image and rotate the whole thing 90 degrees
+// in software every time a new detection was ready -- a full-frame
+// allocate + clear + copy + cv::rotate() + memcpy, on top of the drawing
+// itself, versus landscape's single memcpy.
+//
+// `draw_frame_lcd90cw` is a second, PORTRAIT-shaped buffer (same
+// dimensions as draw_buffer itself) that the LCD-only fast path in
+// detect_proc() draws directly into, computing each point's final rotated
+// position up front (see draw_detections_lcd_90cw() in apriltag_draw.cc)
+// instead of drawing landscape and rotating the finished image afterward.
+// That eliminates the allocate/clear/copy/rotate entirely -- what's left
+// for a fast-path frame is draw once, then one memcpy, matching landscape.
+//
+// This buffer and flag are ADDITIVE: HDMI/landscape never touches either
+// (display->width > display->height is always true for it, so it never
+// enters the branches that use them). They also don't apply to --debug or
+// USB-camera-source modes on a portrait panel -- draw_debug_image(),
+// draw_decode_candidates(), and draw_camera_frame() still only know how to
+// draw landscape, so those modes keep using the original draw_frame + the
+// original rotate-in-frame_handler path, unmodified, on LCD too. See
+// project memory project_apriltag_demo_lcd_osd_rotation.md for the full
+// investigation (why the rotation can't just be dropped -- the panel is
+// physically mounted sideways -- and why an AI2D-hardware-affine approach
+// and a "burn the overlay into the camera's own video buffer" approach
+// were both considered and rejected).
+cv::Mat draw_frame_lcd90cw;
+// Set by detect_proc() alongside g_overlay_generation: true if THIS
+// generation's content lives in draw_frame_lcd90cw (LCD fast path), false
+// if it lives in draw_frame (every other case, including landscape).
+// frame_handler() reads this to pick which of the two buffers/paths to
+// use for the generation it's about to display.
+static std::atomic<bool> g_overlay_lcd_fastpath(false);
+
+// Latest once-a-second camera/detect fps, for the on-screen "cam:/det:"
+// HUD text (draw_fps_stats(), called from detect_proc). Written by
+// frame_handler()'s existing FPS block below, which already computes both
+// numbers for the stderr line -- these stores are just an extra write of
+// values it already has, no new computation. Plain relaxed atomics: this
+// is informational display text, not a correctness-sensitive handoff.
+static std::atomic<double> g_cam_fps(0.0);
+static std::atomic<double> g_det_fps(0.0);
+
+// Advances g_debug_stage the same way a '1'-'5' keypress does (see the
+// interactive loop in main() below), but reachable with no controlling
+// terminal at all: registered as the SIGUSR1 handler so the 01studio
+// KEY-button watcher (S60apriltagkey's cycle_view(), which launches this
+// app with --debug so g_debug_enabled is already true) can drive live
+// pipeline-view cycling on a short press, wrapping normal -> debug 1 -> 2
+// -> 3 -> 4 -> 5 -> normal -> ... A signal handler must stick to
+// async-signal-safe operations -- this only touches a lock-free atomic,
+// unlike the keyboard path's cout print, which is why there's no log
+// line here.
+static void handle_view_cycle_signal(int /*signum*/)
+{
+    int next = (g_debug_stage.load(std::memory_order_relaxed) + 1) % 6;
+    g_debug_stage.store(next, std::memory_order_relaxed);
+}
 
 static const char* denoise_mode_name(int mode)
 {
@@ -475,12 +541,50 @@ static void detect_proc(int video_device)
         if (n > 0) {
             detections.assign(out.begin(), out.begin() + n);
         }
+        // LCD fast path applies only to the plain "camera + detections" view
+        // (selected_debug_stage == 0) on a physically-portrait panel, and
+        // only for the CSI camera (the USB path calls draw_camera_frame(),
+        // which -- like the debug-image drawers below -- only knows how to
+        // draw landscape; those keep using the slower rotate-in-
+        // frame_handler path on LCD, same as before this change). `display`
+        // is read here after it's guaranteed valid (set during display_proc's
+        // early setup, well before the first-frame handshake below that
+        // releases this thread to begin its per-frame loop), but the null
+        // check costs nothing and keeps this branch safe even if that
+        // ordering ever changes.
+        const bool use_lcd_fastpath = selected_debug_stage == 0 &&
+            selected_source != 1 && display && display->width < display->height;
+        if (use_lcd_fastpath) {
+            // Draw directly into the already-panel-oriented buffer -- see
+            // draw_frame_lcd90cw's declaration above and
+            // draw_detections_lcd_90cw()'s comment in apriltag_draw.cc for
+            // why this needs no rotation step at all, unlike the `else`
+            // path below.
+            draw_frame_lcd90cw.setTo(cv::Scalar(0, 0, 0, 0));
+            draw_detections_lcd_90cw(draw_frame_lcd90cw, detections,
+                                     frame_width, frame_height,
+                                     draw_frame.cols, draw_frame.rows);
+            draw_fps_stats(draw_frame_lcd90cw,
+                           g_cam_fps.load(std::memory_order_relaxed),
+                           g_det_fps.load(std::memory_order_relaxed));
+        }
+        g_overlay_lcd_fastpath.store(use_lcd_fastpath, std::memory_order_relaxed);
+
         draw_frame.setTo(cv::Scalar(0, 0, 0, 0));
-        if (selected_debug_stage == 0) {
+        if (use_lcd_fastpath) {
+            // Content already produced above, in draw_frame_lcd90cw --
+            // nothing left to draw into the (landscape) draw_frame this
+            // cycle. It's still cleared just above so that if the LCD fast
+            // path ever stops applying mid-run (e.g. --debug toggled on),
+            // frame_handler doesn't find stale content in it.
+        } else if (selected_debug_stage == 0) {
             if (selected_source == 1) {
                 draw_camera_frame(draw_frame, usb_bgr);
             }
             draw_detections(draw_frame, detections, frame_width, frame_height);
+            draw_fps_stats(draw_frame,
+                           g_cam_fps.load(std::memory_order_relaxed),
+                           g_det_fps.load(std::memory_order_relaxed));
         } else {
             apriltag_debug_image_t debug_image = {};
             if (apriltag_get_debug_image(det, &debug_image) == 1 &&
@@ -497,7 +601,8 @@ static void detect_proc(int video_device)
                 draw_frame.setTo(cv::Scalar(0, 0, 0, 255));
                 cv::putText(draw_frame, "waiting for pipeline debug image",
                             cv::Point(18, 32), cv::FONT_HERSHEY_SIMPLEX,
-                            0.75, cv::Scalar(0, 255, 255, 255), 2);
+                            0.75, cv::Scalar(180, 105, 255, 255) /* pink, matches
+                            apriltag_draw.cc's kPink -- more readable than yellow */, 2);
             }
         }
         g_overlay_generation.fetch_add(1, std::memory_order_release);
@@ -543,8 +648,26 @@ int frame_handler(struct v4l2_drm_context* context, bool displayed)
                     displayed_overlay_generation =
                         g_overlay_generation.load(std::memory_order_relaxed);
                     result_mutex.unlock();
+                } else if (g_overlay_lcd_fastpath.load(std::memory_order_acquire)) {
+                    // LCD fast path: draw_frame_lcd90cw was already drawn
+                    // directly in panel orientation (see detect_proc() and
+                    // draw_detections_lcd_90cw()) -- no rotation needed, so
+                    // this is the same single direct-copy shape as the
+                    // landscape branch above, just from the other buffer.
+                    result_mutex.lock();
+                    memcpy(draw_buffer->map, draw_frame_lcd90cw.data, draw_buffer->size);
+                    displayed_overlay_generation =
+                        g_overlay_generation.load(std::memory_order_relaxed);
+                    result_mutex.unlock();
                 } else {
-                    // Portrait (e.g. ST7701): draw landscape, then rotate.
+                    // Portrait (e.g. ST7701), --debug or USB-camera-source
+                    // mode: draw_debug_image()/draw_decode_candidates()/
+                    // draw_camera_frame() only know how to draw landscape
+                    // (see apriltag_draw.h), so for these modes draw_frame
+                    // still holds landscape content that needs rotating
+                    // into panel orientation here, exactly as before this
+                    // change -- unmodified so these modes keep working
+                    // exactly as they did.
                     cv::Mat temp_img(draw_buffer->width, draw_buffer->height, CV_8UC4);
                     temp_img.setTo(cv::Scalar(0, 0, 0, 0));
                     result_mutex.lock();
@@ -572,10 +695,16 @@ int frame_handler(struct v4l2_drm_context* context, bool displayed)
             fprintf(stderr, "display: %.2f, ", display_frame_count * 1000000. / duration);
             display_frame_count = 0;
         }
-        fprintf(stderr, "camera: %.2f, ", context[0].frame_count * 1000000. / duration);
+        double cam_fps = context[0].frame_count * 1000000. / duration;
+        fprintf(stderr, "camera: %.2f, ", cam_fps);
         context[0].frame_count = 0;
-        fprintf(stderr, "detect: %.2f", detect_frame_count * 1000000. / duration);
+        double det_fps = detect_frame_count * 1000000. / duration;
+        fprintf(stderr, "detect: %.2f", det_fps);
         detect_frame_count = 0;
+        // Feed the on-screen "cam:/det:" HUD (draw_fps_stats(), drawn from
+        // detect_proc) -- same numbers just printed above, no new work.
+        g_cam_fps.store(cam_fps, std::memory_order_relaxed);
+        g_det_fps.store(det_fps, std::memory_order_relaxed);
         fprintf(stderr, "          \r");
         fflush(stderr);
         gettimeofday(&tv, NULL);
@@ -603,7 +732,27 @@ void display_proc(int video_device)
         context.display_format = 0;
         context.drm_rotation = rotation_0;
     } else {
-        // Portrait.
+        // Portrait. Raw panel dimensions (NOT aspect-corrected against the
+        // sensor) -- deliberately reverted back from an aspect-preserving
+        // attempt (context.height derived from context.width the same way
+        // the landscape branch above does). That version syntax-checked
+        // clean but regressed on real hardware: detection corners landed
+        // visibly off from the tag, plus a stray-colored band appeared at
+        // one edge of the panel. Root cause not fully pinned down (most
+        // likely the video plane's actual destination rect on the CRTC
+        // isn't simply "post-rotation source size, top-left anchored" the
+        // way this code assumed -- e.g. the driver may center or rescale a
+        // source smaller than the plane's configured extent -- but that
+        // needs dedicated on-hardware investigation, not another blind
+        // guess). This raw-dimensions form (non-uniform stretch to fill
+        // 800x480 exactly, sensor aspect 1280x720 doesn't match 800/480)
+        // is the LAST CONFIRMED-WORKING geometry on real hardware, matched
+        // by draw_detections_lcd_90cw()'s independent sx/sy scale factors
+        // below -- restore both together, don't drift them apart again.
+        // detect_proc()'s own capture (g_csi_width/height,
+        // context.display=false) is entirely separate from this
+        // display-only plane and is unaffected either way. See project
+        // memory project_apriltag_demo_lcd_osd_rotation.md.
         context.width = display->height;
         context.height = display->width;
         context.video_format = V4L2_PIX_FMT_NV12;
@@ -632,6 +781,13 @@ void display_proc(int video_device)
         draw_frame = cv::Mat(draw_buffer->height, draw_buffer->width, CV_8UC4, cv::Scalar(0, 0, 0, 0));
     } else {
         draw_frame = cv::Mat(draw_buffer->width, draw_buffer->height, CV_8UC4, cv::Scalar(0, 0, 0, 0));
+        // LCD fast path only: a SECOND buffer, shaped exactly like
+        // draw_buffer itself (portrait -- draw_buffer->height rows by
+        // draw_buffer->width cols, the opposite shape from draw_frame just
+        // above), that detect_proc's fast path draws directly into. See
+        // draw_frame_lcd90cw's declaration for the full rationale. Nothing
+        // about draw_frame or the landscape branch above changes.
+        draw_frame_lcd90cw = cv::Mat(draw_buffer->height, draw_buffer->width, CV_8UC4, cv::Scalar(0, 0, 0, 0));
     }
 
     print_key_help();
@@ -775,6 +931,8 @@ int main(int argc, char* argv[])
         cout << " usb=/dev/video" << g_usb_video;
     }
     cout << endl;
+
+    signal(SIGUSR1, handle_view_cycle_signal);
 
     display = display_init(0);
     if (!display) {
