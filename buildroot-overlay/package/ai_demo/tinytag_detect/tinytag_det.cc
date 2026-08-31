@@ -6,6 +6,15 @@
 #include <cstdio>
 #include <cstring>
 
+// Native 16:9 crop target for the network band (matches the kmodel's
+// 640x360 at 2x). Inputs larger than this are cropped to the BOTTOM-LEFT
+// 1280x720 window (throw away any top rows / right columns beyond it);
+// inputs smaller than or equal to it are used as-is (no scale-up / pad --
+// see README). Kept a plain constant so pre_process() and
+// decode_proposals() stay consistent about which region the NN saw.
+constexpr int kCropW = 1280;
+constexpr int kCropH = 720;
+
 TinyTagDet::TinyTagDet(const char *kmodel_file, float heatmap_thres, int max_proposals, float roi_expand,
                        float roi_iou_thres, std::shared_ptr<TagCropDecoder> decoder, const int debug_mode)
     : AIBase(kmodel_file, "TinyTagDet", debug_mode),
@@ -22,8 +31,25 @@ void TinyTagDet::pre_process(cv::Mat ori_img_gray)
 {
     ScopedTiming st(model_name_ + " pre_process", debug_mode_);
     CV_Assert(ori_img_gray.type() == CV_8UC1);
-    const int w = ori_img_gray.cols;
-    const int h = ori_img_gray.rows;
+
+    // Crop to the network's native 16:9 band, keeping the BOTTOM-LEFT
+    // 1280x720 window (discard any top rows / right columns beyond it).
+    // No-op for sources already <= 1280x720. This is a zero-cost sub-Mat
+    // view (no resize, no copy) handed straight to the ai2d hardware
+    // downscale, so the network sees an undistorted 16:9 image instead of
+    // a non-uniform stretch (previously a 1280x800 frame was resized to
+    // 640x360, squishing the scene vertically). Crop-only by design -- no
+    // scale-up/pad for inputs smaller than 1280x720.
+    const int src_w = ori_img_gray.cols;
+    const int src_h = ori_img_gray.rows;
+    const int crop_w = std::min(src_w, kCropW);
+    const int crop_h = std::min(src_h, kCropH);
+    const int crop_x = 0;                  // keep LEFT columns
+    const int crop_y = src_h - crop_h;     // keep BOTTOM rows
+    cv::Mat gray = ori_img_gray(cv::Rect(crop_x, crop_y, crop_w, crop_h));
+
+    const int w = gray.cols;
+    const int h = gray.rows;
 
     if (!ai2d_builder_ || w != ai2d_in_w_ || h != ai2d_in_h_)
     {
@@ -54,7 +80,7 @@ void TinyTagDet::pre_process(cv::Mat ori_img_gray)
             ai2d_in_tensor_.impl()->to_host().unwrap()->buffer().as_host().unwrap().map(map_access_::map_write).unwrap().buffer();
         uint8_t *dst = reinterpret_cast<uint8_t *>(input_buf.data());
         for (int y = 0; y < h; ++y)
-            std::memcpy(dst + static_cast<size_t>(y) * w, ori_img_gray.ptr<uint8_t>(y), w);
+            std::memcpy(dst + static_cast<size_t>(y) * w, gray.ptr<uint8_t>(y), w);
         hrt::sync(ai2d_in_tensor_, sync_op_t::sync_write_back, true).expect("write back input failed");
     }
 
@@ -143,12 +169,16 @@ void TinyTagDet::decode_proposals(FrameSize frame_size, std::vector<Proposal> &p
 
     {
         ScopedTiming st(model_name_ + " post_process: decode+roi_expand+clamp", debug_mode_);
-        // Network-input-space (e.g. 640x360) -> frame_size space. Generalizes
-        // HEADS_AND_POSTPROCESSING.md step 9's fixed "x2, since the network
-        // ran on a half-downscaled frame" into frame_size/network_input, so
-        // this works for any frame_size, not just a hardcoded 2x factor.
-        const float x_factor = static_cast<float>(frame_size.width) / input_shapes_[0][3];
-        const float y_factor = static_cast<float>(frame_size.height) / input_shapes_[0][2];
+        // The network was fed the bottom-left 16:9 band (see pre_process),
+        // so map network coords into that band's space, then offset back to
+        // full-frame coords. For sources <= 1280x720 this reduces to the
+        // previous behavior (crop == whole frame, offsets == 0).
+        const int band_w = std::min(static_cast<int>(frame_size.width), kCropW);
+        const int band_h = std::min(static_cast<int>(frame_size.height), kCropH);
+        const int crop_x = 0;
+        const int crop_y = static_cast<int>(frame_size.height) - band_h;
+        const float x_factor = static_cast<float>(band_w) / input_shapes_[0][3];
+        const float y_factor = static_cast<float>(band_h) / input_shapes_[0][2];
 
         proposals.reserve(peaks.size());
         for (auto &pk : peaks)
@@ -169,10 +199,15 @@ void TinyTagDet::decode_proposals(FrameSize frame_size, std::vector<Proposal> &p
             w *= x_factor;
             h *= y_factor;
 
-            float x0 = std::clamp(cx - w / 2.f, 0.f, static_cast<float>(frame_size.width));
-            float y0 = std::clamp(cy - h / 2.f, 0.f, static_cast<float>(frame_size.height));
-            float x1 = std::clamp(cx + w / 2.f, 0.f, static_cast<float>(frame_size.width));
-            float y1 = std::clamp(cy + h / 2.f, 0.f, static_cast<float>(frame_size.height));
+            // Offset band coords into full-frame coords (network saw the
+            // bottom-left band), and clamp the decoded box to the kept band
+            // so the CV crop-decode never reads cropped-away top/right rows.
+            cx += crop_x;
+            cy += crop_y;
+            float x0 = std::clamp(cx - w / 2.f, static_cast<float>(crop_x), static_cast<float>(crop_x + band_w));
+            float y0 = std::clamp(cy - h / 2.f, static_cast<float>(crop_y), static_cast<float>(crop_y + band_h));
+            float x1 = std::clamp(cx + w / 2.f, static_cast<float>(crop_x), static_cast<float>(crop_x + band_w));
+            float y1 = std::clamp(cy + h / 2.f, static_cast<float>(crop_y), static_cast<float>(crop_y + band_h));
             if (x1 <= x0 || y1 <= y0)
                 continue;
 

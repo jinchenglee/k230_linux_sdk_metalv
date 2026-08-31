@@ -29,6 +29,26 @@ tinytag_detect.elf <kmodel> <input> <heatmap_thres> <max_proposals> <roi_expand>
 `debug_mode`: 0 silent, 1 per-stage timing, 2 + per-ROI timing and verbose
 proposal/detection logs.
 
+### Operating point: heatmap_thres
+
+`heatmap_thres` trades recall against proposal count (and therefore the
+per-ROI CV crop-decode cost, which dominates the live pipeline).
+
+- `0.20` (the training repo's frozen value) is **very conservative**: it
+  keeps the most ROIs (highest recall) but proposes many low-confidence
+  boxes, and the CV decoder pays for each of them even when they decode to
+  nothing. Measured on 1280x800 footage: ~14 proposals/frame, ~16.7 ms
+  post_process.
+- `0.35` is the recommended **production** setting: it cuts the proposal
+  count roughly in half (~7/frame) and roughly halves post_process
+  (~9.1 ms), for only a **slight drop in recall** (e.g. 204 -> 185
+  detections across a 65-frame clip). Use this unless an application
+  specifically needs maximum recall over throughput.
+
+Both were measured with the 16:9 crop described below; see the profiling
+notes in `docs/commits/tinytag-crop-threshold-commit.txt`.
+
+
 ## Pipeline: live camera (real deployment)
 
 ```

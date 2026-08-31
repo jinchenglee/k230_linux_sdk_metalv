@@ -65,7 +65,12 @@ public:
                float roi_iou_thres, std::shared_ptr<TagCropDecoder> decoder, const int debug_mode = 1);
     ~TinyTagDet();
 
-    // ori_img_gray must be CV_8UC1. Resizes (no letterbox/pad -- matches
+    // ori_img_gray must be CV_8UC1. For inputs larger than 1280x720, it is
+    // first cropped (zero-copy sub-Mat view) to the BOTTOM-LEFT 1280x720
+    // band -- throwing away any top rows / right columns -- so the network
+    // sees an undistorted native 16:9 image instead of a non-uniform stretch.
+    // Inputs <= 1280x720 are used as-is (crop-only by design; no scale-up /
+    // letterbox-pad -- see README). Then resized (no letterbox/pad -- matches
     // training preprocessing per HEADS_AND_POSTPROCESSING.md's fixed x2
     // scale factor implying a plain resize, not aspect-preserving) into the
     // kmodel's input tensor.
@@ -76,9 +81,10 @@ public:
     // decode_proposals() steps 1-8: sigmoid, 3x3-max-pool NMS, threshold,
     // top-K, center/size decode, roi_expand, clamp. frame_size is the size
     // of the image passed to pre_process(); proposal ROIs come back scaled
-    // into that space (generalizes the training doc's fixed "x2 to full
-    // resolution" into frame_size/network_input_shape, so this works for
-    // any input image size, not just a hardcoded half-downscale factor).
+    // into that space. Because pre_process() crops the network input to the
+    // bottom-left 1280x720 band, this maps network coords into that band and
+    // then offsets back to full-frame coords (generalizes the training doc's
+    // fixed "x2 to full resolution" into band_size/network_input_shape).
     void decode_proposals(FrameSize frame_size, std::vector<Proposal> &proposals);
 
     // Full pipeline: decode_proposals() then, per proposal, crop
