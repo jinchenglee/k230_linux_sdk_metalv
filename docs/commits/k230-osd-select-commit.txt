@@ -1,0 +1,19 @@
+feat(osd): make tag apps auto-select shared k230_osd overlay lib
+
+apriltag_demo and tinytag_detect now link the shared k230_osd module
+(tinytag_detect.mk / apriltag_demo.mk list it in *_DEPENDENCIES), but only
+k230_canmv_defconfig explicitly enabled BR2_PACKAGE_K230_OSD. The other
+boards that build these apps (k230_canmv_v3, k230_canmv_01studio) did not
+enable it, so `make` would fail on an unsatisfied dependency even though
+nothing else changed.
+
+Select the module from each app's Config.in (matching how they already
+select BR2_PACKAGE_DISPLAY / BR2_PACKAGE_OPENCV4), so any board that enables
+the app auto-builds k230_osd via Kconfig -- no per-board .config edit, and
+it stays correct if the apps move to another config. The module's own
+dependencies (display, opencv4) are already pulled by the apps, so the
+select does not widen the build scope elsewhere.
+
+Files:
+- package/ai_demo/tinytag_detect/Config.in
+- package/apriltag_demo/Config.in
