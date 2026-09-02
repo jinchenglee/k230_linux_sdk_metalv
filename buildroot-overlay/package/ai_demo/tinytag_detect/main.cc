@@ -1,4 +1,5 @@
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -21,6 +22,7 @@
 // comment for why op_profile ends up unqualified.
 #include <nncase/runtime/stackvm/op_profile.h>
 
+#include "k230_osd.h"
 #include "scoped_timing.hpp"
 #include "sensor_set.h"
 #include "tag_crop_decoder.h"
@@ -62,6 +64,8 @@ void print_usage(const char *name)
          << "  roi_expand      safety margin multiplied onto each proposal's decoded size before\n"
          << "                  cropping for CV decode (1.5 at that same operating point)\n"
          << "  debug_mode      0 (silent), 1 (per-stage timing), 2 (+ per-ROI timing and verbose logs)\n"
+         << "                  In live mode, confirmed detections and their per-stage timings are\n"
+         << "                  always printed; timing from zero-detection frames is discarded.\n"
          << "  roi_iou_thres   OPTIONAL (default 0.5). Drop a proposal whose box overlaps a kept\n"
          << "                  higher-confidence one by more than this IoU, before paying for its\n"
          << "                  CV decode. The spec's 3x3 NMS only suppresses heatmap *cells*, so\n"
@@ -138,27 +142,16 @@ void run_op_profile(const char *kmodel_path, int iterations)
     op_profile::print();
 }
 
-std::mutex result_mutex;
+std::mutex start_mutex;
+std::condition_variable start_cv;
+bool display_ready = false;
 std::atomic<bool> ai_stop(false);
 std::atomic<bool> display_stop(false);
 static volatile unsigned ai_frame_count = 0;
-// Diagnostic: how many times frame_handler actually got far enough to hand a
-// new overlay to the display. If the OSD still looks frozen while this counter
-// tracks the AI rate, the problem is downstream of this app (DRM commit /
-// plane composition); if it stays ~0 while AI runs, the problem is the gating
-// logic above it. Printed in the existing per-second FPS line as "osd:".
 static volatile unsigned osd_staged_count = 0;
 static struct timeval tv, tv2;
 static struct display *g_display;
-struct display_buffer *draw_buffer;
-cv::Mat osd_frame;
-// Incremented only after osd_frame contains a complete new overlay --
-// mirrors apriltag_demo.elf's g_overlay_generation exactly (see its main.cc
-// comment: "Camera and DRM events can arrive faster than detection, so
-// copying on every callback wastes substantial memory bandwidth"). Gating
-// frame_handler's copy on this, not on the display thread's own camera
-// buffer identity, is the whole fix below -- see the comment at its use.
-static std::atomic<uint64_t> g_overlay_generation(0);
+static struct k230_osd *g_osd;
 
 // Latest once-a-second camera/AI fps, for the on-screen "cam:/det:" HUD
 // text (drawn from ai_proc, right after the detection overlay). Written
@@ -168,6 +161,10 @@ static std::atomic<uint64_t> g_overlay_generation(0);
 // apriltag_demo.elf's g_cam_fps/g_det_fps (same pattern, same reasoning).
 static std::atomic<double> g_cam_fps(0.0);
 static std::atomic<double> g_det_fps(0.0);
+
+// Terminal telemetry is emitted only for confirmed detections. The on-screen
+// FPS HUD remains independent and updates during zero-detection intervals.
+static std::atomic<unsigned> g_detected_frame_count(0);
 
 // Box-level IoU suppression threshold (see TinyTagDet's constructor doc).
 // ai_proc only receives `argv`, not `argc`, so it can't tell whether the
@@ -199,9 +196,13 @@ void ai_proc(char *argv[], int video_device)
     struct v4l2_drm_context context;
 #define BUFFER_NUM 3
 
-    // Wait for display_proc to bring up draw_buffer (see frame_handler).
-    result_mutex.lock();
-    result_mutex.unlock();
+    // Do not touch g_osd until display_proc has created and committed it.
+    {
+        std::unique_lock<std::mutex> lock(start_mutex);
+        start_cv.wait(lock, [] { return display_ready || ai_stop.load(); });
+    }
+    if (ai_stop)
+        return;
 
     v4l2_drm_default_context(&context);
     context.device = video_device;
@@ -238,13 +239,17 @@ void ai_proc(char *argv[], int video_device)
 
     int debug_mode = atoi(argv[6]);
     auto decoder = make_crop_decoder(); // TINYTAG_CV_DETECTOR=rvv for AprilTagRVVDecoder, default AprilTagCDecoder
+    // Live mode always retains stage timings long enough to decide whether
+    // this frame has a confirmed tag. debug_mode 2 still enables extra detail.
+    int detector_debug_mode = debug_mode > 1 ? debug_mode : 1;
     TinyTagDet det(argv[1], atof(argv[3]), atoi(argv[4]), atof(argv[5]), g_roi_iou_thres, decoder,
-                   debug_mode);
+                   detector_debug_mode);
     std::vector<TinyTagResult> results;
     std::vector<Proposal> proposals;
 
     while (!ai_stop)
     {
+        k230_osd_prepare(g_osd);
         int ret = v4l2_drm_dump(&context, 1000);
         if (ret)
         {
@@ -270,32 +275,42 @@ void ai_proc(char *argv[], int video_device)
         // input in one hardware step; feeding it the raw sensor view
         // directly does the whole 1280x720 -> 640x360 downscale itself; no
         // decimate stage needed at all.
-        cv::Mat net_input(static_cast<int>(csi_height), static_cast<int>(csi_width), CV_8UC1,
-                          const_cast<uint8_t *>(y_plane), csi_stride);
-        det.pre_process(net_input);
-
-        det.inference();
-
-        cv::Mat full_res_gray(static_cast<int>(csi_height), static_cast<int>(csi_width), CV_8UC1,
+        std::string frame_diagnostics;
+        auto run_detection = [&]() {
+            cv::Mat net_input(static_cast<int>(csi_height), static_cast<int>(csi_width), CV_8UC1,
                               const_cast<uint8_t *>(y_plane), csi_stride);
+            det.pre_process(net_input);
 
-        // post_process() (CV crop-decode dominates: a handful of ms per ROI)
-        // deliberately runs OUTSIDE result_mutex. With the float kmodel this
-        // didn't matter -- run() alone took ~6.6s, so post_process's few ms
-        // under the lock was a rounding error next to that. With the int8
-        // kmodel run() dropped to ~1.7ms, so the *same* post_process
-        // duration became a large fraction of (or longer than) the display
-        // thread's own refresh period -- frame_handler (which needs this
-        // same mutex, called synchronously from the display thread's V4L2
-        // servicing loop) could stall waiting for it on every call, which
-        // is consistent with "runs fast, screen looks frozen." Only the
-        // actual osd_frame write needs to be under the lock.
-        results.clear();
-        proposals.clear();
-        det.post_process({csi_width, csi_height}, full_res_gray, results, &proposals);
+            det.inference();
 
-        if (debug_mode > 0)
+            cv::Mat full_res_gray(static_cast<int>(csi_height), static_cast<int>(csi_width), CV_8UC1,
+                                  const_cast<uint8_t *>(y_plane), csi_stride);
+
+            // k230_osd owns the DRAWING buffer through post-processing and
+            // rendering, so the display thread neither blocks this work nor sees
+            // a partially drawn overlay.
+            results.clear();
+            proposals.clear();
+            det.post_process({csi_width, csi_height}, full_res_gray, results, &proposals);
+        };
+
+        {
+            ScopedTimingCapture timing_capture(frame_diagnostics);
+            run_detection();
+        }
+
+        if (!results.empty())
+        {
+            g_detected_frame_count.fetch_add(1, std::memory_order_relaxed);
+            if (!frame_diagnostics.empty())
+                cout << frame_diagnostics << std::flush;
             fprintf(stderr, "\n[ai] proposals=%zu detections=%zu\n", proposals.size(), results.size());
+            for (const auto &r : results)
+                fprintf(stderr,
+                        "[ai]   id=%d hamming=%d margin=%.2f proposal_conf=%.3f center=(%.1f,%.1f)\n",
+                        r.id, r.hamming, r.decision_margin, r.proposal_confidence,
+                        r.center.x, r.center.y);
+        }
         // Per-proposal ROI coordinates + confidence, gated at debug_mode>=2
         // (same convention as cv_crop_decode's per-ROI timing). Added to
         // check actual on-device proposal positions against host-simulator
@@ -310,22 +325,22 @@ void ai_proc(char *argv[], int video_device)
         // specific to the live scene not represented in the validation
         // set -- this print is what distinguishes them: compare these
         // on-device coordinates against where the physical tag actually is.
-        if (debug_mode > 1)
+        if (debug_mode > 1 && !results.empty())
+        {
             for (const auto &p : proposals)
                 fprintf(stderr, "[ai]   proposal conf=%.3f roi=(%.0f,%.0f,%.0f,%.0f)\n", p.confidence,
                         p.roi.x, p.roi.y, p.roi.x + p.roi.width, p.roi.y + p.roi.height);
+        }
 
-        result_mutex.lock();
-        osd_frame.setTo(cv::Scalar(0, 0, 0, 0));
+        cv::Mat &osd = k230_osd_begin(g_osd);
         // Proposals drawn first (cyan boxes + neural confidence), confirmed
         // detections drawn on top (green quads + id) -- so a proposal the
         // CV decoder rejected is still visible, not hidden behind nothing.
-        TinyTagDet::draw_proposals_scaled(osd_frame, proposals, csi_width, csi_height);
-        TinyTagDet::draw_detections_scaled(osd_frame, results, csi_width, csi_height);
-        draw_fps_stats(osd_frame, g_cam_fps.load(std::memory_order_relaxed),
+        TinyTagDet::draw_proposals_scaled(osd, proposals, csi_width, csi_height);
+        TinyTagDet::draw_detections_scaled(osd, results, csi_width, csi_height);
+        draw_fps_stats(osd, g_cam_fps.load(std::memory_order_relaxed),
                        g_det_fps.load(std::memory_order_relaxed));
-        g_overlay_generation.fetch_add(1, std::memory_order_release);
-        result_mutex.unlock();
+        k230_osd_publish(g_osd);
 
         ai_frame_count += 1;
         v4l2_drm_dump_release(&context);
@@ -338,101 +353,21 @@ int frame_handler(struct v4l2_drm_context *context, bool displayed)
     static bool first_frame = true;
     if (first_frame)
     {
-        result_mutex.unlock();
-        first_frame = false;
+        {
+            std::lock_guard<std::mutex> lock(start_mutex);
+            display_ready = true;
+            first_frame = false;
+        }
+        start_cv.notify_all();
     }
 
     static unsigned response = 0, display_frame_count = 0;
     response += 1;
     if (displayed)
     {
-        if (context[0].buffer_hold[context[0].wp] >= 0)
-        {
-            // Gate on "ai_proc produced a new overlay" (g_overlay_generation),
-            // not on "the display thread's own camera buffer identity
-            // changed" (context[0].display_buffers[...] != some previous
-            // pointer). Those are unrelated signals: the latter tracks
-            // display_proc's own separate v4l2 capture stream, which can be
-            // slow/stalled independent of whether ai_proc is producing fresh
-            // results every frame -- exactly what happened on real hardware
-            // once the int8 kmodel made ai_proc fast (log showed proposals
-            // computed every ~10-40ms, but the screen only refreshed every
-            // several seconds). Matches apriltag_demo.elf's frame_handler,
-            // which already solved this exact class of problem.
-            static uint64_t displayed_overlay_generation = UINT64_MAX;
-            uint64_t generation = g_overlay_generation.load(std::memory_order_acquire);
-            if (generation != displayed_overlay_generation)
-            {
-                // Landscape: copy osd_frame straight into the DRM buffer, no
-                // intermediate Mat. The previous version (inherited from
-                // object_detect_yolov8n) allocated an 8MB temp Mat, cleared
-                // it, copied osd_frame into it, then copied that into
-                // draw_buffer -- ~32MB of memory traffic per overlay update
-                // at 1920x1080x4, vs ~16MB now. apriltag_demo removed exactly
-                // this, and its comment says why: "the old temp Mat added a
-                // second full-frame copy plus a full-frame clear". Invisible
-                // at the float kmodel's one-update-per-6.8s, but at int8
-                // speed the overlay updates ~25x/s and that extra traffic
-                // competes with the display pipeline for the same memory.
-                // (The clear was redundant regardless: osd_frame is fully
-                // overwritten by ai_proc's own setTo() each frame, and
-                // copyTo into a same-size Mat overwrites every pixel.)
-                if (draw_buffer->width > draw_buffer->height)
-                {
-                    result_mutex.lock();
-                    memcpy(draw_buffer->map, osd_frame.data, draw_buffer->size);
-                    displayed_overlay_generation = g_overlay_generation.load(std::memory_order_relaxed);
-                    result_mutex.unlock();
-                }
-                else
-                {
-                    // Portrait still needs the temp: cv::rotate can't write
-                    // in place into a differently-shaped destination.
-                    cv::Mat temp_img(draw_buffer->width, draw_buffer->height, CV_8UC4);
-                    result_mutex.lock();
-                    osd_frame.copyTo(temp_img);
-                    displayed_overlay_generation = g_overlay_generation.load(std::memory_order_relaxed);
-                    result_mutex.unlock();
-                    cv::rotate(temp_img, temp_img, cv::ROTATE_90_CLOCKWISE);
-                    memcpy(draw_buffer->map, temp_img.data, draw_buffer->size);
-                }
-                // Flush the buffer we just CPU-wrote (draw_buffer), NOT the
-                // camera video-plane buffer. This previously flushed
-                // `context[0].display_buffers[...]->map` -- copied verbatim
-                // from object_detect_yolov8n/main.cc:175, which has the same
-                // bug. apriltag_demo/src/main.cc:558 gets it right.
-                thead_csi_dcache_clean_invalid_range(draw_buffer->map, draw_buffer->size);
-
-                // The memcpy + cache flush above is what actually makes new
-                // overlay content appear: the ARGB plane is committed to
-                // this exact draw_buffer once, at setup
-                // (display_commit_buffer in display_proc), and the display
-                // keeps scanning that same FB out every frame. Updating its
-                // pixels in place is therefore sufficient -- no per-frame
-                // commit is required for content changes.
-                //
-                // This display_update_buffer() call is kept only because
-                // apriltag_demo (the one implementation confirmed working on
-                // this hardware) has it, and matching it exactly is worth
-                // more than reasoning about whether it is needed. Note it is
-                // very likely a no-op: v4l2_drm_run() calls
-                // display_handle_vsync() at the top of its display block
-                // (vvcam/v4l2-drm/src/lib.c:628), and that does
-                // `drmModeAtomicFree(display->req); display->req = NULL;` --
-                // discarding anything staged here, since frame_handler runs
-                // *before* that block.
-                //
-                // Deliberately NOT using display->osd_disp_buffer here: that
-                // hook forces have_data_to_display() (lib.c:489-499) true,
-                // which forces display_handle_vsync() + display_commit() to
-                // run on that iteration. With the loop already polling far
-                // faster than the camera delivers (observed poll: ~3300/s vs
-                // camera: ~16fps), adding forced commits risks flooding DRM
-                // with atomic commits/page-flip events rather than helping.
-                display_update_buffer(draw_buffer, 0, 0);
-                osd_staged_count += 1;
-            }
-        }
+        k230_osd_on_frame(g_osd, true);
+        if (g_display->osd_disp_buffer)
+            osd_staged_count += 1;
         display_frame_count += 1;
     }
 
@@ -440,27 +375,32 @@ int frame_handler(struct v4l2_drm_context *context, bool displayed)
     uint64_t duration = 1000000 * (tv2.tv_sec - tv.tv_sec) + tv2.tv_usec - tv.tv_usec;
     if (duration >= 1000000)
     {
-        fprintf(stderr, " poll: %.2f, ", response * 1000000. / duration);
+        double poll_fps = response * 1000000. / duration;
         response = 0;
+        double display_fps = display_frame_count * 1000000. / duration;
         if (g_display)
-        {
-            fprintf(stderr, "display: %.2f, ", display_frame_count * 1000000. / duration);
             display_frame_count = 0;
-        }
         double cam_fps = context[0].frame_count * 1000000. / duration;
-        fprintf(stderr, "camera: %.2f, ", cam_fps);
         context[0].frame_count = 0;
         double det_fps = ai_frame_count * 1000000. / duration;
-        fprintf(stderr, "AI: %.2f, ", det_fps);
         ai_frame_count = 0;
-        fprintf(stderr, "osd: %.2f", osd_staged_count * 1000000. / duration);
+        double osd_fps = osd_staged_count * 1000000. / duration;
         osd_staged_count = 0;
         // Feed the on-screen "cam:/det:" HUD (drawn from ai_proc) -- same
-        // numbers just printed above, no new work.
+        // live numbers as before, whether or not this interval had a tag.
         g_cam_fps.store(cam_fps, std::memory_order_relaxed);
         g_det_fps.store(det_fps, std::memory_order_relaxed);
-        fprintf(stderr, "          \r");
-        fflush(stderr);
+
+        // Avoid terminal churn for intervals with no confirmed tags. A count
+        // (rather than latest-frame state) preserves brief/flickering hits.
+        if (g_detected_frame_count.exchange(0, std::memory_order_relaxed) != 0)
+        {
+            fprintf(stderr,
+                    " poll: %.2f, display: %.2f, camera: %.2f, AI: %.2f, osd: %.2f, drop: %llu          \r",
+                    poll_fps, display_fps, cam_fps, det_fps, osd_fps,
+                    (unsigned long long)k230_osd_dropped_frames(g_osd));
+            fflush(stderr);
+        }
         gettimeofday(&tv, NULL);
     }
 
@@ -494,24 +434,38 @@ void display_proc(int video_device)
     if (v4l2_drm_setup(&context, 1, &g_display))
     {
         cerr << "display_proc: v4l2_drm_setup error" << endl;
+        ai_stop.store(true);
+        start_cv.notify_all();
         return;
     }
 
-    struct display_plane *plane = display_get_plane(g_display, DRM_FORMAT_ARGB8888);
-    draw_buffer = display_allocate_buffer(plane, g_display->width, g_display->height);
-    display_commit_buffer(draw_buffer, 0, 0);
-
-    if (draw_buffer->width > draw_buffer->height)
-        osd_frame = cv::Mat(draw_buffer->height, draw_buffer->width, CV_8UC4, cv::Scalar(0, 0, 0, 0));
-    else
-        osd_frame = cv::Mat(draw_buffer->width, draw_buffer->height, CV_8UC4, cv::Scalar(0, 0, 0, 0));
+    const bool landscape = g_display->width > g_display->height;
+    k230_osd_config osd_config = {};
+    osd_config.width = g_display->width;
+    // Match the OSD plane to the actual 16:9 camera destination rectangle.
+    osd_config.height = landscape ? context.height : g_display->height;
+    osd_config.lcd_fastpath = false;
+    osd_config.mode = landscape ? K230_OSD_MODE_FAST
+                                : K230_OSD_MODE_SLOW_ROTATE;
+    g_osd = k230_osd_create(g_display, &osd_config);
+    const struct display_buffer *front = k230_osd_front_buffer(g_osd);
+    if (!g_osd || !front || display_commit_buffer(front, 0, 0) != 0)
+    {
+        cerr << "display_proc: k230_osd setup error" << endl;
+        k230_osd_destroy(g_osd);
+        g_osd = nullptr;
+        ai_stop.store(true);
+        start_cv.notify_all();
+        return;
+    }
 
     gettimeofday(&tv, NULL);
-    v4l2_drm_run(&context, 1, frame_handler);
+    v4l2_drm_run_event_driven(&context, 1, frame_handler);
 
     if (g_display)
     {
-        display_free_plane(plane);
+        k230_osd_destroy(g_osd);
+        g_osd = nullptr;
         display_exit(g_display);
     }
 }
@@ -626,8 +580,6 @@ int main(int argc, char *argv[])
             cerr << "display_init error, exit" << endl;
             return -1;
         }
-
-        result_mutex.lock();
 
         std::thread ai_thread(ai_proc, argv, kd_mpi_get_vvcam_video00() + 1);
         std::thread display_thread(display_proc, kd_mpi_get_vvcam_video00());

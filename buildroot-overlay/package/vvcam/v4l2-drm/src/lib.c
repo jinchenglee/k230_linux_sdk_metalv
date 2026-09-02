@@ -307,6 +307,56 @@ int v4l2_drm_setup(struct v4l2_drm_context context[], unsigned num, struct displ
 
 static unsigned dump_count = 0;
 
+static bool v4l2_drm_have_pending_display_update(
+    const struct display* d,
+    const struct v4l2_drm_context context[],
+    unsigned num)
+{
+    if (d->lvgl_disp_buffer || d->osd_disp_buffer)
+        return true;
+
+    for (unsigned i = 0; i < num; i++) {
+        if (context[i].display && context[i].flag_dqbuf &&
+            context[i].buffer_hold[context[i].wp] >= 0)
+            return true;
+    }
+    return false;
+}
+
+static int v4l2_drm_commit_pending_display_update(
+    struct display* d,
+    struct v4l2_drm_context context[],
+    unsigned num)
+{
+    for (unsigned i = 0; i < num; i++) {
+        if (!context[i].display || !context[i].flag_dqbuf ||
+            context[i].buffer_hold[context[i].wp] < 0)
+            continue;
+
+        if (display_update_buffer(
+                context[i].display_buffers[context[i].buffer_hold[context[i].wp]],
+                context[i].offset_x, context[i].offset_y))
+            return -1;
+        context[i].flag_dqbuf = false;
+    }
+
+    if (d->osd_disp_buffer) {
+        if (display_update_buffer(d->osd_disp_buffer, 0, 0))
+            return -1;
+        d->osd_disp_buffer = NULL;
+    }
+    if (d->lvgl_disp_buffer) {
+        if (display_update_buffer(d->lvgl_disp_buffer, 0, 0))
+            return -1;
+        d->lvgl_disp_buffer = NULL;
+    }
+
+    if (display_commit(d))
+        return -1;
+    d->frame_count += 1;
+    return 0;
+}
+
 static void dump_file(const struct v4l2_drm_context* ctx, unsigned channel) {
     char filename[128];
     snprintf(
@@ -330,7 +380,8 @@ static void dump_file(const struct v4l2_drm_context* ctx, unsigned channel) {
     pr("dump file to %s", filename);
 }
 
-int v4l2_drm_run(struct v4l2_drm_context context[], unsigned num, v4l2_drm_handler handler) {
+static int v4l2_drm_run_impl(struct v4l2_drm_context context[], unsigned num,
+                             v4l2_drm_handler handler, bool event_driven) {
     int flag_enable_display = 0;
     int display_fd;
     struct display* d = NULL;
@@ -355,6 +406,7 @@ int v4l2_drm_run(struct v4l2_drm_context context[], unsigned num, v4l2_drm_handl
         return -1;
     }
 
+    bool display_commit_pending = flag_enable_display != 0;
     struct pollfd fds[num + flag_enable_display];
     while (1) {
         for (unsigned i = 0; i < num; i++) {
@@ -432,9 +484,11 @@ int v4l2_drm_run(struct v4l2_drm_context context[], unsigned num, v4l2_drm_handl
             }
         }
 
+        const bool displayed = flag_enable_display && fds[num].revents &&
+                               (!event_driven || display_commit_pending);
         int ch = 0;
         if (handler) {
-            ch = handler(context, flag_enable_display && fds[num].revents);
+            ch = handler(context, displayed);
             switch (ch) {
                 case -1:
                 case 'q': goto streamoff;
@@ -449,32 +503,49 @@ int v4l2_drm_run(struct v4l2_drm_context context[], unsigned num, v4l2_drm_handl
             }
         }
 
-        if (flag_enable_display && fds[num].revents) {
-            // display
-            bool flag_check_source = false;
-            for (unsigned i = 0; i < num; i++) {
-                if ((context[i].buffer_hold[context[i].wp] >= 0) && (context[i].display)) {
-                    flag_check_source = true;
-                    break;
+        if (!event_driven) {
+            if (flag_enable_display && fds[num].revents) {
+                // display
+                bool flag_check_source = false;
+                for (unsigned i = 0; i < num; i++) {
+                    if ((context[i].buffer_hold[context[i].wp] >= 0) &&
+                        context[i].display) {
+                        flag_check_source = true;
+                        break;
+                    }
                 }
-            }
-            if (!flag_check_source) {
-                // skip
-                continue;
-            }
-            display_handle_vsync(d);
-            for (unsigned i = 0; i < num; i++) {
-                if ((!context[i].display) || (context[i].buffer_hold[context[i].wp] < 0)) {
+                if (!flag_check_source) {
+                    // skip
                     continue;
                 }
-                CKE(display_update_buffer(
-                    context[i].display_buffers[context[i].buffer_hold[context[i].wp]],
-                    context[i].offset_x, context[i].offset_y
-                ), streamoff);
-                context[i].flag_dqbuf = false;
+                display_handle_vsync(d);
+                for (unsigned i = 0; i < num; i++) {
+                    if (!context[i].display ||
+                        context[i].buffer_hold[context[i].wp] < 0) {
+                        continue;
+                    }
+                    CKE(display_update_buffer(
+                        context[i].display_buffers[
+                            context[i].buffer_hold[context[i].wp]],
+                        context[i].offset_x, context[i].offset_y
+                    ), streamoff);
+                    context[i].flag_dqbuf = false;
+                }
+                CKE(display_commit(d), streamoff);
+                d->frame_count += 1;
             }
-            CKE(display_commit(d), streamoff);
-            d->frame_count += 1;
+        } else {
+            if (displayed) {
+                display_handle_vsync(d);
+                display_commit_pending = false;
+            }
+
+            if (flag_enable_display && !display_commit_pending &&
+                v4l2_drm_have_pending_display_update(d, context, num)) {
+                CKE(v4l2_drm_commit_pending_display_update(d, context, num),
+                    streamoff);
+                display_commit_pending = true;
+            }
         }
     }
     streamoff:
@@ -484,19 +555,36 @@ int v4l2_drm_run(struct v4l2_drm_context context[], unsigned num, v4l2_drm_handl
     return 0;
 }
 
+int v4l2_drm_run(struct v4l2_drm_context context[], unsigned num,
+                 v4l2_drm_handler handler)
+{
+    return v4l2_drm_run_impl(context, num, handler, false);
+}
+
+int v4l2_drm_run_event_driven(struct v4l2_drm_context context[], unsigned num,
+                              v4l2_drm_handler handler)
+{
+    return v4l2_drm_run_impl(context, num, handler, true);
+}
+
 bool v4l2_drm_run_v4l2_2_drm_need_run = 1;
 
-static int v4l2_drm_run_v4l2_2_drm_have_data_to_display(const struct display* d, const struct v4l2_drm_context context[], unsigned num)
+static int v4l2_drm_run_v4l2_2_drm_have_data_to_display(
+    const struct display* d,
+    const struct v4l2_drm_context context[],
+    unsigned num)
 {
-    if(d->lvgl_disp_buffer || d->osd_disp_buffer)
+    if (d->lvgl_disp_buffer || d->osd_disp_buffer)
         return 1;
 
     for (unsigned i = 0; i < num; i++) {
-        if ((context[i].buffer_hold[context[i].wp] >= 0) && (context[i].display))
+        if (context[i].buffer_hold[context[i].wp] >= 0 &&
+            context[i].display)
             return 1;
     }
-    return 0;//no data
+    return 0; // no data
 }
+
 int v4l2_drm_run_v4l2_2_drm(struct v4l2_drm_context context[], unsigned num, v4l2_drm_handler handler) {
     int flag_enable_display = 0;
     int display_fd;
@@ -621,27 +709,30 @@ int v4l2_drm_run_v4l2_2_drm(struct v4l2_drm_context context[], unsigned num, v4l
         }
 
         if (flag_enable_display && fds[num].revents) {
-            if(!v4l2_drm_run_v4l2_2_drm_have_data_to_display(d,context,num)){
-                usleep(10000);// delay 10ms
-                continue; //no data to dispaly
+            if (!v4l2_drm_run_v4l2_2_drm_have_data_to_display(
+                    d, context, num)) {
+                usleep(10000);
+                continue;
             }
             display_handle_vsync(d);
             for (unsigned i = 0; i < num; i++) {
-                if ((!context[i].display) || (context[i].buffer_hold[context[i].wp] < 0)) {
+                if (!context[i].display ||
+                    context[i].buffer_hold[context[i].wp] < 0) {
                     continue;
                 }
                 CKE(display_update_buffer(
-                    context[i].display_buffers[context[i].buffer_hold[context[i].wp]],
+                    context[i].display_buffers[
+                        context[i].buffer_hold[context[i].wp]],
                     context[i].offset_x, context[i].offset_y
                 ), streamoff);
                 context[i].flag_dqbuf = false;
             }
-            if(d->osd_disp_buffer){
-                display_update_buffer(d->osd_disp_buffer,0,0 );
+            if (d->osd_disp_buffer) {
+                display_update_buffer(d->osd_disp_buffer, 0, 0);
                 d->osd_disp_buffer = NULL;
             }
-            if(d->lvgl_disp_buffer){
-                display_update_buffer(d->lvgl_disp_buffer,0,0 );
+            if (d->lvgl_disp_buffer) {
+                display_update_buffer(d->lvgl_disp_buffer, 0, 0);
                 d->lvgl_disp_buffer = NULL;
             }
 

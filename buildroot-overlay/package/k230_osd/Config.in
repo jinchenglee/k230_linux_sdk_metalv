@@ -1,0 +1,15 @@
+config BR2_PACKAGE_K230_OSD
+    bool "k230 shared OSD overlay library"
+    select BR2_PACKAGE_DISPLAY
+    select BR2_PACKAGE_OPENCV4
+    help
+        Shared double-buffered ARGB OSD overlay for K230 camera/AI apps.
+        One copy of the OSD plane buffer/swap/rotation plumbing that both
+        apriltag_demo and tinytag_detect (and future apps) link, instead of
+        each app carrying a divergence-prone duplicate. It owns the
+        double-buffered FRONT/BACK OSD plane, the tear-free osd_disp_buffer
+        swap, overlay generation gating, and the landscape / LCD-fastpath /
+        rotate-fallback rotation; the app does its own drawing.
+
+        See package/k230_osd/include/k230_osd.h for the lifecycle and the
+        fast-detection (faster-than-vsync) clearing caveat.

@@ -235,6 +235,7 @@ target_compile_definitions(${sequence_bin} PRIVATE
 target_link_libraries(${rvv_bin}
     -Wl,--start-group
     ${APRILTAG_RVV_LIB}
+    k230_osd
     opencv_videoio
     opencv_imgcodecs
     opencv_imgproc
@@ -253,6 +254,7 @@ target_link_libraries(${rvv_bin}
 target_link_libraries(${c_bin}
     -Wl,--start-group
     ${APRILTAG_C_LIB}
+    k230_osd
     opencv_videoio
     opencv_imgcodecs
     opencv_imgproc

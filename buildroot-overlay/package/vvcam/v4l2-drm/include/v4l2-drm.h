@@ -64,6 +64,12 @@ int v4l2_drm_setup(struct v4l2_drm_context context[], unsigned num, struct displ
  * @param fps Array of FPS output, NULL if not used
  */
 int v4l2_drm_run(struct v4l2_drm_context ctx[], unsigned num, v4l2_drm_handler handler);
+/*
+ * Opt-in update-driven scheduler: submit only fresh camera/OSD/LVGL buffers
+ * while preserving the legacy v4l2_drm_run callback cadence for other apps.
+ */
+int v4l2_drm_run_event_driven(struct v4l2_drm_context ctx[], unsigned num,
+                              v4l2_drm_handler handler);
 int v4l2_drm_run_v4l2_2_drm(struct v4l2_drm_context ctx[], unsigned num, v4l2_drm_handler handler);
 
 

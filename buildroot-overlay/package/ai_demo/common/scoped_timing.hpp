@@ -28,6 +28,51 @@
 #include <chrono>
 #include <string>
 #include <iostream>
+#include <sstream>
+
+namespace scoped_timing_detail
+{
+// Optional per-thread sink used by callers that must decide whether a
+// frame's diagnostics should be emitted only after the work has completed.
+// The default remains nullptr, so existing users continue to print directly.
+inline thread_local std::string *output_buffer = nullptr;
+
+inline void write(const std::string &line)
+{
+	if (output_buffer)
+		output_buffer->append(line);
+	else
+		std::cout << line << std::flush;
+}
+} // namespace scoped_timing_detail
+
+// Temporarily capture ScopedTiming (and related diagnostic) output on the
+// current thread. Nested captures restore the previous sink on destruction.
+class ScopedTimingCapture
+{
+public:
+	explicit ScopedTimingCapture(std::string &buffer)
+		: previous_(scoped_timing_detail::output_buffer)
+	{
+		scoped_timing_detail::output_buffer = &buffer;
+	}
+
+	~ScopedTimingCapture()
+	{
+		scoped_timing_detail::output_buffer = previous_;
+	}
+
+	ScopedTimingCapture(const ScopedTimingCapture &) = delete;
+	ScopedTimingCapture &operator=(const ScopedTimingCapture &) = delete;
+
+private:
+	std::string *previous_;
+};
+
+inline void scoped_timing_write(const std::string &line)
+{
+	scoped_timing_detail::write(line);
+}
 
 /**
  * @brief 计时类
@@ -61,7 +106,9 @@ public:
 		{
 			m_stop = std::chrono::steady_clock::now();
 			double elapsed_ms = std::chrono::duration<double, std::milli>(m_stop - m_start).count();
-			std::cout << m_info << " took " << elapsed_ms << " ms" << std::endl;
+			std::ostringstream line;
+			line << m_info << " took " << elapsed_ms << " ms\n";
+			scoped_timing_write(line.str());
 		}
 	}
 

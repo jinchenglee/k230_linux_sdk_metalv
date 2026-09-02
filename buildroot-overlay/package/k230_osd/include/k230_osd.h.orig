@@ -1,0 +1,82 @@
+/* k230_osd.h -- shared, zero-copy ARGB OSD overlay for K230 apps.
+ *
+ * Three DRM buffers form a bounded latest-wins queue:
+ *
+ *   FRONT (scanout) -> PENDING (next atomic commit) -> READY/DRAWING (CPU)
+ *
+ * The producer never writes FRONT or PENDING. If it outruns vsync it repaints
+ * an uncommitted READY buffer, dropping stale overlay work instead of blocking
+ * detection or growing latency. The display callback retires PENDING only
+ * after the preceding page-flip event signals completion.
+ *
+ * Producer lifecycle, once per detection:
+ *   k230_osd_prepare(osd);       // acquire + pre-clear a CPU-owned buffer
+ *   ... capture / hardware detection ...
+ *   cv::Mat &canvas = k230_osd_begin(osd);
+ *   ... draw overlay ...
+ *   k230_osd_publish(osd);       // cache flush + READY, no memcpy
+ *
+ * Display callback:
+ *   k230_osd_on_frame(osd, displayed);
+ */
+#ifndef K230_OSD_H
+#define K230_OSD_H
+
+#include <stdbool.h>
+#include <stdint.h>
+
+#include <opencv2/core.hpp>
+
+#include "display.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/* FRONT + PENDING + one producer-owned buffer. */
+#define K230_OSD_BUFFER_COUNT 3
+
+typedef enum {
+    /* Draw directly into the pitch-aware mapped DRM buffer. */
+    K230_OSD_MODE_FAST = 0,
+    /* Draw landscape, then rotate directly into the mapped DRM buffer. */
+    K230_OSD_MODE_SLOW_ROTATE = 1,
+} k230_osd_mode;
+
+typedef struct {
+    uint32_t width;
+    uint32_t height;
+    bool lcd_fastpath;
+    k230_osd_mode mode;
+} k230_osd_config;
+
+typedef struct k230_osd k230_osd;
+
+k230_osd *k230_osd_create(struct display *display,
+                           const k230_osd_config *config);
+
+/* Stop producer/display callbacks before destroying the object. */
+void k230_osd_destroy(k230_osd *osd);
+
+/* Commit this cleared buffer once during display startup. */
+const struct display_buffer *k230_osd_front_buffer(const k230_osd *osd);
+
+/* Takes effect on the next prepare; an in-progress frame keeps its mode. */
+void k230_osd_set_mode(k230_osd *osd, k230_osd_mode mode);
+
+void k230_osd_prepare(k230_osd *osd);
+cv::Mat &k230_osd_begin(k230_osd *osd);
+void k230_osd_publish(k230_osd *osd);
+void k230_osd_on_frame(k230_osd *osd, bool displayed);
+
+/* Lightweight telemetry for on-device latency/throughput validation. */
+uint64_t k230_osd_generation(const k230_osd *osd);
+uint64_t k230_osd_displayed_generation(const k230_osd *osd);
+uint64_t k230_osd_dropped_frames(const k230_osd *osd);
+bool k230_osd_lcd_fastpath(const k230_osd *osd);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* K230_OSD_H */

@@ -242,7 +242,12 @@ void TinyTagDet::decode_proposals(FrameSize frame_size, std::vector<Proposal> &p
                 kept.push_back(cand);
         }
         if (debug_mode_ > 1)
-            std::printf("roi_iou_suppress: %zu -> %zu proposals\n", proposals.size(), kept.size());
+        {
+            char line[128];
+            std::snprintf(line, sizeof(line), "roi_iou_suppress: %zu -> %zu proposals\n",
+                          proposals.size(), kept.size());
+            scoped_timing_write(line);
+        }
         proposals.swap(kept);
     }
 }
@@ -302,7 +307,11 @@ void TinyTagDet::post_process(FrameSize frame_size, cv::Mat full_res_gray,
                 if (debug_mode_ > 1)
                 {
                     double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-                    std::printf("post_process: cv_crop_decode (one roi) dets=%zu took %.4f ms\n", dets.size(), ms);
+                    char line[160];
+                    std::snprintf(line, sizeof(line),
+                                  "post_process: cv_crop_decode (one roi) dets=%zu took %.4f ms\n",
+                                  dets.size(), ms);
+                    scoped_timing_write(line);
                 }
             }
             for (auto &d : dets)

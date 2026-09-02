@@ -24,6 +24,7 @@ menu "canaan package"
 	source "package/camera_webrtc_demo/Config.in"
 	source "package/apriltag/Config.in"
 	source "package/apriltag_demo/Config.in"
+	source "package/k230_osd/Config.in"
 	source "package/nn_profile/Config.in"
 	source "package/audio_rec_play/Config.in"
 

@@ -1,6 +1,6 @@
 APRILTAG_DEMO_SITE = $(realpath $(TOPDIR))"/package/apriltag_demo"
 APRILTAG_DEMO_SITE_METHOD = local
-APRILTAG_DEMO_DEPENDENCIES += opencv4 display vvcam libmmz apriltag binutils linux
+APRILTAG_DEMO_DEPENDENCIES += opencv4 display vvcam libmmz apriltag k230_osd binutils linux
 APRILTAG_DEMO_RVV_DIR ?= $(realpath $(TOPDIR)/../../../apriltag-rvv)
 # Legacy production-only force control. Workload and profile have separate
 # controls so forcing production does not rebuild instrumented variants.

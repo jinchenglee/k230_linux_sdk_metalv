@@ -23,7 +23,7 @@ if(CMAKE_TOOLCHAIN_FILE MATCHES "buildroot/toolchainfile.cmake")
     # the sysroot as opencv_videoio's own transitive dependencies, but
     # opencv_videoio doesn't re-export their symbols to our own direct API
     # calls, so they need to be linked explicitly here too.
-    target_link_libraries(${bin} PRIVATE apriltag opencv_videoio avcodec avformat avutil swscale)
+    target_link_libraries(${bin} PRIVATE apriltag opencv_videoio avcodec avformat avutil swscale k230_osd)
 
     # apriltag-rvv: the same RVV-accelerated AprilTag detector
     # apriltag_demo.elf's --rvv mode uses, offered here as an alternative

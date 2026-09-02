@@ -192,6 +192,145 @@ optionally let VICAP/ISP emit the decimated detection channel) are written up
 in `package/apriltag_demo/README.md` under "Frame flow and hardware-offload
 priorities".
 
+### 3.2 Current buffer and thread topology (updated 2026-09-01)
+
+The 2026-07-29 diagram above is intentionally retained as the **before**
+snapshot. The current implementation has removed the single-buffered OSD copy
+and uses the opt-in event-driven DRM loop, but it has **not yet shortened the
+detection camera-buffer lifetime**. The remaining warning marker is therefore
+on the detect-channel MMAP buffer, not the OSD handoff.
+
+Sizes below use the same 1280x720 detect channel and 1920x1080 HDMI example as
+the original drawing. Landscape OSD height follows the camera destination
+rectangle; for a 1920x1080 mode that is still 1920x1080.
+
+```
+                     OV5647 / GC2093 ──► MIPI CSI-2 ──► VICAP + ISP
+                                                              │
+                    ┌─────────────────────────────────────────┴──────────────────┐
+                    │  TWO INDEPENDENT V4L2 CAPTURE CHANNELS off the same ISP    │
+                    ▼                                                            ▼
+ /dev/video<N+1> "detect" channel                      /dev/video<N> "display" channel
+ MMAP, 3 × NV12 1280x720                               DMABUF, 4 × NV12 1920x1080
+
+╔═════════════════════════════════════════════╗   ╔═════════════════════════════════════════════╗
+║ THREAD "apriltag-detect"                   ║   ║ THREAD "apriltag-disp"                     ║
+║ detect_proc                                 ║   ║ display_proc + frame_handler              ║
+╠═════════════════════════════════════════════╣   ╠═════════════════════════════════════════════╣
+║                                             ║   ║                                             ║
+║ k230_osd_prepare()                          ║   ║ v4l2_drm_run_event_driven()                ║
+║   FREE or replaceable READY → DRAWING       ║   ║   poll(display video_fd, DRM fd)           ║
+║   memset mapped DRM OSD buffer              ║   ║   at most ONE atomic commit in flight      ║
+║        │                                    ║   ║        │                                    ║
+║        ▼                                    ║   ║        ▼                                    ║
+║ detect kernel queue [B0][B1][B2]            ║   ║ display DMABUF ring [V0][V1][V2][V3]      ║
+║        │ VIDIOC_DQBUF                       ║   ║   newest uncommitted camera frame wins     ║
+║        ▼                                    ║   ║   older pending arrival is DQBUF/QBUF      ║
+║ ┌───────────────────────────────────────┐   ║   ║        │                                    ║
+║ │ B[idx].mmap: NV12 1280x720            │   ║   ║        └──► no CPU video copy              ║
+║ │ Y plane: zero-copy detector input     │   ║   ║                                             ║
+║ │ UV plane: unused                      │   ║   ║ completed page flip:                       ║
+║ └───────────────────────────────────────┘   ║   ║   OSD PENDING → FRONT                     ║
+║        │                                    ║   ║   old OSD FRONT → FREE                    ║
+║        │ optional full-resolution denoise   ║   ║   newest OSD READY → PENDING              ║
+║        ▼                                    ║   ║        │                                    ║
+║ apriltag_detect() — synchronous             ║   ║        ▼                                    ║
+║ decimate → threshold → CCL → quads → decode ║   ║ next atomic commit includes:              ║
+║        │                                    ║   ║   • freshest pending camera DMABUF         ║
+║        ▼                                    ║   ║   • optional new OSD PENDING buffer        ║
+║ detections[] (detect-thread local)           ║   ║                                             ║
+║        │                                    ║   ╚═════════════════════════════════════════════╝
+║        ▼                                    ║
+║ draw quads/text DIRECTLY into mapped        ║
+║ ARGB8888 OSD buffer in DRAWING state        ║
+║   no draw_frame heap canvas                 ║
+║   no full-frame OSD memcpy                  ║
+║        │                                    ║
+║        ▼                                    ║
+║ k230_osd_publish()                          ║
+║   dcache clean mapped buffer                ║
+║   DRAWING → READY (latest wins)             ║
+║   superseded READY → FREE, drop++           ║
+║        │                                    ║
+║        ▼                                    ║
+║ ⚠ B[idx] IS STILL DEQUEUED HERE             ║
+║        │                                    ║
+║        └── VIDIOC_QBUF after detect + OSD   ║
+╚═════════════════════════════════════════════╝
+
+              ┌──────── shared k230_osd ownership (short mutex only) ────────┐
+              │                                                             │
+              │ Three pitch-aware ARGB8888 DRM buffers (~8.29 MB each):     │
+              │                                                             │
+              │   FREE → DRAWING → READY → PENDING → FRONT ─────────┐       │
+              │     ▲                                               │       │
+              │     └────────────── completed flip ─────────────────┘       │
+              │                                                             │
+              │ Producer never touches FRONT/PENDING. If it outruns display,│
+              │ it repaints uncommitted READY: bounded memory, latest wins. │
+              └─────────────────────────────────────────────────────────────┘
+
+                       ┌────────── DRM / KMS planes ──────────┐
+                       │ VIDEO: one of four NV12 DMABUFs      │
+                       │ OSD:   FRONT of three ARGB buffers   │
+                       │ hardware alpha-composite → HDMI/LCD │
+                       └──────────────────────────────────────┘
+
+ Third thread: main() — blocking STDIN hotkeys; atomics only.
+ Startup: condition-variable handshake. Shutdown: producer joins before OSD/display teardown.
+
+ ─ ─ ─ ─ ─ ─ ─ ─ NEXT CHANGE (not implemented yet) ─ ─ ─ ─ ─ ─ ─ ─
+
+ DQBUF B[idx] → short Stage-0 ingest/decimate into detector-owned storage → QBUF B[idx]
+                                                                    │
+                                                                    ▼
+                  remaining threshold/CCL/quad/decode + OSD proceeds
+                  without holding a capture buffer or back-pressuring ISP
+```
+
+What changed relative to the original topology:
+
+1. **OSD bottleneck resolved.** The heap `draw_frame`, 8.29 MB per-overlay
+   memcpy, and long `result_mutex` critical section are gone. The producer
+   draws into one of three mapped DRM buffers; exact FRONT/PENDING retirement
+   prevents scanout reuse, while READY replacement bounds latency when
+   detection outruns OSD commits.
+2. **Display scheduling is opt-in and event-driven.** Only the tag apps call
+   `v4l2_drm_run_event_driven()`. It drains a completed flip before submitting
+   another and commits only when a fresh camera or OSD plane update exists;
+   legacy users of `v4l2_drm_run()` retain their old behavior.
+3. **Camera-buffer hold remains.** `detect_proc` still passes the dequeued
+   MMAP Y plane directly into the synchronous detector and calls
+   `v4l2_drm_dump_release()` only after drawing and publishing the overlay.
+   This is now the next structural bottleneck.
+
+The CPU-side OSD traffic is now approximately one mapped-buffer clear plus one
+cache writeback per produced overlay. The full-frame `draw_frame → DRM` read +
+write pair has been eliminated:
+
+| Current path | Bytes touched by the CPU |
+|---|---|
+| Y-plane read into `detect()` | 921 KB read |
+| Decimate + threshold + CCL | ~700 KB read/write over a 230 KB working set |
+| Denoise, if enabled | +1.8 MB at 1280x720 |
+| Clear DRAWING OSD buffer | ~8.29 MB write |
+| Draw overlay primitives | proportional to quads/text, directly in mapped OSD |
+| Old full-frame OSD memcpy | **0** (removed: 8.29 MB read + 8.29 MB write) |
+| Publish OSD | cache clean/writeback of the mapped buffer range |
+
+Live-board telemetry after this change reached roughly `camera: 28`,
+`detect: 28`, `osd: 21`, `display: 51`, and `poll: 80` fps in the reported
+sample. `drop:` is cumulative and counts READY overlays superseded by newer
+results before staging; it demonstrates the intended latest-wins policy, not
+an unbounded queue.
+
+The next change should split the detector immediately after input ingest
+(factor-2 decimation in the common case), retain the decimated image in
+detector-owned persistent storage, and requeue the MMAP capture buffer before
+threshold/CCL/quad/decode. That shortens ownership without adding another
+full-resolution copy. Whether acquisition later deserves its own thread is a
+separate scheduling decision; it is not required for the first lifetime fix.
+
 ## 4. NV12 Y-plane ↔ `detect()` compatibility
 
 `detect()` takes an explicit `stride` separate from `width`, which makes the
