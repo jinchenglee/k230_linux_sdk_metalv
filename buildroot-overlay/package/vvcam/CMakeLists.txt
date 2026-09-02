@@ -19,6 +19,34 @@ foreach(profile ov5647.xml ov5647.manual.json ov5647.auto.json)
         string(REPLACE "[ 1920]" "[ 1280]" profile_text "${profile_text}")
         string(REPLACE "[ 1080]" "[ 720]" profile_text "${profile_text}")
     endif()
+    # The lens-shading mesh is stored as 33x33 samples plus sector tables that
+    # give, in pixels, how far apart those samples sit.  The sector tables are
+    # therefore a statement about the frame the mesh was calibrated against.
+    # Relabelling a 1920x1080 profile as 1280x720 without rescaling them leaves
+    # the ISP walking the mesh with a row pitch that overruns the shorter
+    # frame, which shows up as severe horizontal banding in luma (the mesh row
+    # applied to a given image row is effectively arbitrary).  Rescale both
+    # axes by 2/3 so the sectors span the 720p frame: 32 x 60 -> 32 x 40 across
+    # 1280 columns, and a 540-row half-height table -> 360 rows.  The mesh
+    # samples themselves are untouched and remain 1080p-derived, so corner
+    # falloff is only approximately corrected until a real 720p flat-field
+    # calibration replaces this starter profile.
+    if(profile STREQUAL "ov5647.manual.json")
+        string(REPLACE "60, 60, 60, 60, 60, 60, 60, 60, 60, 60, 60, 60, 60, 60, 60, 60, 60, 60, 60, 60, 60, 60, 60, 60, 60, 60, 60, 60, 60, 60, 60, 60"
+                       "40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40"
+               profile_text "${profile_text}")
+        string(REPLACE "34, 34, 33, 34, 34, 34, 33, 34, 34, 34, 33, 34, 34, 34, 33, 34"
+                       "23, 22, 23, 22, 23, 22, 23, 22, 23, 22, 23, 22, 23, 22, 23, 22"
+               profile_text "${profile_text}")
+    endif()
+    if(profile STREQUAL "ov5647.xml")
+        string(REPLACE "[60 60 60 60 60 60 60 60 60 60 60 60 60 60 60 60 60 60 60 60 60 60 60 60 60 60 60 60 60 60 60 60]"
+                       "[40 40 40 40 40 40 40 40 40 40 40 40 40 40 40 40 40 40 40 40 40 40 40 40 40 40 40 40 40 40 40 40]"
+               profile_text "${profile_text}")
+        string(REPLACE "[34 34 33 34 34 34 33 34 34 34 33 34 34 34 33 34]"
+                       "[23 22 23 22 23 22 23 22 23 22 23 22 23 22 23 22]"
+               profile_text "${profile_text}")
+    endif()
     string(REPLACE "ov5647" "ov5647-1280x720" profile_name "${profile}")
     file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/${profile_name}" "${profile_text}")
     list(APPEND OV5647_720P_STARTER_PROFILES

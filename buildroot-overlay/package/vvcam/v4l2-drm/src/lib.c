@@ -255,6 +255,52 @@ fail_close:
     return -1;
 }
 
+/* CPROC (color processing) control ids, ISP-side.  These are driven through
+ * the video device's VIDIOC_S_CTRL, which the kernel forwards to the ISP
+ * subdev control handler (vvcam_isp_s_ctrl -> v4l2_s_ctrl) where the CPROC
+ * block is registered.  Values match vvcam_isp_cproc.h. */
+#define V4L2_DRM_CPROC_BASE            (V4L2_CID_USER_BASE + 0x2900)
+#define V4L2_DRM_CPROC_ENABLE         (V4L2_DRM_CPROC_BASE + 0x0000)
+#define V4L2_DRM_CPROC_MODE           (V4L2_DRM_CPROC_BASE + 0x0003) /* 0=auto 1=manual */
+#define V4L2_DRM_CPROC_MANU_SATURATION (V4L2_DRM_CPROC_BASE + 0x000C)
+
+int v4l2_drm_set_luma_only(unsigned device, bool enable)
+{
+    char path[64];
+    int fd;
+
+    snprintf(path, sizeof(path), "/dev/video%u", device);
+    fd = open(path, O_RDWR | O_NONBLOCK);
+    if (fd < 0) {
+        fprintf(stderr, "v4l2-drm: cannot open %s: %s\n", path, strerror(errno));
+        return -1;
+    }
+
+    /* Enable the CPROC block and switch it to manual control so the
+     * saturation value we set is honored (not overridden by auto tuning). */
+    if (enable) {
+        if (ioctl(fd, VIDIOC_S_CTRL, &(struct v4l2_control){.id = V4L2_DRM_CPROC_ENABLE, .value = 1}) < 0 ||
+            ioctl(fd, VIDIOC_S_CTRL, &(struct v4l2_control){.id = V4L2_DRM_CPROC_MODE, .value = 1}) < 0 ||
+            ioctl(fd, VIDIOC_S_CTRL, &(struct v4l2_control){.id = V4L2_DRM_CPROC_MANU_SATURATION, .value = 0}) < 0) {
+            fprintf(stderr, "v4l2-drm: cannot set luma-only CPROC on %s: %s\n",
+                    path, strerror(errno));
+            close(fd);
+            return -1;
+        }
+    } else {
+        if (ioctl(fd, VIDIOC_S_CTRL, &(struct v4l2_control){.id = V4L2_DRM_CPROC_MODE, .value = 0}) < 0 ||
+            ioctl(fd, VIDIOC_S_CTRL, &(struct v4l2_control){.id = V4L2_DRM_CPROC_ENABLE, .value = 0}) < 0) {
+            fprintf(stderr, "v4l2-drm: cannot restore color CPROC on %s: %s\n",
+                    path, strerror(errno));
+            close(fd);
+            return -1;
+        }
+    }
+
+    close(fd);
+    return 0;
+}
+
 void v4l2_drm_default_context(struct v4l2_drm_context* ctx) {
     memset(ctx, 0 , sizeof(*ctx));
     ctx->width = 640;

@@ -857,6 +857,9 @@ int main(int argc, char* argv[])
             sensor_width, sensor_height, sensor_fps,
             sensor_mode_result == 0 ? " (preferred)" : " (fallback)");
 
+    if (v4l2_drm_set_luma_only(kd_mpi_get_vvcam_video00(), true) < 0)
+        fprintf(stderr, "[input] luma-only unavailable, keeping color path\n");
+
     std::thread detect_thread(detect_proc, kd_mpi_get_vvcam_video00() + 1);
     std::thread display_thread(display_proc, kd_mpi_get_vvcam_video00());
 

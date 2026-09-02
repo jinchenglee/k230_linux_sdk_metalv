@@ -70,6 +70,13 @@ int v4l2_drm_request_sensor_mode(unsigned device,
                                   uint32_t fallback_fps,
                                   uint16_t *selected_width, uint16_t *selected_height,
                                   uint32_t *selected_fps);
+/* Opt-in luma-only capture: programs the ISP color (CPROC) block to output
+ * neutral chroma (grayscale), so the NV12 stream both detection and the
+ * hardware display plane read carries Y/luma only. This is a one-time
+ * control-plane call at setup -- zero per-frame CPU cost -- and is additive:
+ * applications that never call it keep the previous color path unchanged.
+ * Returns 0 on success (device found and control accepted), -1 otherwise. */
+int v4l2_drm_set_luma_only(unsigned device, bool enable);
 // use /dev/dri/card0 as default
 int v4l2_drm_setup(struct v4l2_drm_context context[], unsigned num, struct display** display);
 /**
