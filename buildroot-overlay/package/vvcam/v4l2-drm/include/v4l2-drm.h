@@ -57,6 +57,19 @@ struct v4l2_drm_context {
 typedef int(*v4l2_drm_handler)(struct v4l2_drm_context* ctx, bool displayed);
 
 void v4l2_drm_default_context(struct v4l2_drm_context* ctx);
+/*
+ * Request a physical-camera mode by capability.  The active sensor driver
+ * resolves its own opaque mode index.  Returns 0 for the preferred mode, 1
+ * for the fallback mode, and -1 when neither is supported or configuration
+ * cannot be applied.  Must be called before capture starts.
+ */
+int v4l2_drm_request_sensor_mode(unsigned device,
+                                  uint16_t preferred_width, uint16_t preferred_height,
+                                  uint32_t preferred_fps,
+                                  uint16_t fallback_width, uint16_t fallback_height,
+                                  uint32_t fallback_fps,
+                                  uint16_t *selected_width, uint16_t *selected_height,
+                                  uint32_t *selected_fps);
 // use /dev/dri/card0 as default
 int v4l2_drm_setup(struct v4l2_drm_context context[], unsigned num, struct display** display);
 /**
@@ -76,6 +89,11 @@ int v4l2_drm_run_v4l2_2_drm(struct v4l2_drm_context ctx[], unsigned num, v4l2_dr
 int v4l2_drm_start(const struct v4l2_drm_context* context);
 int v4l2_drm_stop(const struct v4l2_drm_context* context);
 int v4l2_drm_dump(struct v4l2_drm_context* context, int timeout);
+/* Latest-wins variant of v4l2_drm_dump(): waits for readiness, then drains the
+ * driver's done-queue FIFO, immediately requeuing (QBUF) every older buffer and
+ * keeping only the newest one in context->vbuffer. This discards queued stale
+ * frames; as with the legacy API, a buffer remains held until dump_release(). */
+int v4l2_drm_dump_latest(struct v4l2_drm_context* context, int timeout);
 int v4l2_drm_dump_release(struct v4l2_drm_context* context);
 extern bool v4l2_drm_run_v4l2_2_drm_need_run;
 #ifdef __cplusplus

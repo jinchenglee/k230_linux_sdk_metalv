@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <string.h>
 #include <vvcam_sensor.h>
 
 extern struct vvcam_sensor vvcam_ov5647;
@@ -6,7 +7,6 @@ extern struct vvcam_sensor vvcam_imx335;
 extern struct vvcam_sensor vvcam_gc2093;
 extern struct vvcam_sensor vvcam_gc2053;
 extern struct vvcam_sensor vvcam_bf3238;
-
 
 void vvcam_sensor_init(void) {
     // get /dev/media0

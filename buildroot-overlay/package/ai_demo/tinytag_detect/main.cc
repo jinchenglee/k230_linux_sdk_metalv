@@ -38,8 +38,8 @@ namespace
 void print_usage(const char *name)
 {
     cout << "Usage: " << name
-         << " <kmodel> <input> <heatmap_thres> <max_proposals> <roi_expand> <debug_mode>"
-         << " [roi_iou_thres]" << endl
+         << " <kmodel> <input> <heatmap_thres> <max_proposals> <roi_expand> <profile_mode>"
+         << " [roi_iou_thres] [--debug]" << endl
          << "Options:" << endl
          << "  kmodel          tinytag kmodel path\n"
          << "  input           one of:\n"
@@ -57,13 +57,13 @@ void print_usage(const char *name)
          << "                    - \"ProfileOps\": diagnostic mode, no camera/image/video --\n"
          << "                      loads the kmodel, runs it a few times with the nncase runtime's\n"
          << "                      built-in per-op profiler enabled, and prints per-op timing (only\n"
-         << "                      heatmap_thres/debug_mode args are used, both ignored)\n"
+         << "                      heatmap_thres/profile_mode args are used, both ignored)\n"
          << "  heatmap_thres   proposal confidence threshold (0.20 at the training repo's frozen\n"
          << "                  operating point -- see experimental/tinytag-v6/HEADS_AND_POSTPROCESSING.md)\n"
          << "  max_proposals   top-K cap on proposals per frame (20 at that same operating point)\n"
          << "  roi_expand      safety margin multiplied onto each proposal's decoded size before\n"
          << "                  cropping for CV decode (1.5 at that same operating point)\n"
-         << "  debug_mode      0 (silent), 1 (per-stage timing), 2 (+ per-ROI timing and verbose logs)\n"
+         << "  profile_mode    0 (silent), 1 (per-stage timing), 2 (+ per-ROI timing and verbose logs)\n"
          << "                  In live mode, confirmed detections and their per-stage timings are\n"
          << "                  always printed; timing from zero-detection frames is discarded.\n"
          << "  roi_iou_thres   OPTIONAL (default 0.5). Drop a proposal whose box overlaps a kept\n"
@@ -71,6 +71,8 @@ void print_usage(const char *name)
          << "                  CV decode. The spec's 3x3 NMS only suppresses heatmap *cells*, so\n"
          << "                  well-separated peaks can still decode to near-identical boxes.\n"
          << "                  Pass 0 to disable and match the reference spec exactly.\n"
+         << "  --debug         emit live-loop timing (capture wait/requeue, ROI copy, OSD,\n"
+         << "                  and whole-frame wall time) for confirmed detections\n"
          << "\n"
          << "Environment:\n"
          << "  TINYTAG_CV_DETECTOR   CV crop-decode backend: unset/\"c\" (default) uses the\n"
@@ -152,6 +154,7 @@ static volatile unsigned osd_staged_count = 0;
 static struct timeval tv, tv2;
 static struct display *g_display;
 static struct k230_osd *g_osd;
+static bool g_live_timing_debug = false;
 
 // Latest once-a-second camera/AI fps, for the on-screen "cam:/det:" HUD
 // text (drawn from ai_proc, right after the detection overlay). Written
@@ -237,23 +240,51 @@ void ai_proc(char *argv[], int video_device)
     fprintf(stderr, "[input] CSI requested %dx%d, negotiated %zux%zu stride=%zu\n", SENSOR_WIDTH,
             SENSOR_HEIGHT, csi_width, csi_height, csi_stride);
 
-    int debug_mode = atoi(argv[6]);
+    int profile_mode = atoi(argv[6]);
     auto decoder = make_crop_decoder(); // TINYTAG_CV_DETECTOR=rvv for AprilTagRVVDecoder, default AprilTagCDecoder
-    // Live mode always retains stage timings long enough to decide whether
-    // this frame has a confirmed tag. debug_mode 2 still enables extra detail.
-    int detector_debug_mode = debug_mode > 1 ? debug_mode : 1;
+    // Profile timing is opt-in. A confirmed detection is represented by the
+    // result vector, not by timing output, so production does not need to
+    // construct or stream per-stage diagnostics.
+    int detector_debug_mode = profile_mode;
     TinyTagDet det(argv[1], atof(argv[3]), atoi(argv[4]), atof(argv[5]), g_roi_iou_thres, decoder,
                    detector_debug_mode);
     std::vector<TinyTagResult> results;
     std::vector<Proposal> proposals;
+    std::vector<ProposalCrop> crops;
+    size_t crop_count = 0;
 
     while (!ai_stop)
     {
+        std::string frame_diagnostics;
+        std::chrono::steady_clock::time_point frame_start;
+        auto append_live_timing = [&](const char *stage,
+                                      std::chrono::steady_clock::time_point start) {
+            if (!g_live_timing_debug)
+                return;
+            const double ms = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - start).count();
+            char line[128];
+            std::snprintf(line, sizeof(line), "live: %s took %.4f ms\n", stage, ms);
+            frame_diagnostics += line;
+        };
+
+        std::chrono::steady_clock::time_point stage_start;
+        if (g_live_timing_debug) {
+            frame_start = std::chrono::steady_clock::now();
+            stage_start = frame_start;
+        }
         k230_osd_prepare(g_osd);
-        int ret = v4l2_drm_dump(&context, 1000);
+        if (g_live_timing_debug)
+            append_live_timing("osd_prepare", stage_start);
+
+        if (g_live_timing_debug)
+            stage_start = std::chrono::steady_clock::now();
+        int ret = v4l2_drm_dump_latest(&context, 1000);
+        if (g_live_timing_debug)
+            append_live_timing("capture_wait_latest", stage_start);
         if (ret)
         {
-            perror("ai_proc: v4l2_drm_dump error");
+            perror("ai_proc: v4l2_drm_dump_latest error");
             continue;
         }
 
@@ -275,7 +306,6 @@ void ai_proc(char *argv[], int video_device)
         // input in one hardware step; feeding it the raw sensor view
         // directly does the whole 1280x720 -> 640x360 downscale itself; no
         // decimate stage needed at all.
-        std::string frame_diagnostics;
         auto run_detection = [&]() {
             cv::Mat net_input(static_cast<int>(csi_height), static_cast<int>(csi_width), CV_8UC1,
                               const_cast<uint8_t *>(y_plane), csi_stride);
@@ -286,12 +316,31 @@ void ai_proc(char *argv[], int video_device)
             cv::Mat full_res_gray(static_cast<int>(csi_height), static_cast<int>(csi_width), CV_8UC1,
                                   const_cast<uint8_t *>(y_plane), csi_stride);
 
-            // k230_osd owns the DRAWING buffer through post-processing and
-            // rendering, so the display thread neither blocks this work nor sees
-            // a partially drawn overlay.
             results.clear();
             proposals.clear();
-            det.post_process({csi_width, csi_height}, full_res_gray, results, &proposals);
+            det.decode_proposals({csi_width, csi_height}, proposals);
+
+            // The neural output has now been converted into a small, bounded
+            // set of ROIs. Copy only those pixels before returning the camera
+            // mmap; the expensive CV tag decode below no longer back-pressures
+            // the capture queue.
+            std::chrono::steady_clock::time_point copy_start;
+            if (g_live_timing_debug)
+                copy_start = std::chrono::steady_clock::now();
+            det.copy_proposal_crops(full_res_gray, proposals, crops, crop_count);
+            if (g_live_timing_debug)
+                append_live_timing("copy_roi_crops", copy_start);
+
+            std::chrono::steady_clock::time_point release_start;
+            if (g_live_timing_debug)
+                release_start = std::chrono::steady_clock::now();
+            if (v4l2_drm_dump_release(&context)) {
+                perror("ai_proc: v4l2_drm_dump_release error");
+                return;
+            }
+            if (g_live_timing_debug)
+                append_live_timing("capture_requeue", release_start);
+            det.decode_proposal_crops(crops, crop_count, results);
         };
 
         {
@@ -302,8 +351,6 @@ void ai_proc(char *argv[], int video_device)
         if (!results.empty())
         {
             g_detected_frame_count.fetch_add(1, std::memory_order_relaxed);
-            if (!frame_diagnostics.empty())
-                cout << frame_diagnostics << std::flush;
             fprintf(stderr, "\n[ai] proposals=%zu detections=%zu\n", proposals.size(), results.size());
             for (const auto &r : results)
                 fprintf(stderr,
@@ -311,7 +358,7 @@ void ai_proc(char *argv[], int video_device)
                         r.id, r.hamming, r.decision_margin, r.proposal_confidence,
                         r.center.x, r.center.y);
         }
-        // Per-proposal ROI coordinates + confidence, gated at debug_mode>=2
+        // Per-proposal ROI coordinates + confidence, gated at profile_mode>=2
         // (same convention as cv_crop_decode's per-ROI timing). Added to
         // check actual on-device proposal positions against host-simulator
         // predictions -- host-side comparison of fp32 vs int8 kmodels on
@@ -325,13 +372,15 @@ void ai_proc(char *argv[], int video_device)
         // specific to the live scene not represented in the validation
         // set -- this print is what distinguishes them: compare these
         // on-device coordinates against where the physical tag actually is.
-        if (debug_mode > 1 && !results.empty())
+        if (profile_mode > 1 && !results.empty())
         {
             for (const auto &p : proposals)
                 fprintf(stderr, "[ai]   proposal conf=%.3f roi=(%.0f,%.0f,%.0f,%.0f)\n", p.confidence,
                         p.roi.x, p.roi.y, p.roi.x + p.roi.width, p.roi.y + p.roi.height);
         }
 
+        if (g_live_timing_debug)
+            stage_start = std::chrono::steady_clock::now();
         cv::Mat &osd = k230_osd_begin(g_osd);
         // Proposals drawn first (cyan boxes + neural confidence), confirmed
         // detections drawn on top (green quads + id) -- so a proposal the
@@ -341,9 +390,21 @@ void ai_proc(char *argv[], int video_device)
         draw_fps_stats(osd, g_cam_fps.load(std::memory_order_relaxed),
                        g_det_fps.load(std::memory_order_relaxed));
         k230_osd_publish(g_osd);
+        if (g_live_timing_debug)
+            append_live_timing("osd_begin_draw_publish", stage_start);
 
         ai_frame_count += 1;
-        v4l2_drm_dump_release(&context);
+        if (!results.empty() && (profile_mode > 0 || g_live_timing_debug))
+        {
+            if (g_live_timing_debug) {
+                const double total_ms = std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - frame_start).count();
+                char line[128];
+                std::snprintf(line, sizeof(line), "live: frame_total took %.4f ms\n", total_ms);
+                frame_diagnostics += line;
+            }
+            cout << frame_diagnostics << std::flush;
+        }
     }
     v4l2_drm_stop(&context);
 }
@@ -551,6 +612,11 @@ void __attribute__((destructor)) cleanup()
 int main(int argc, char *argv[])
 {
     cout << "case " << argv[0] << " built at " << __DATE__ << " " << __TIME__ << endl;
+    if (argc > 1 && strcmp(argv[argc - 1], "--debug") == 0)
+    {
+        g_live_timing_debug = true;
+        --argc;
+    }
     if (argc != 7 && argc != 8)
     {
         print_usage(argv[0]);
@@ -562,7 +628,7 @@ int main(int argc, char *argv[])
     float heatmap_thres = atof(argv[3]);
     int max_proposals = atoi(argv[4]);
     float roi_expand = atof(argv[5]);
-    int debug_mode = atoi(argv[6]);
+    int profile_mode = atoi(argv[6]);
     float roi_iou_thres = (argc == 8) ? atof(argv[7]) : kDefaultRoiIouThres;
     g_roi_iou_thres = roi_iou_thres; // ai_proc reads this (it only gets argv)
 
@@ -580,6 +646,23 @@ int main(int argc, char *argv[])
             cerr << "display_init error, exit" << endl;
             return -1;
         }
+
+        uint16_t sensor_width = 0, sensor_height = 0;
+        uint32_t sensor_fps = 0;
+        int sensor_mode_result = v4l2_drm_request_sensor_mode(
+            kd_mpi_get_vvcam_video00(),
+            1280, 720, 60,
+            1920, 1080, 30,
+            &sensor_width, &sensor_height, &sensor_fps);
+        if (sensor_mode_result < 0) {
+            cerr << "tinytag_detect: active camera supports neither "
+                 << "1280x720@60 nor 1920x1080@30" << endl;
+            display_exit(g_display);
+            return -1;
+        }
+        cerr << "[input] sensor selected " << sensor_width << "x" << sensor_height
+             << "@" << sensor_fps
+             << (sensor_mode_result == 0 ? " (preferred)" : " (fallback)") << endl;
 
         std::thread ai_thread(ai_proc, argv, kd_mpi_get_vvcam_video00() + 1);
         std::thread display_thread(display_proc, kd_mpi_get_vvcam_video00());
@@ -633,23 +716,23 @@ int main(int argc, char *argv[])
         if (want_hw)
         {
             int hw_ret = run_video_file_hw(kmodel_path, image_path, heatmap_thres, max_proposals, roi_expand,
-                                            roi_iou_thres, debug_mode);
+                                            roi_iou_thres, profile_mode);
             if (hw_ret == 0)
                 return 0;
             cerr << "hw video codec path failed (see above), falling back to software" << endl;
         }
         return run_video_file(kmodel_path, image_path, heatmap_thres, max_proposals, roi_expand,
-                               roi_iou_thres, debug_mode);
+                               roi_iou_thres, profile_mode);
     }
 
     auto decoder = make_crop_decoder(); // TINYTAG_CV_DETECTOR=rvv for AprilTagRVVDecoder, default AprilTagCDecoder
     TinyTagDet det(kmodel_path, heatmap_thres, max_proposals, roi_expand, roi_iou_thres, decoder,
-                   debug_mode);
+                   profile_mode);
 
     std::vector<TinyTagResult> results;
     std::vector<Proposal> proposals;
     {
-        ScopedTiming st_total("total (pre_process + inference + post_process)", debug_mode);
+        ScopedTiming st_total("total (pre_process + inference + post_process)", profile_mode);
         det.pre_process(gray);
         det.inference();
         det.post_process({static_cast<size_t>(gray.cols), static_cast<size_t>(gray.rows)}, gray, results,

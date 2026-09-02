@@ -20,6 +20,15 @@ struct Proposal
     cv::Rect2f roi;    // full-frame pixel coords, after roi_expand + clamp
 };
 
+// Detector-owned copy of one clipped proposal ROI. Live capture creates
+// these before returning its V4L2 buffer to the driver.
+struct ProposalCrop
+{
+    Proposal proposal;
+    cv::Rect roi;
+    cv::Mat gray;
+};
+
 // One decoded tag, in full-frame pixel coordinates.
 struct TinyTagResult
 {
@@ -86,6 +95,19 @@ public:
     // then offsets back to full-frame coords (generalizes the training doc's
     // fixed "x2 to full resolution" into band_size/network_input_shape).
     void decode_proposals(FrameSize frame_size, std::vector<Proposal> &proposals);
+
+    // Copy each proposal ROI while full_res_gray is valid. The source may be
+    // a V4L2 mmap and is not accessed after this call returns.
+    static void copy_proposal_crops(cv::Mat full_res_gray,
+                                    const std::vector<Proposal> &proposals,
+                                    std::vector<ProposalCrop> &crops,
+                                    size_t &crop_count);
+
+    // CPU-heavy crop decode from detector-owned ROI copies. Kept separate so
+    // live capture can release its V4L2 buffer before this work begins.
+    void decode_proposal_crops(const std::vector<ProposalCrop> &crops,
+                               size_t crop_count,
+                               std::vector<TinyTagResult> &results);
 
     // Full pipeline: decode_proposals() then, per proposal, crop
     // full_res_gray and run it through `decoder_` (steps 9-11: crop-decode

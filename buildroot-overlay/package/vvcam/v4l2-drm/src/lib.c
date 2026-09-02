@@ -15,7 +15,245 @@
 #include <sys/poll.h>
 #include <sys/select.h>
 #include <unistd.h>
+#include <dlfcn.h>
 #include <v4l2-drm.h>
+
+/* Kept in sync with vvcam_isp_driver.c and v4l2-drm-scene. */
+#define V4L2_DRM_SCENE_CID_BASE V4L2_CID_USER_BASE
+
+struct v4l2_drm_scene_config {
+    char scene_path[128];
+    char sensor[32];
+    char xml_file[128];
+    char manu_json_file[128];
+    char auto_json_file[128];
+    uint32_t mode;
+};
+
+static int v4l2_drm_get_scene_config(int fd, struct v4l2_drm_scene_config *cfg)
+{
+    struct v4l2_ext_controls ctrls = {0};
+    struct v4l2_ext_control ctrl[6] = {0};
+
+    ctrl[0].id = V4L2_DRM_SCENE_CID_BASE;
+    ctrl[0].size = sizeof(cfg->scene_path);
+    ctrl[0].string = cfg->scene_path;
+    ctrl[1].id = V4L2_DRM_SCENE_CID_BASE + 1;
+    ctrl[1].size = sizeof(cfg->sensor);
+    ctrl[1].string = cfg->sensor;
+    ctrl[2].id = V4L2_DRM_SCENE_CID_BASE + 2;
+    ctrl[2].size = sizeof(cfg->xml_file);
+    ctrl[2].string = cfg->xml_file;
+    ctrl[3].id = V4L2_DRM_SCENE_CID_BASE + 3;
+    ctrl[3].size = sizeof(cfg->manu_json_file);
+    ctrl[3].string = cfg->manu_json_file;
+    ctrl[4].id = V4L2_DRM_SCENE_CID_BASE + 4;
+    ctrl[4].size = sizeof(cfg->auto_json_file);
+    ctrl[4].string = cfg->auto_json_file;
+    ctrl[5].id = V4L2_DRM_SCENE_CID_BASE + 5;
+    ctrls.ctrl_class = V4L2_CTRL_CLASS_USER;
+    ctrls.count = 6;
+    ctrls.controls = ctrl;
+    if (ioctl(fd, VIDIOC_G_EXT_CTRLS, &ctrls) < 0)
+        return -1;
+    cfg->mode = ctrl[5].value;
+    return 0;
+}
+
+static int v4l2_drm_set_scene_mode(int fd, const struct v4l2_drm_scene_config *cfg,
+                                   uint32_t mode)
+{
+    struct v4l2_ext_controls ctrls = {0};
+    struct v4l2_ext_control ctrl[6] = {0};
+
+    ctrl[0].id = V4L2_DRM_SCENE_CID_BASE;
+    ctrl[0].size = strlen(cfg->scene_path) + 1;
+    ctrl[0].string = (char *)cfg->scene_path;
+    ctrl[1].id = V4L2_DRM_SCENE_CID_BASE + 1;
+    ctrl[1].size = strlen(cfg->sensor) + 1;
+    ctrl[1].string = (char *)cfg->sensor;
+    ctrl[2].id = V4L2_DRM_SCENE_CID_BASE + 2;
+    ctrl[2].size = strlen(cfg->xml_file) + 1;
+    ctrl[2].string = (char *)cfg->xml_file;
+    ctrl[3].id = V4L2_DRM_SCENE_CID_BASE + 3;
+    ctrl[3].size = strlen(cfg->manu_json_file) + 1;
+    ctrl[3].string = (char *)cfg->manu_json_file;
+    ctrl[4].id = V4L2_DRM_SCENE_CID_BASE + 4;
+    ctrl[4].size = strlen(cfg->auto_json_file) + 1;
+    ctrl[4].string = (char *)cfg->auto_json_file;
+    ctrl[5].id = V4L2_DRM_SCENE_CID_BASE + 5;
+    ctrl[5].value = mode;
+    ctrls.ctrl_class = V4L2_CTRL_CLASS_USER;
+    ctrls.count = 6;
+    ctrls.controls = ctrl;
+    return ioctl(fd, VIDIOC_S_EXT_CTRLS, &ctrls);
+}
+
+/* A sensor mode is usable only when the active ISP scene has a matching
+ * calibration resolution.  The closed isp_media_server reports this only at
+ * STREAMON, so reject it here and allow the caller's fallback instead. */
+static int v4l2_drm_scene_supports_resolution(const struct v4l2_drm_scene_config *cfg,
+                                              uint16_t width, uint16_t height)
+{
+    char path[sizeof(cfg->scene_path) + sizeof(cfg->xml_file) + 2];
+    char resolution[32];
+    char line[256];
+    FILE *xml;
+
+    if (snprintf(path, sizeof(path), "%s/%s", cfg->scene_path, cfg->xml_file) >=
+        (int)sizeof(path))
+        return 0;
+    if (snprintf(resolution, sizeof(resolution), "%ux%u", width, height) >=
+        (int)sizeof(resolution))
+        return 0;
+    xml = fopen(path, "r");
+    if (!xml)
+        return 0;
+    while (fgets(line, sizeof(line), xml)) {
+        if (strstr(line, resolution)) {
+            fclose(xml);
+            return 1;
+        }
+    }
+    fclose(xml);
+    return 0;
+}
+
+static int v4l2_drm_mode_filename(char *out, size_t out_size,
+                                  const char *filename,
+                                  uint16_t width, uint16_t height)
+{
+    /* Keep multi-part suffixes (for example .manual.json) intact so all
+     * siblings share the XML profile's <stem>-<resolution> naming. */
+    const char *suffix = strchr(filename, '.');
+    size_t base_len = suffix ? (size_t)(suffix - filename) : strlen(filename);
+    int written = snprintf(out, out_size, "%.*s-%ux%u%s", (int)base_len,
+                           filename, width, height, suffix ? suffix : "");
+
+    return written >= 0 && (size_t)written < out_size;
+}
+
+/* Look for a sibling per-mode scene.  This derives profile names from the
+ * active scene rather than from a sensor name: e.g. ov5647.xml becomes
+ * ov5647-1280x720.xml.  A future camera enables a mode by shipping its own
+ * three matching files under the same convention. */
+static int v4l2_drm_select_scene_profile(struct v4l2_drm_scene_config *cfg,
+                                         uint16_t width, uint16_t height)
+{
+    struct v4l2_drm_scene_config candidate = *cfg;
+    char path[sizeof(cfg->scene_path) + sizeof(cfg->xml_file) + 2];
+
+    if (v4l2_drm_scene_supports_resolution(cfg, width, height))
+        return 1;
+    if (!v4l2_drm_mode_filename(candidate.xml_file, sizeof(candidate.xml_file),
+                                 cfg->xml_file, width, height) ||
+        !v4l2_drm_mode_filename(candidate.manu_json_file,
+                                 sizeof(candidate.manu_json_file),
+                                 cfg->manu_json_file, width, height) ||
+        !v4l2_drm_mode_filename(candidate.auto_json_file,
+                                 sizeof(candidate.auto_json_file),
+                                 cfg->auto_json_file, width, height))
+        return 0;
+    if (snprintf(path, sizeof(path), "%s/%s", candidate.scene_path,
+                 candidate.xml_file) >= (int)sizeof(path) || access(path, R_OK) != 0)
+        return 0;
+    if (snprintf(path, sizeof(path), "%s/%s", candidate.scene_path,
+                 candidate.manu_json_file) >= (int)sizeof(path) || access(path, R_OK) != 0)
+        return 0;
+    if (snprintf(path, sizeof(path), "%s/%s", candidate.scene_path,
+                 candidate.auto_json_file) >= (int)sizeof(path) || access(path, R_OK) != 0)
+        return 0;
+    if (!v4l2_drm_scene_supports_resolution(&candidate, width, height))
+        return 0;
+
+    fprintf(stderr, "v4l2-drm: using per-mode scene %s (starter tuning)\n",
+            candidate.xml_file);
+    *cfg = candidate;
+    return 1;
+}
+
+int v4l2_drm_request_sensor_mode(unsigned device,
+                                  uint16_t preferred_width, uint16_t preferred_height,
+                                  uint32_t preferred_fps,
+                                  uint16_t fallback_width, uint16_t fallback_height,
+                                  uint32_t fallback_fps,
+                                  uint16_t *selected_width, uint16_t *selected_height,
+                                  uint32_t *selected_fps)
+{
+    typedef int (*find_mode_fn)(const char *, uint16_t, uint16_t, uint32_t, uint32_t *);
+    char path[64];
+    struct v4l2_drm_scene_config cfg = {0};
+    find_mode_fn find_mode;
+    void *sensor_lib;
+    uint32_t mode;
+    int fd;
+    int result;
+
+    snprintf(path, sizeof(path), "/dev/video%u", device);
+    fd = open(path, O_RDWR | O_NONBLOCK);
+    if (fd < 0) {
+        fprintf(stderr, "v4l2-drm: cannot open %s: %s\n", path, strerror(errno));
+        return -1;
+    }
+    if (v4l2_drm_get_scene_config(fd, &cfg) < 0) {
+        fprintf(stderr, "v4l2-drm: cannot read active camera scene: %s\n",
+                strerror(errno));
+        goto fail_close;
+    }
+
+    sensor_lib = dlopen("libvvcam-capabilities.so", RTLD_NOW | RTLD_LOCAL);
+    if (!sensor_lib) {
+        fprintf(stderr, "v4l2-drm: cannot load sensor capability library: %s\n",
+                dlerror());
+        goto fail_close;
+    }
+    find_mode = (find_mode_fn)dlsym(sensor_lib, "vvcam_sensor_find_mode");
+    if (!find_mode) {
+        fprintf(stderr, "v4l2-drm: sensor capability lookup is unavailable: %s\n",
+                dlerror());
+        goto fail_dl;
+    }
+
+    result = find_mode(cfg.sensor, preferred_width, preferred_height,
+                       preferred_fps, &mode);
+    if (result == 0 && !v4l2_drm_select_scene_profile(
+                           &cfg, preferred_width, preferred_height))
+        result = -1;
+    if (result == 0) {
+        result = 0;
+        if (selected_width) *selected_width = preferred_width;
+        if (selected_height) *selected_height = preferred_height;
+        if (selected_fps) *selected_fps = preferred_fps;
+    } else if (find_mode(cfg.sensor, fallback_width, fallback_height,
+                         fallback_fps, &mode) == 0 &&
+               v4l2_drm_select_scene_profile(
+                   &cfg, fallback_width, fallback_height)) {
+        result = 1;
+        if (selected_width) *selected_width = fallback_width;
+        if (selected_height) *selected_height = fallback_height;
+        if (selected_fps) *selected_fps = fallback_fps;
+    } else {
+        fprintf(stderr,
+                "v4l2-drm: active sensor '%s' has neither %ux%u@%u nor %ux%u@%u\n",
+                cfg.sensor, preferred_width, preferred_height, preferred_fps,
+                fallback_width, fallback_height, fallback_fps);
+        goto fail_dl;
+    }
+    if (v4l2_drm_set_scene_mode(fd, &cfg, mode) < 0) {
+        fprintf(stderr, "v4l2-drm: cannot select camera mode %u: %s\n",
+                mode, strerror(errno));
+        goto fail_dl;
+    }
+    dlclose(sensor_lib);
+    close(fd);
+    return result;
+
+fail_dl:
+    dlclose(sensor_lib);
+fail_close:
+    close(fd);
+    return -1;
+}
 
 void v4l2_drm_default_context(struct v4l2_drm_context* ctx) {
     memset(ctx, 0 , sizeof(*ctx));
@@ -829,6 +1067,51 @@ int v4l2_drm_dump(struct v4l2_drm_context* context, int timeout) {
         return ret;
     }
     return ioctl(context->video_fd, VIDIOC_DQBUF, &context->vbuffer);
+}
+
+/* Latest-wins dequeue: wait for readiness, then drain the driver's done-queue
+ * FIFO (DQBUF returns the oldest first), requeuing every older buffer
+ * immediately (QBUF) and keeping only the newest one. O_NONBLOCK fd means an
+ * empty queue surfaces as a failed DQBUF (EAGAIN), giving a clean loop bound.
+ * Stale frames are recycled instead of being handed to the consumer. */
+int v4l2_drm_dump_latest(struct v4l2_drm_context* context, int timeout)
+{
+    struct pollfd pf = {
+        .events = POLLIN | POLLPRI,
+        .fd = context->video_fd,
+        .revents = 0
+    };
+    int ret;
+retry:
+    ret = poll(&pf, 1, timeout);
+    if ((ret < 0) && (errno == EINTR)) {
+        goto retry;
+    }
+    if (ret <= 0) {
+        return ret;
+    }
+
+    struct v4l2_buffer held = context->vbuffer; /* newest so far */
+    bool have = false;
+    for (;;) {
+        struct v4l2_buffer vb = context->vbuffer; /* inherits type/memory */
+        if (ioctl(context->video_fd, VIDIOC_DQBUF, &vb) < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK)
+                break; /* done queue drained */
+            return -1;
+        }
+        if (have && ioctl(context->video_fd, VIDIOC_QBUF, &held) < 0) {
+            /* vb is not retained by the caller on this error path. */
+            (void)ioctl(context->video_fd, VIDIOC_QBUF, &vb);
+            return -1;
+        }
+        held = vb;
+        have = true;
+    }
+    if (!have)
+        return -1;
+    context->vbuffer = held;
+    return 0;
 }
 
 int v4l2_drm_dump_release(struct v4l2_drm_context* context) {

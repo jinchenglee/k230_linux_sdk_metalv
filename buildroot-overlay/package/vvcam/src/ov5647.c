@@ -250,6 +250,110 @@ static struct reg_list ov5647_1920x1080_30fps[] = {
     {0, 0}
 };
 
+/*
+ * OV5647 2-lane RAW10, binned 1280x720 at 60 fps.
+ *
+ * This is the mode-6 sequence from Canaan's maintained K230 OV5647 driver,
+ * ported with its 1796x851 timing and matching AE metadata below.  It is a
+ * true sensor mode, unlike requesting a 1280x720 scaled V4L2 output while
+ * the sensor remains in 1080p30.
+ */
+static struct reg_list ov5647_1280x720_60fps[] = {
+    {0x0100, 0x00},
+    {0x0103, 0x01},
+    {0x3034, 0x1a},
+    {0x3035, 0x21},
+    {0x3036, 0x6e},
+    {0x303c, 0x11},
+    {0x3106, 0xf5},
+    {0x3820, 0x01},
+    {0x3821, 0x03},
+    {0x3827, 0xec},
+    {0x370c, 0x03},
+    {0x3612, 0x59},
+    {0x3618, 0x00},
+    {0x5000, 0x06},
+    {0x5001, 0x00},
+    {0x5002, 0x00},
+    {0x5003, 0x08},
+    {0x5a00, 0x08},
+    {0x3000, 0x00},
+    {0x3001, 0x00},
+    {0x3002, 0x00},
+    {0x3016, 0x08},
+    {0x3017, 0xe0},
+    {0x3018, 0x44},
+    {0x301c, 0xf8},
+    {0x301d, 0xf0},
+    {0x3a18, 0x03},
+    {0x3a19, 0xff},
+    {0x3c01, 0x80},
+    {0x3b07, 0x0c},
+    {0x380c, 0x07}, /* HTS = 1796 */
+    {0x380d, 0x04},
+    {0x380e, 0x03}, /* VTS = 851 */
+    {0x380f, 0x53},
+    {0x3814, 0x31},
+    {0x3815, 0x31},
+    {0x3808, 0x05},
+    {0x3809, 0x00},
+    {0x380a, 0x02},
+    {0x380b, 0xd0},
+    {0x3800, 0x00},
+    {0x3801, 0x18},
+    {0x3802, 0x00},
+    {0x3803, 0xfc},
+    {0x3804, 0x0a},
+    {0x3805, 0x27},
+    {0x3806, 0x06},
+    {0x3807, 0xa7},
+    {0x3811, 0x04},
+    {0x3813, 0x02},
+    {0x3630, 0x2e},
+    {0x3632, 0xe2},
+    {0x3633, 0x23},
+    {0x3634, 0x44},
+    {0x3636, 0x06},
+    {0x3620, 0x64},
+    {0x3621, 0xe0},
+    {0x3600, 0x37},
+    {0x3704, 0xa0},
+    {0x3703, 0x5a},
+    {0x3715, 0x78},
+    {0x3717, 0x01},
+    {0x3731, 0x02},
+    {0x370b, 0x60},
+    {0x3705, 0x1a},
+    {0x3f05, 0x02},
+    {0x3f06, 0x10},
+    {0x3f01, 0x0a},
+    {0x3a00, 0x00},
+    {0x3a08, 0x01},
+    {0x3a09, 0x28},
+    {0x3a0a, 0x00},
+    {0x3a0b, 0xf6},
+    {0x3a0d, 0x08},
+    {0x3a0e, 0x06},
+    {0x3a0f, 0x58},
+    {0x3a10, 0x50},
+    {0x3a1b, 0x58},
+    {0x3a1e, 0x50},
+    {0x3a11, 0x60},
+    {0x3a1f, 0x28},
+    {0x4001, 0x02},
+    {0x4004, 0x04},
+    {0x4000, 0x09},
+    {0x4837, 0x16},
+    {0x4800, 0x24},
+    {0x3501, 0x02},
+    {0x3502, 0xa0},
+    {0x3503, 0x07},
+    {0x350b, 0x10},
+    {0x3212, 0xa0},
+    {0x0100, 0x01},
+    {0, 0}
+};
+
 
 static struct ov5647_mode modes[] = {
     {
@@ -303,6 +407,50 @@ static struct ov5647_mode modes[] = {
             }
         },
         .regs = ov5647_1920x1080_30fps
+    },
+    {
+        .mode = {
+            .clk = 25000000,
+            .width = 1280,
+            .height = 720,
+            .lanes = VVCAM_SENSOR_2LANE,
+            .freq = VVCAM_SENSOR_800M,
+            .bayer = VVCAM_BAYER_PAT_GBRG,
+            .bit_width = 10,
+            .ae_info = {
+                .frame_length = 851,
+                .cur_frame_length = 851,
+                .one_line_exp_time = 0.000019593,
+                .gain_accuracy = 1024,
+                .min_gain = 1.0,
+                .max_gain = 24.0,
+                .int_time_delay_frame = 2,
+                .gain_delay_frame = 2,
+                .color_type = 0,
+                .integration_time_increment = 0.000019593,
+                .gain_increment = (1.0f / 16.0f),
+                .max_long_integraion_line = 851 - 12,
+                .min_long_integraion_line = 2,
+                .max_integraion_line = 851 - 12,
+                .min_integraion_line = 2,
+                .max_long_integraion_time = 0.000019593 * (851 - 12),
+                .min_long_integraion_time = 0.000019593 * 2,
+                .max_integraion_time = 0.000019593 * (851 - 12),
+                .min_integraion_time = 0.000019593 * 2,
+                .a_long_gain = { .min = 1.0, .max = 8.0, .step = (1.0f / 16.0f) },
+                .a_gain = { .min = 1.0, .max = 24.0, .step = (1.0f / 16.0f) },
+                .d_long_gain = { .min = 1.0, .max = 1.0, .step = (1.0f / 1024.0f) },
+                .d_gain = { .min = 1.0, .max = 1.0, .step = (1.0f / 1024.0f) },
+                .cur_long_integration_time = 0.0,
+                .cur_integration_time = 0.0,
+                .cur_long_again = 0.0,
+                .cur_long_dgain = 0.0,
+                .cur_again = 0.0,
+                .cur_dgain = 0.0,
+                .cur_fps = 60,
+            }
+        },
+        .regs = ov5647_1280x720_60fps
     }
 };
 static unsigned modes_len = sizeof(modes) / sizeof(struct ov5647_mode);
@@ -415,8 +563,8 @@ static int ov5647_apply_orient(struct ov5647_ctx *sensor)
 }
 
 static int enum_mode(void* ctx, uint32_t index, struct vvcam_sensor_mode* mode) {
-    if (index == 0) {
-        memcpy(mode, &modes[0].mode, sizeof(struct vvcam_sensor_mode));
+    if (index < modes_len) {
+        memcpy(mode, &modes[index].mode, sizeof(struct vvcam_sensor_mode));
         return 0;
     } else {
         return -1;
@@ -442,7 +590,8 @@ static int set_mode(void* ctx, uint32_t index) {
         // out of range
         return -1;
     }
-    struct vvcam_sensor_mode* mode = &modes[index].mode;
+    struct ov5647_mode* selected_mode = &modes[index];
+    struct vvcam_sensor_mode* mode = &selected_mode->mode;
 
     printf("ov5647: %s %ux%u\n", __func__, mode->width, mode->height);
     if (open_i2c(sensor)) {
@@ -455,15 +604,15 @@ static int set_mode(void* ctx, uint32_t index) {
     sensor->orient_base_3820 = 0;
     sensor->orient_base_3821 = 0;
     for(unsigned i = 0;; i++) {
-        if ((modes[0].regs[i].addr == 0) && (modes[0].regs[i].value == 0)) {
+        if ((selected_mode->regs[i].addr == 0) && (selected_mode->regs[i].value == 0)) {
             break;
         }
-        if (modes[0].regs[i].addr == OV5647_REG_TIMING_CTRL_VFLIP) {
-            sensor->orient_base_3820 = modes[0].regs[i].value;
-        } else if (modes[0].regs[i].addr == OV5647_REG_TIMING_CTRL_HMIRROR) {
-            sensor->orient_base_3821 = modes[0].regs[i].value;
+        if (selected_mode->regs[i].addr == OV5647_REG_TIMING_CTRL_VFLIP) {
+            sensor->orient_base_3820 = selected_mode->regs[i].value;
+        } else if (selected_mode->regs[i].addr == OV5647_REG_TIMING_CTRL_HMIRROR) {
+            sensor->orient_base_3821 = selected_mode->regs[i].value;
         }
-        CHECK_ERROR(write_reg(sensor, modes[0].regs[i].addr, modes[0].regs[i].value));
+        CHECK_ERROR(write_reg(sensor, selected_mode->regs[i].addr, selected_mode->regs[i].value));
     }
     uint8_t again_h, again_l;
     uint8_t exp_time_h, exp_time_l;

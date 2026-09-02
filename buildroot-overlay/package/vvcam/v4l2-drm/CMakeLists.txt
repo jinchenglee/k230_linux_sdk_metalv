@@ -12,7 +12,7 @@ include_directories(include ${DISPLAY_INCLUDE_DIRS})
 
 # C library
 add_library(${PROJECT_NAME} src/lib.c)
-target_link_libraries(${PROJECT_NAME} ${DISPLAY_LIBRARIES})
+target_link_libraries(${PROJECT_NAME} ${DISPLAY_LIBRARIES} dl)
 
 # C++ wrapper library
 add_library(${PROJECT_NAME}++ src/v4l2-drm++.cpp)

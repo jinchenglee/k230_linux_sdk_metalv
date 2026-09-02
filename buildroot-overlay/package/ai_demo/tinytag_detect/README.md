@@ -14,7 +14,7 @@ below), see `experimental/README.md` -- that's the log; this is the map.
 ## Usage
 
 ```
-tinytag_detect.elf <kmodel> <input> <heatmap_thres> <max_proposals> <roi_expand> <debug_mode> [roi_iou_thres]
+tinytag_detect.elf <kmodel> <input> <heatmap_thres> <max_proposals> <roi_expand> <profile_mode> [roi_iou_thres] [--debug]
 ```
 
 `<input>` is one of:
@@ -26,8 +26,11 @@ tinytag_detect.elf <kmodel> <input> <heatmap_thres> <max_proposals> <roi_expand>
   software regardless (see "Hardware video codec" below for why).
 - `"ProfileOps"`: diagnostic mode, prints per-op KPU timing.
 
-`debug_mode`: 0 silent, 1 per-stage timing, 2 + per-ROI timing and verbose
+`profile_mode`: 0 silent, 1 per-stage timing, 2 + per-ROI timing and verbose
 proposal/detection logs.
+
+`--debug` enables the opt-in live-loop timing report for confirmed detections
+(capture wait/requeue, ROI copy, OSD work, and frame total).
 
 ### Operating point: heatmap_thres
 

@@ -306,20 +306,19 @@ static void detect_proc(int video_device)
                 usb_gray.release();
                 fprintf(stderr, "\n[input] switched to CSI camera\n");
             }
-            int ret = v4l2_drm_dump(&context, 1000);
+            int ret = v4l2_drm_dump_latest(&context, 1000);
             if (ret) {
-                perror("detect: v4l2_drm_dump error");
+                perror("detect: v4l2_drm_dump_latest error");
                 continue;
             }
             csi_frame_held = true;
-            // detect() is synchronous and reads this mmap directly, so this
-            // V4L2 buffer remains dequeued through all pipeline stages. A
-            // future split Stage-0 API should decimate Y into detector-owned
-            // storage here and requeue immediately; that preserves zero-extra-
-            // copy factor-2 processing without capture-queue back-pressure.
-            gray = (const uint8_t*)context.buffers[context.vbuffer.index].mmap;
             frame_width = csi_width;
             frame_height = csi_height;
+            // The Rust detector's persistent stage-0/1 buffers are the right
+            // ownership boundary for an early requeue. Until that split C API
+            // exists, keep this zero-copy mmap alive for the current call
+            // rather than taking a full-resolution private snapshot here.
+            gray = static_cast<const uint8_t *>(context.buffers[context.vbuffer.index].mmap);
             frame_stride = csi_stride;
         } else {
             if (g_usb_video < 0) {
@@ -841,6 +840,22 @@ int main(int argc, char* argv[])
     }
     fprintf(stderr, "[display] selected mode %ux%u@%u\n",
             display->width, display->height, display->mode.vrefresh);
+    uint16_t sensor_width = 0, sensor_height = 0;
+    uint32_t sensor_fps = 0;
+    int sensor_mode_result = v4l2_drm_request_sensor_mode(
+        kd_mpi_get_vvcam_video00(),
+        1280, 720, 60,
+        1920, 1080, 30,
+        &sensor_width, &sensor_height, &sensor_fps);
+    if (sensor_mode_result < 0) {
+        cerr << "apriltag_demo: active camera supports neither "
+             << "1280x720@60 nor 1920x1080@30" << endl;
+        display_exit(display);
+        return -1;
+    }
+    fprintf(stderr, "[input] sensor selected %ux%u@%u%s\n",
+            sensor_width, sensor_height, sensor_fps,
+            sensor_mode_result == 0 ? " (preferred)" : " (fallback)");
 
     std::thread detect_thread(detect_proc, kd_mpi_get_vvcam_video00() + 1);
     std::thread display_thread(display_proc, kd_mpi_get_vvcam_video00());

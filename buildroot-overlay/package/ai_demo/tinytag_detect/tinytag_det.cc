@@ -259,6 +259,79 @@ float TinyTagDet::rect_iou(const cv::Rect2f &a, const cv::Rect2f &b)
     return uni > 0.f ? inter / uni : 0.f;
 }
 
+void TinyTagDet::copy_proposal_crops(cv::Mat full_res_gray,
+                                     const std::vector<Proposal> &proposals,
+                                     std::vector<ProposalCrop> &crops,
+                                     size_t &crop_count)
+{
+    CV_Assert(full_res_gray.type() == CV_8UC1);
+    crop_count = 0;
+    crops.reserve(proposals.size());
+    for (const auto &proposal : proposals)
+    {
+        cv::Rect roi(static_cast<int>(std::lround(proposal.roi.x)),
+                     static_cast<int>(std::lround(proposal.roi.y)),
+                     static_cast<int>(std::lround(proposal.roi.width)),
+                     static_cast<int>(std::lround(proposal.roi.height)));
+        roi &= cv::Rect(0, 0, full_res_gray.cols, full_res_gray.rows);
+        if (roi.width <= 0 || roi.height <= 0)
+            continue;
+        if (crop_count == crops.size())
+            crops.emplace_back();
+        ProposalCrop &crop = crops[crop_count++];
+        crop.proposal = proposal;
+        crop.roi = roi;
+        // copyTo retains crop.gray's allocation when the ROI shape is the
+        // same; slots persist across frames up to max_proposals_.
+        full_res_gray(roi).copyTo(crop.gray);
+    }
+}
+
+void TinyTagDet::decode_proposal_crops(const std::vector<ProposalCrop> &crops,
+                                       size_t crop_count,
+                                       std::vector<TinyTagResult> &results)
+{
+    std::vector<TinyTagResult> raw;
+    {
+        ScopedTiming st(model_name_ + " post_process: cv_crop_decode (all rois, n=" +
+                             std::to_string(crop_count) + ")",
+                         debug_mode_);
+        for (size_t i = 0; i < crop_count; ++i)
+        {
+            const ProposalCrop &crop = crops[i];
+            auto t0 = std::chrono::steady_clock::now();
+            std::vector<TagDetection> dets = decoder_->detect(crop.gray);
+            if (debug_mode_ > 1)
+            {
+                double ms = std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - t0).count();
+                char line[160];
+                std::snprintf(line, sizeof(line),
+                              "post_process: cv_crop_decode (one roi) dets=%zu took %.4f ms\n",
+                              dets.size(), ms);
+                scoped_timing_write(line);
+            }
+            for (const auto &d : dets)
+            {
+                TinyTagResult r;
+                r.id = d.id;
+                r.hamming = d.hamming;
+                r.decision_margin = d.decision_margin;
+                r.proposal_confidence = crop.proposal.confidence;
+                r.roi = cv::Rect2f(static_cast<float>(crop.roi.x), static_cast<float>(crop.roi.y),
+                                    static_cast<float>(crop.roi.width), static_cast<float>(crop.roi.height));
+                cv::Point2f off(static_cast<float>(crop.roi.x), static_cast<float>(crop.roi.y));
+                r.center = d.center + off;
+                for (int c = 0; c < 4; ++c)
+                    r.corners[c] = d.corners[c] + off;
+                raw.push_back(r);
+            }
+        }
+    }
+    ScopedTiming st(model_name_ + " post_process: dedupe", debug_mode_);
+    dedupe(raw, results);
+}
+
 void TinyTagDet::post_process(FrameSize frame_size, cv::Mat full_res_gray,
                                std::vector<TinyTagResult> &results,
                                std::vector<Proposal> *all_proposals)

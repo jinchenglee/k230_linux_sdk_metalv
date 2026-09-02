@@ -167,6 +167,15 @@ struct vvcam_sensor {
     struct vvcam_sensor_ctrl ctrl;
 };
 
+/*
+ * Find a sensor mode by capability rather than by that sensor's private mode
+ * index.  The returned index is for isp_media_server's existing set_mode()
+ * ABI; callers must treat it as opaque.
+ */
+int vvcam_sensor_find_mode(const char *sensor_name, uint16_t width,
+                           uint16_t height, uint32_t fps,
+                           uint32_t *mode_index);
+
 void vvcam_sensor_add(struct vvcam_sensor* sensor);
 void vvcam_sensor_init(void);
 
