@@ -477,11 +477,19 @@ void display_proc(int video_device)
     context.device = video_device;
     if (g_display->width > g_display->height)
     {
+        // Request the display-derived capture size; v4l2_drm_setup negotiates
+        // it against the sensor, clamps to the camera's real output (e.g. the
+        // OV5647 native 720p), sizes the plane buffer to that negotiated size,
+        // and reports it back in context.width/height. The OSD plane is then
+        // sized from context (below), so it always matches the actual camera
+        // region regardless of the camera or monitor resolution.
         context.width = g_display->width;
         context.height = (g_display->width * SENSOR_HEIGHT / SENSOR_WIDTH) & 0xfff8;
         context.video_format = V4L2_PIX_FMT_NV12;
         context.display_format = 0;
         context.drm_rotation = rotation_0;
+        context.display_width = g_display->width;
+        context.display_height = (g_display->width * SENSOR_HEIGHT / SENSOR_WIDTH) & 0xfff8;
     }
     else
     {
@@ -490,7 +498,10 @@ void display_proc(int video_device)
         context.video_format = V4L2_PIX_FMT_NV12;
         context.display_format = 0;
         context.drm_rotation = rotation_90;
+        context.display_width = g_display->width;
+        context.display_height = g_display->height;
     }
+    context.max_display_fps = display_is_hdmi(g_display) ? 30 : 0;
 
     if (v4l2_drm_setup(&context, 1, &g_display))
     {
@@ -500,11 +511,17 @@ void display_proc(int video_device)
         return;
     }
 
+    /* The K230 HDMI video plane scans out the negotiated framebuffer at its
+     * native size. Keep OSD and video in the same coordinate space. */
+    if (display_is_hdmi(g_display)) {
+        context.display_width = context.width;
+        context.display_height = context.height;
+    }
+
     const bool landscape = g_display->width > g_display->height;
     k230_osd_config osd_config = {};
-    osd_config.width = g_display->width;
-    // Match the OSD plane to the actual 16:9 camera destination rectangle.
-    osd_config.height = landscape ? context.height : g_display->height;
+    osd_config.width = context.display_width;
+    osd_config.height = context.display_height;
     osd_config.lcd_fastpath = false;
     osd_config.mode = landscape ? K230_OSD_MODE_FAST
                                 : K230_OSD_MODE_SLOW_ROTATE;
@@ -640,7 +657,7 @@ int main(int argc, char *argv[])
 
     if (strcmp(image_path, "None") == 0)
     {
-        g_display = display_init(0);
+        g_display = display_init_refresh(0, 30);
         if (!g_display)
         {
             cerr << "display_init error, exit" << endl;

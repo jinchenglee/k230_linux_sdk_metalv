@@ -15,6 +15,7 @@
 #include <sys/poll.h>
 #include <sys/select.h>
 #include <unistd.h>
+#include <time.h>
 #include <dlfcn.h>
 #include <v4l2-drm.h>
 
@@ -305,6 +306,9 @@ void v4l2_drm_default_context(struct v4l2_drm_context* ctx) {
     memset(ctx, 0 , sizeof(*ctx));
     ctx->width = 640;
     ctx->height = 480;
+    ctx->display_width = 0;
+    ctx->display_height = 0;
+    ctx->max_display_fps = 0;
     ctx->device = 0;
     ctx->video_fd = -1;
     ctx->video_format = V4L2_PIX_FMT_NV12;
@@ -378,21 +382,6 @@ int v4l2_drm_setup(struct v4l2_drm_context context[], unsigned num, struct displ
             d->drm_rotation = context[i].drm_rotation;
             context[i].plane = display_get_plane(d, context[i].display_format);
             CKE(context[i].plane == NULL, close);
-            for (unsigned j = 0; j < context[i].buffer_num; j++) {
-                if(context[i].display_format == DRM_FORMAT_NV12)
-                {
-                    if((context[i].drm_rotation == rotation_90) || (context[i].drm_rotation == rotation_270))
-                    {
-                        context[i].plane->drm_rotation = context[i].drm_rotation;
-                        CKE(display_allocate_buffer(context[i].plane, context[i].height, context[i].width) == NULL, close);
-                    }
-                    else
-                        CKE(display_allocate_buffer(context[i].plane, context[i].width, context[i].height) == NULL, close);
-                }
-                else {
-                    CKE(display_allocate_buffer(context[i].plane, context[i].width, context[i].height) == NULL, close);
-                }
-            }
         }
         char cam_device_path[64];
         snprintf(cam_device_path, sizeof(cam_device_path) - 1, "/dev/video%u", context[i].device);
@@ -433,6 +422,30 @@ int v4l2_drm_setup(struct v4l2_drm_context context[], unsigned num, struct displ
         format.fmt.pix.width = context[i].width;
         format.fmt.pix.height = context[i].height;
         CKE(ioctl(context[i].video_fd, VIDIOC_S_FMT, &format), close);
+
+        // The driver may clamp the requested size to the sensor's actual output
+        // (e.g. the OV5647 native 720p). Size the camera plane buffer to the
+        // negotiated size and report it back in context, so the camera frame
+        // always fits its buffer regardless of what the monitor negotiated.
+        // Capture resolution/refresh and monitor resolution/refresh are
+        // independent -- reconciled by the DRM plane mapping, not by this size.
+        context[i].width = format.fmt.pix.width;
+        context[i].height = format.fmt.pix.height;
+        if (context[i].display && context[i].plane != NULL) {
+            for (unsigned j = 0; j < context[i].buffer_num; j++) {
+                if(context[i].display_format == DRM_FORMAT_NV12) {
+                    if((context[i].drm_rotation == rotation_90) ||
+                       (context[i].drm_rotation == rotation_270)) {
+                        context[i].plane->drm_rotation = context[i].drm_rotation;
+                        CKE(display_allocate_buffer(context[i].plane, context[i].width, context[i].height) == NULL, close);
+                    } else {
+                        CKE(display_allocate_buffer(context[i].plane, context[i].width, context[i].height) == NULL, close);
+                    }
+                } else {
+                    CKE(display_allocate_buffer(context[i].plane, context[i].width, context[i].height) == NULL, close);
+                }
+            }
+        }
 
         if (context[i].hflip >= 0) {
             CKE(v4l2_drm_set_control(context[i].video_fd, V4L2_CID_HFLIP, context[i].hflip), close);
@@ -607,6 +620,16 @@ static bool v4l2_drm_have_pending_display_update(
     return false;
 }
 
+static unsigned v4l2_drm_display_width(const struct v4l2_drm_context *context)
+{
+    return context->display_width ? context->display_width : context->width;
+}
+
+static unsigned v4l2_drm_display_height(const struct v4l2_drm_context *context)
+{
+    return context->display_height ? context->display_height : context->height;
+}
+
 static int v4l2_drm_commit_pending_display_update(
     struct display* d,
     struct v4l2_drm_context context[],
@@ -617,9 +640,11 @@ static int v4l2_drm_commit_pending_display_update(
             context[i].buffer_hold[context[i].wp] < 0)
             continue;
 
-        if (display_update_buffer(
+        if (display_update_buffer_to(
                 context[i].display_buffers[context[i].buffer_hold[context[i].wp]],
-                context[i].offset_x, context[i].offset_y))
+                context[i].offset_x, context[i].offset_y,
+                v4l2_drm_display_width(&context[i]),
+                v4l2_drm_display_height(&context[i])))
             return -1;
         context[i].flag_dqbuf = false;
     }
@@ -664,6 +689,15 @@ static void dump_file(const struct v4l2_drm_context* ctx, unsigned channel) {
     pr("dump file to %s", filename);
 }
 
+static uint64_t timespec_elapsed_ns(const struct timespec *start,
+                                    const struct timespec *end)
+{
+    int64_t sec = (int64_t)end->tv_sec - (int64_t)start->tv_sec;
+    int64_t nsec = (int64_t)end->tv_nsec - (int64_t)start->tv_nsec;
+    return sec <= 0 && nsec <= 0 ? 0 :
+           (uint64_t)(sec * 1000000000LL + nsec);
+}
+
 static int v4l2_drm_run_impl(struct v4l2_drm_context context[], unsigned num,
                              v4l2_drm_handler handler, bool event_driven) {
     int flag_enable_display = 0;
@@ -675,7 +709,11 @@ static int v4l2_drm_run_impl(struct v4l2_drm_context context[], unsigned num,
         if (context[i].display) {
             if (flag_enable_display == 0) {
                 // trig vsync
-                display_commit_buffer(context[i].display_buffers[0], context[i].offset_x, context[i].offset_y);
+                display_commit_buffer_to(context[i].display_buffers[0],
+                                         context[i].offset_x,
+                                         context[i].offset_y,
+                                         v4l2_drm_display_width(&context[i]),
+                                         v4l2_drm_display_height(&context[i]));
             }
             flag_enable_display = 1;
             d = context[i].plane->display;
@@ -690,6 +728,16 @@ static int v4l2_drm_run_impl(struct v4l2_drm_context context[], unsigned num,
         return -1;
     }
 
+    unsigned max_display_fps = 0;
+    struct timespec last_display_commit;
+    clock_gettime(CLOCK_MONOTONIC, &last_display_commit);
+    for (unsigned i = 0; i < num; i++) {
+        if (context[i].display && context[i].max_display_fps != 0 &&
+            (max_display_fps == 0 || context[i].max_display_fps < max_display_fps))
+            max_display_fps = context[i].max_display_fps;
+    }
+    if (event_driven && max_display_fps)
+        pr("display submissions capped at %u fps", max_display_fps);
     bool display_commit_pending = flag_enable_display != 0;
     struct pollfd fds[num + flag_enable_display];
     while (1) {
@@ -824,11 +872,17 @@ static int v4l2_drm_run_impl(struct v4l2_drm_context context[], unsigned num,
                 display_commit_pending = false;
             }
 
-            if (flag_enable_display && !display_commit_pending &&
+            struct timespec now;
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            const bool rate_ready = max_display_fps == 0 ||
+                timespec_elapsed_ns(&last_display_commit, &now) >=
+                    1000000000ULL / max_display_fps;
+            if (flag_enable_display && !display_commit_pending && rate_ready &&
                 v4l2_drm_have_pending_display_update(d, context, num)) {
                 CKE(v4l2_drm_commit_pending_display_update(d, context, num),
                     streamoff);
                 display_commit_pending = true;
+                last_display_commit = now;
             }
         }
     }

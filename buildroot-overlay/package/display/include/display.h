@@ -75,6 +75,9 @@ struct display_plane {
 };
 
 void display_exit(struct display* display);
+/* Prefer a connector mode at or below max_vrefresh. */
+struct display* display_init_refresh(unsigned device, uint32_t max_vrefresh);
+bool display_is_hdmi(const struct display* display);
 struct display* display_init(unsigned device);
 struct display_plane* display_get_plane(struct display* display, unsigned int fourcc);
 void display_free_plane(struct display_plane* plane);
@@ -83,6 +86,10 @@ void display_free_plane(struct display_plane* plane);
 void display_free_buffer(struct display_buffer* buffer);
 int display_commit_buffer(const struct display_buffer* buffer, uint32_t x, uint32_t y);
 int display_update_buffer(struct display_buffer* buffer, uint32_t x, uint32_t y);
+int display_commit_buffer_to(const struct display_buffer* buffer, uint32_t x,
+                             uint32_t y, uint32_t width, uint32_t height);
+int display_update_buffer_to(struct display_buffer* buffer, uint32_t x,
+                             uint32_t y, uint32_t width, uint32_t height);
 int display_commit(struct display* display);
 void display_wait_vsync(struct display* display);
 void display_handle_vsync(struct display* display);

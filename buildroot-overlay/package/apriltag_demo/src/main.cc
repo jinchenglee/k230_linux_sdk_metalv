@@ -677,6 +677,8 @@ void display_proc(int video_device)
         context.height = (display->width * SENSOR_HEIGHT / SENSOR_WIDTH) & 0xfff8;
         context.video_format = V4L2_PIX_FMT_NV12;
         context.display_format = 0;
+        context.display_width = display->width;
+        context.display_height = (display->width * SENSOR_HEIGHT / SENSOR_WIDTH) & 0xfff8;
         context.drm_rotation = rotation_0;
     } else {
         // Portrait. Raw panel dimensions (NOT aspect-corrected against the
@@ -705,6 +707,8 @@ void display_proc(int video_device)
         context.video_format = V4L2_PIX_FMT_NV12;
         context.display_format = 0;
         context.drm_rotation = rotation_90;
+        context.display_width = display->width;
+        context.display_height = display->height;
     }
     if (v4l2_drm_setup(&context, 1, &display)) {
         cerr << "display: v4l2_drm_setup error" << endl;
@@ -712,6 +716,13 @@ void display_proc(int video_device)
         start_cv.notify_all();
         return;
     }
+    /* Keep HDMI OSD coordinates identical to the native camera framebuffer;
+     * this video plane does not scale 720p to a larger monitor mode. */
+    if (display_is_hdmi(display)) {
+        context.display_width = context.width;
+        context.display_height = context.height;
+    }
+    context.max_display_fps = display_is_hdmi(display) ? 30 : 0;
     struct v4l2_streamparm display_parm = {};
     display_parm.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     if (ioctl(context.video_fd, VIDIOC_G_PARM, &display_parm) == 0 &&
@@ -724,9 +735,8 @@ void display_proc(int video_device)
 
     const bool landscape = display->width > display->height;
     k230_osd_config osd_config = {};
-    osd_config.width = display->width;
-    // Landscape OSD exactly matches the camera's 16:9 destination rectangle.
-    osd_config.height = landscape ? context.height : display->height;
+    osd_config.width = context.display_width;
+    osd_config.height = context.display_height;
     osd_config.lcd_fastpath = !landscape;
     osd_config.mode = K230_OSD_MODE_FAST;
     g_osd = k230_osd_create(display, &osd_config);
@@ -885,7 +895,7 @@ int main(int argc, char* argv[])
 
     signal(SIGUSR1, handle_view_cycle_signal);
 
-    display = display_init(0);
+    display = display_init_refresh(0, 30);
     if (!display) {
         cerr << "display_init error, exit" << endl;
         return -1;

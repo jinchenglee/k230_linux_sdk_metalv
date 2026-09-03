@@ -31,7 +31,15 @@ void display_exit(struct display* display) {
     free(display);
 }
 
-struct display* display_init(unsigned device) {
+bool display_is_hdmi(const struct display* display) {
+    if (!display || !display->conn)
+        return false;
+
+    return display->conn->connector_type == DRM_MODE_CONNECTOR_HDMIA ||
+           display->conn->connector_type == DRM_MODE_CONNECTOR_HDMIB;
+}
+
+struct display* display_init_refresh(unsigned device, uint32_t max_vrefresh) {
     struct display* display;
     int flags;
     uint64_t has_dumb;
@@ -95,15 +103,31 @@ struct display* display_init(unsigned device) {
     display->mmWidth = conn->mmWidth;
     display->mmHeight = conn->mmHeight;
 
+    const uint32_t refresh_limit = display_is_hdmi(display) ? max_vrefresh : 0;
+    int selected_mode = -1;
+    int lowest_rate_mode = -1;
     for (i = 0; i < conn->count_modes; i++) {
-        if (conn->modes[i].hdisplay <= 1920 && conn->modes[i].vdisplay <= 1280 && conn->modes[i].vrefresh <= 65)
+        const drmModeModeInfo *mode = &conn->modes[i];
+        if (mode->hdisplay > 1920 || mode->vdisplay > 1280 || mode->vrefresh > 65)
+            continue;
+        if (lowest_rate_mode < 0 || mode->vrefresh < conn->modes[lowest_rate_mode].vrefresh)
+            lowest_rate_mode = (int)i;
+        if (refresh_limit == 0 || mode->vrefresh <= refresh_limit) {
+            selected_mode = (int)i;
             break;
+        }
     }
-    if (i == conn->count_modes) {
+    if (selected_mode < 0)
+        selected_mode = lowest_rate_mode;
+    if (selected_mode < 0) {
         pr("1080P not support");
         goto free_con;
     }
-    memcpy(&display->mode, &conn->modes[i], sizeof(display->mode));
+    memcpy(&display->mode, &conn->modes[selected_mode], sizeof(display->mode));
+    pr("selected mode %ux%u@%u (HDMI limit %u Hz)%s",
+       display->mode.hdisplay, display->mode.vdisplay, display->mode.vrefresh,
+       refresh_limit, refresh_limit && display->mode.vrefresh > refresh_limit
+                         ? "; connector fallback" : "");
 
     CKE(drmModeCreatePropertyBlob(display->fd, &display->mode, sizeof(display->mode), &display->blob_id), free_con);
 
@@ -612,7 +636,8 @@ static int drm_add_conn_property(const struct display* display, drmModeAtomicReq
     return 0;
 }
 
-int display_update_buffer(struct display_buffer* buffer, uint32_t x, uint32_t y) {
+int display_update_buffer_to(struct display_buffer* buffer, uint32_t x,
+                             uint32_t y, uint32_t width, uint32_t height) {
     struct display_plane* plane = buffer->plane;
     struct display* display = plane->display;
     display->commitFlags |= DRM_MODE_PAGE_FLIP_EVENT;
@@ -637,8 +662,8 @@ int display_update_buffer(struct display_buffer* buffer, uint32_t x, uint32_t y)
     drm_add_plane_property(plane, display->req, "SRC_H", buffer->height << 16);
     drm_add_plane_property(plane, display->req, "CRTC_X", x);
     drm_add_plane_property(plane, display->req, "CRTC_Y", y);
-    drm_add_plane_property(plane, display->req, "CRTC_W", buffer->width);
-    drm_add_plane_property(plane, display->req, "CRTC_H", buffer->height);
+    drm_add_plane_property(plane, display->req, "CRTC_W", width);
+    drm_add_plane_property(plane, display->req, "CRTC_H", height);
 
     if (plane_has_property(plane, "rotation")) {
         drm_add_plane_property(plane, display->req, "rotation",
@@ -646,6 +671,10 @@ int display_update_buffer(struct display_buffer* buffer, uint32_t x, uint32_t y)
     }
 
     return 0;
+}
+
+int display_update_buffer(struct display_buffer* buffer, uint32_t x, uint32_t y) {
+    return display_update_buffer_to(buffer, x, y, buffer->width, buffer->height);
 }
 
 int display_commit(struct display* display) {
@@ -666,7 +695,8 @@ int display_commit(struct display* display) {
     return 0;
 }
 
-int display_commit_buffer(const struct display_buffer* buffer, uint32_t x, uint32_t y) {
+int display_commit_buffer_to(const struct display_buffer* buffer, uint32_t x,
+                             uint32_t y, uint32_t width, uint32_t height) {
     uint32_t flags = DRM_MODE_PAGE_FLIP_EVENT;
     struct display_plane* plane = buffer->plane;
     struct display* display = plane->display;
@@ -699,8 +729,8 @@ int display_commit_buffer(const struct display_buffer* buffer, uint32_t x, uint3
     drm_add_plane_property(plane, req, "SRC_H", buffer->height << 16);
     drm_add_plane_property(plane, req, "CRTC_X", x);
     drm_add_plane_property(plane, req, "CRTC_Y", y);
-    drm_add_plane_property(plane, req, "CRTC_W", buffer->width);
-    drm_add_plane_property(plane, req, "CRTC_H", buffer->height);
+    drm_add_plane_property(plane, req, "CRTC_W", width);
+    drm_add_plane_property(plane, req, "CRTC_H", height);
 
     if (plane_has_property(plane, "rotation")) {
         drm_add_plane_property(plane, req, "rotation",
@@ -715,6 +745,10 @@ error:
     drmModeAtomicFree(req);
     display->req = NULL;
     return -1;
+}
+
+int display_commit_buffer(const struct display_buffer* buffer, uint32_t x, uint32_t y) {
+    return display_commit_buffer_to(buffer, x, y, buffer->width, buffer->height);
 }
 
 // not recomand, select display fd instead
@@ -798,4 +832,8 @@ int display_commit_buffer_noblock(const struct display_buffer* buffer, uint32_t 
 error:
     drmModeAtomicFree(req);
     return -1;
+}
+
+struct display* display_init(unsigned device) {
+    return display_init_refresh(device, 65);
 }

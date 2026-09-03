@@ -30,6 +30,11 @@ struct v4l2_crop_size {
 struct v4l2_drm_context {
     unsigned width;
     unsigned height;
+    /* DRM destination rectangle. Zero preserves framebuffer dimensions. */
+    unsigned display_width;
+    unsigned display_height;
+    /* Maximum event-driven atomic submissions per second; zero is unlimited. */
+    unsigned max_display_fps;
     unsigned device;
     int video_fd;
     unsigned frame_count; //sensor 帧数
