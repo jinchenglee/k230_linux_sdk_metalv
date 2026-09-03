@@ -37,7 +37,7 @@ The board reports nproc=1, only cpu0 online (the README notes "the target expose
 
 2. How this currently hurts throughput & latency
 
-- Capture back-pressure (biggest serialization point, both apps). Because the V4L2 buffer is held for the entire pipeline (detect or AI+CV decode), the 3-buffer capture queue can't recycle, so the camera is paced at the processing rate. Throughput is ≈ 1 / pipeline_time, and the held buffer adds a full pipeline-latency lag. The comment in apriltag main.cc:349-354 names this directly.
+- Capture back-pressure (biggest serialization point, both apps). Because the V4L2 buffer is held for the entire pipeline (detect or AI+CV decode), the 3-buffer capture queue can't recycle, so the camera is paced at the processing rate. Throughput is ≈ 1 / pipeline_time, and the held buffer adds a full pipeline-latency lag. The comment in apriltag main.cc:349-354 names this directly. [PARTIALLY ADDRESSED — see §5.] `v4l2_drm_dump_latest()` (b27c25e, lib.c:1123) now drains the done-queue and requeues every older buffer, handing the caller only the newest one. That removes the FIFO *staleness* half of the lag — you no longer detect on a frame that has been sitting behind others in the queue — but the caller still holds one buffer for the whole pipeline, so the back-pressure and the 1/pipeline_time throughput ceiling are unchanged. §3A is done for tinytag and still open for apriltag — see §3A and §5.
 - Full-frame overlay copy + flush per detection, on the same core. [RESOLVED by the k230_osd module — see §4.] Historically each new detection triggered a whole-canvas ARGB memcpy (osd_frame→draw_buffer; ~3.6 MB at 720p, ~16 MB at 1080p) plus a full dcache_clean_invalid_range. That stole CPU/memory bandwidth from the (memory-heavy) detector. The triple-buffered k230_osd module removes the per-detection copy: the app draws into a CPU-owned plane buffer and the module retires buffers via the event-driven v4l2-drm path, keeping the draw local and the scanout-to-write "handoff" explicit.
 - Sequential CV crop-decode on one core (tinytag). The ~7 ROIs are decoded one after another on the single core; it's the dominant cost. Only SIMD (RVV backend) can speed it up here — there's no second core to parallelize across.
 - Extra software copy/rotate/allocate in portrait & debug/USB paths (cv::Mat temp_img + copyTo + cv::rotate every update; USB does VideoCapture.read + BGR→gray + opaque camera draw on the OSD). These are the remaining per-update frame-sized allocations/transfers on one CPU.
@@ -47,8 +47,12 @@ The board reports nproc=1, only cpu0 online (the README notes "the target expose
 3. Opportunities (ranked)
 
 A. Requeue the camera buffer earlier — overlap capture with compute. (Largest structural win, both apps.)
-- tinytag: after decode_proposals() (ROIs known, ~3–4 ms in) the raw frame is only needed to feed the CV crops, which are tiny. Copy just the few ROI crop regions (~KB) into owned storage and immediately v4l2_drm_dump_release(). The CV crop-decode then runs against owned memory while the next frame is already being captured — removing the ~9–16 ms buffer hold, decoupling throughput from CV-decode latency (that's exactly the "post_process outside the lock" class of fix, extended to the buffer).
-- apriltag: implement the Stage-0 split the code already anticipates (main.cc:349-354): decimate/threshold the Y into detector-owned storage and requeue right away; the heavy CCL/flags/quad/decode then overlap the next capture. This is the main way to lift apriltag above 1/detect_time and cut latency.
+- tinytag: **DONE (b27c25e).** Implemented as described below: `copy_proposal_crops()` copies the ROI pixels, `v4l2_drm_dump_release()` runs immediately after, and `decode_proposal_crops()` then works on owned memory (main.cc:309-343). `--debug` reports the two new stages as `copy_roi_crops` and `capture_requeue`. The OSD is drawn after the release (main.cc:384), so no part of the overlay is inside the hold window. Original plan: after decode_proposals() (ROIs known, ~3–4 ms in) the raw frame is only needed to feed the CV crops, which are tiny. Copy just the few ROI crop regions (~KB) into owned storage and immediately v4l2_drm_dump_release(). The CV crop-decode then runs against owned memory while the next frame is already being captured — removing the ~9–16 ms buffer hold, decoupling throughput from CV-decode latency (that's exactly the "post_process outside the lock" class of fix, extended to the buffer).
+- apriltag: **DONE, via a full-frame snapshot rather than the Stage-0 split.** The detector needs the original pixels through decode, so the planned "decimate/threshold into detector-owned storage" split would require a new detector C API. Instead the detect loop now takes one packed full-resolution copy of the Y plane into a persistent `owned_gray` and calls `v4l2_drm_dump_release()` immediately, before the debug dump, `apriltag_detect()` and the OSD. The denoise path pays nothing extra, since `filtered_gray` is already a private copy. `APRILTAG_DEMO_LATE_REQUEUE=1` restores the old hold-across-detect behaviour in the same binary for A/B.
+  - **Measured: throughput unchanged** (detect ~9-10 fps, camera ~52-55 fps, `ok=1`, both paths, 720p). Expected — the detector is CPU-bound and the copy is ~1 ms. The win is freshness, and it is **bounded by DETECT_BUFFER_NUM**: the sensor produces a frame every ~19 ms while an iteration takes ~110 ms, so the driver fills every free buffer and then idles. Early requeue leaves it 3 free buffers instead of 2, i.e. it keeps capturing one buffer-period longer — roughly **19 ms less staleness**.
+  - **Could not measure staleness directly**: the vvcam video driver returns `v4l2_buffer.timestamp == 0` even though its queue advertises `V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC` (`vvcam_video_register.c:1221`). A frame-age metric was written, found inert on-board, and removed. Fixing the driver to stamp buffers would make this whole class of latency work measurable and is worth doing before further latency tuning.
+  - **Next, complementary:** reaching one-frame staleness needs `DETECT_BUFFER_NUM >= iteration_period / frame_period` (~6 at these rates) — currently 3 in both apps. Each extra 1280x720 NV12 buffer costs ~1.4 MB of CMA, so 3 -> 6 is ~4 MB. Untested; worth an experiment now that the requeue no longer wastes one of the buffers.
+- apriltag, OSD hold: **DONE as a side effect of the above.** The single `v4l2_drm_dump_release()` used to sit after `k230_osd_begin()`/`draw_detections*()`/`k230_osd_publish()`, so the camera buffer was held across the overlay write too. In the CSI path that block touches no camera pixels — `draw_detections*()` takes the copied `detections` vector plus width/height ints, `draw_camera_frame()` is USB-only, and the debug-stage path reads detector-owned storage — so moving the release above the detector removed this as well. The canvas clear was already outside the window (`k230_osd_prepare()` runs before capture).
 
 B. Draw the overlay directly into the OSD plane (kill the per-detection memcpy + shrink the flush).
 - Write the quads/text into draw_buffer->map (the persistent plane mmap) in the producer and just thead_csi_dcache_clean_invalid_range it, instead of drawing into osd_frame and then memcpy-ing the whole canvas. Saves the full-frame transfer each detection and frees CPU/bandwidth for the detector.
@@ -69,7 +73,7 @@ Most of this is already good (persistent ai2d tensor/builder, persistent osd_fra
 
 In short: the architecture is sound and already does the right things (zero-copy camera→detector, camera on a hardware plane, persistent buffers, hardware resize/KPU). The OSD-side full-frame copy + flush was the second-biggest serialization point and is now gone via the k230_osd triple-buffered module (draw into a CPU-owned plane buffer; buffers retired on real page flips). The remaining wins are all about the single core, and the top one is now clearly: overlap capture with compute (requeue the camera buffer earlier — the Stage-0 / small-crop split, §3A), plus CCL/RVV tune on the detector. That will move latency and throughput more than further OSD work.
 
-Next step I'd take: prototype the capture-requeue split (the now-clearly-highest-impact one) on tinytag first — copy the ROI crops to owned storage right after decode_proposals and requeue immediately — and measure the effect on frame latency/throughput. It's a contained change to ai_proc/post_process.
+Next step I'd take: §3A is now done in both apps, so the open items are (a) teach the vvcam video driver to stamp buffer timestamps, without which no latency claim here is measurable, and (b) try raising DETECT_BUFFER_NUM/BUFFER_NUM from 3, which is what now bounds capture freshness. Detector-side CCL/RVV tuning remains the throughput lever.
 ╰───────────────────────────────────────────
 
 ---
@@ -133,3 +137,52 @@ apps link. Full detail: docs/notes/osd-doublebuffer-2026-09-01.md.
     21) at boot — relevant when validating on an 01studio board (note it
     launches tinytag at the 0.20 threshold, not 0.35).
 
+
+---
+
+## 5. Camera mode & capture rate (2026-09-02)
+
+Two camera-side changes landed since this note was written: the newest-buffer
+dequeue (`b27c25e`, folded into §2 above) and a native OV5647 1280x720@60
+sensor mode, whose broken ISP profile was fixed in `f717dcb`. Full detail:
+docs/notes/ov5647-720p-mode.md.
+
+### The measurement that matters here
+
+Both tag apps now prefer the native 720p60 mode over 1080p30. The detector
+sees a 1280x720 image either way (in 1080p mode the ISP downscales), same
+scene, same detector:
+
+| sensor mode | camera | display | **detect** |
+|---|---|---|---|
+| native 720p@60 | ~53 fps | ~60 fps | **~9 fps** |
+| 1080p@30 (ISP downscale) | ~28 fps | ~42 fps | **~15 fps** |
+
+Detection is **slower** at 720p, and it is not because the detector does more
+work: quad counts per frame are comparable (q ~ 13-26 vs 22-26). It is the
+single core. `/proc/stat` showed **exactly zero idle ticks** over a 5-second
+sample during a 720p run, so the doubled capture and display work comes
+directly out of the detection thread's budget.
+
+### Why this sharpens §3A rather than competing with it
+
+This is the "Critical context" section's thesis measured directly: on one core,
+*any* rate increase upstream is paid for downstream. The 720p mode buys
+freshness (16.7 ms readout instead of 33.3 ms) and spends detection throughput
+to get it, because the detector still holds the capture buffer for the whole
+pipeline and is scheduled against a 60 fps capture/display load.
+
+The capture-requeue split (§3A) is what would let the mode deliver both: once
+the buffer is released early, capture stops being paced by the detector and the
+extra camera rate turns into lower latency instead of contention. **tinytag
+already has this** (b27c25e) and **apriltag now does too** (see §3A) — though
+measurement showed the split is throughput-neutral, since the detector is
+CPU-bound; it buys freshness, bounded by the capture buffer count. So the fps
+table above still stands: treat 720p-vs-1080p as an explicit
+latency-vs-throughput choice.
+
+Note there is currently **no runtime switch** between the two — the
+preferred/fallback pair is hardcoded at both call sites (`apriltag_demo`
+main.cc:845, `tinytag_detect` main.cc:652), and `--csi-size` does *not* select
+the sensor mode. A `--sensor-mode` flag would make this trade-off measurable
+without swapping libraries, which is how the numbers above had to be obtained.

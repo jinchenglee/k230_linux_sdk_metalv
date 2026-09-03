@@ -280,6 +280,18 @@ static void detect_proc(int video_device)
     cv::Mat usb_bgr;
     cv::Mat usb_gray;
     cv::Mat filtered_gray;
+    // Private full-resolution snapshot of the capture mmap, so the V4L2 buffer
+    // can be requeued before the detector runs. Allocation is reused across
+    // frames; only the first frame (or a geometry change) allocates.
+    cv::Mat owned_gray;
+    // A/B switch for the §3A requeue point: set APRILTAG_DEMO_LATE_REQUEUE=1 to
+    // restore the old behaviour (hold the mmap across detect + OSD, no
+    // snapshot) so the two can be compared with one binary.
+    const bool late_requeue = getenv("APRILTAG_DEMO_LATE_REQUEUE") != nullptr;
+    if (late_requeue) {
+        fprintf(stderr, "[input] late requeue: holding capture buffer across "
+                        "detect+OSD (pre-3A behaviour)\n");
+    }
 
     while (!detect_stop) {
         const int selected_source = g_input_source.load();
@@ -314,10 +326,9 @@ static void detect_proc(int video_device)
             csi_frame_held = true;
             frame_width = csi_width;
             frame_height = csi_height;
-            // The Rust detector's persistent stage-0/1 buffers are the right
-            // ownership boundary for an early requeue. Until that split C API
-            // exists, keep this zero-copy mmap alive for the current call
-            // rather than taking a full-resolution private snapshot here.
+            // Borrowed zero-copy view of the capture mmap. It stays valid only
+            // until the requeue below, which happens before detect() runs; see
+            // the snapshot step after the denoise block.
             gray = static_cast<const uint8_t *>(context.buffers[context.vbuffer.index].mmap);
             frame_stride = csi_stride;
         } else {
@@ -395,6 +406,44 @@ static void detect_proc(int video_device)
             }
             gray = filtered_gray.data;
             frame_stride = filtered_gray.step;
+        }
+
+        // Requeue the capture buffer before the detector runs (perf_todo §3A).
+        // What this buys is freshness, not throughput: the detector is
+        // CPU-bound either way, and measurement confirmed detect fps is
+        // unchanged. The sensor produces a frame every ~19 ms while an
+        // iteration takes ~110 ms, so the driver fills every free buffer and
+        // then has nowhere to put frames until one is returned; dump_latest()
+        // then hands us the newest *queued* frame, which was captured back when
+        // the queue filled up. Returning the buffer up front leaves the driver
+        // DETECT_BUFFER_NUM free buffers instead of DETECT_BUFFER_NUM-1, so it
+        // keeps capturing one buffer-period longer -- roughly 19 ms less
+        // staleness here.
+        //
+        // That bound is set by DETECT_BUFFER_NUM: reaching one-frame staleness
+        // would need buffers >= iteration_period / frame_period (~6 at these
+        // rates). This change is the free half of that; raising the buffer
+        // count is the other half, and costs CMA.
+        //
+        // The denoise path has already written a private filtered_gray, so it
+        // costs nothing there; otherwise take one packed full-resolution copy.
+        // Everything downstream (debug dump, detect, OSD) then reads owned
+        // memory, which is also why the OSD write is no longer inside the hold.
+        if (csi_frame_held && !late_requeue) {
+            if (gray != filtered_gray.data) {
+                owned_gray.create(static_cast<int>(frame_height),
+                                  static_cast<int>(frame_width), CV_8UC1);
+                const cv::Mat borrowed(static_cast<int>(frame_height),
+                                       static_cast<int>(frame_width), CV_8UC1,
+                                       const_cast<uint8_t *>(gray), frame_stride);
+                borrowed.copyTo(owned_gray);
+                gray = owned_gray.data;
+                frame_stride = owned_gray.step;
+            }
+            if (v4l2_drm_dump_release(&context)) {
+                perror("detect: v4l2_drm_dump_release error");
+            }
+            csi_frame_held = false;
         }
 
         // Dump the exact grayscale we feed detect() (packed width*height,
@@ -543,8 +592,11 @@ static void detect_proc(int video_device)
         k230_osd_publish(g_osd);
 
         detect_frame_count += 1;
+        // Only reached in the APRILTAG_DEMO_LATE_REQUEUE A/B path; the default
+        // path released the buffer before detect().
         if (csi_frame_held) {
             v4l2_drm_dump_release(&context);
+            csi_frame_held = false;
         }
     }
 
