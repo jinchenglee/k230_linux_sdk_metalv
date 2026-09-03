@@ -65,15 +65,16 @@ B. Draw the overlay directly into the OSD plane (kill the per-detection memcpy +
 D. Use the hardware offload engines to keep CPU free (already partly done for tinytag).
 - tinytag already offloads resize (ai2d) and inference (KPU); the residual CPU cost is the CV crop-decode, whose per-core lever is the RVV crop-decode backend (2.1x on your input) — but close the recall gap first before enabling.
 - apriltag has no NPU; it's pure CPU CCL. Its lever is (again) Stage-0 overlap (A) plus CCL kernel tuning (group_emit/direction passes) — but note the instrumented stage numbers are inflated; run the production ablation matrix to confirm which mask helps.
+  - **Superseded in priority by §6 (2026-09-02).** `--rvv` measured live: **no change** (detect 8.9-9.9 fps, same as scalar), even though the detector-only benchmark puts RVV 12% ahead of scalar. The detector is not what binds the live app, so detector-side tuning is currently invisible. Revisit after the non-detector load is cut.
 
 E. Buffer-allocation hygiene.
 Most of this is already good (persistent ai2d tensor/builder, persistent osd_frame/draw_frame/filtered_gray, persistent plane mmap). The remaining per-update allocations are the temp_img in portrait/debug paths and the per-frame cv::Mats in USB mode. Fixing those is cheap and removes GC/allocation jitter on the one busy core.
 
 
 
-In short: the architecture is sound and already does the right things (zero-copy camera→detector, camera on a hardware plane, persistent buffers, hardware resize/KPU). The OSD-side full-frame copy + flush was the second-biggest serialization point and is now gone via the k230_osd triple-buffered module (draw into a CPU-owned plane buffer; buffers retired on real page flips). The remaining wins are all about the single core, and the top one is now clearly: overlap capture with compute (requeue the camera buffer earlier — the Stage-0 / small-crop split, §3A), plus CCL/RVV tune on the detector. That will move latency and throughput more than further OSD work.
+In short: the architecture is sound and already does the right things (zero-copy camera→detector, camera on a hardware plane, persistent buffers, hardware resize/KPU). The OSD-side full-frame copy + flush was the second-biggest serialization point and is now gone via the k230_osd triple-buffered module (draw into a CPU-owned plane buffer; buffers retired on real page flips). The remaining wins are all about the single core. §3A (requeue the camera buffer earlier) is now done in both apps and turned out to be throughput-neutral — it buys freshness, not fps. Measurement since then (§6) shows the detector is no longer the bottleneck at all: the live app reaches only ~50% of the detector's standalone throughput, so the top item is now cutting the capture/display CPU load, not tuning CCL/RVV.
 
-Next step I'd take: §3A is now done in both apps, so the open items are (a) teach the vvcam video driver to stamp buffer timestamps, without which no latency claim here is measurable, and (b) try raising DETECT_BUFFER_NUM/BUFFER_NUM from 3, which is what now bounds capture freshness. Detector-side CCL/RVV tuning remains the throughput lever.
+Next step I'd take: see §6 — the detector is no longer the bottleneck. Live apriltag runs at ~50% of the detector's standalone throughput, so the work is cutting the capture/display load, starting with a 1280x720@30 sensor mode.
 ╰───────────────────────────────────────────
 
 ---
@@ -181,8 +182,145 @@ CPU-bound; it buys freshness, bounded by the capture buffer count. So the fps
 table above still stands: treat 720p-vs-1080p as an explicit
 latency-vs-throughput choice.
 
+**Follow-up (§6):** that choice is avoidable. The 60 fps capture rate, not the
+resolution, is what costs the detection throughput here, so a native 720p@30
+mode would keep the freshness benefit at half the capture load. See §6.1.
+
 Note there is currently **no runtime switch** between the two — the
 preferred/fallback pair is hardcoded at both call sites (`apriltag_demo`
 main.cc:845, `tinytag_detect` main.cc:652), and `--csi-size` does *not* select
 the sensor mode. A `--sensor-mode` flag would make this trade-off measurable
 without swapping libraries, which is how the numbers above had to be obtained.
+
+
+---
+
+## 6. The detector is no longer the bottleneck (2026-09-02)
+
+Measured with the on-board detector-only benchmark (`/root/app/apriltag_bench`,
+`fixture.jpg`, 1280x720, factor 2, 15 iterations x 10 batches, warmup 3) — no
+capture, no display, no OSD:
+
+| backend | mean latency | throughput |
+|---|---|---|
+| Rust RVV | 47.6 ms | **21.0 fps** |
+| Rust scalar | 53.3 ms | **18.8 fps** |
+| C reference | 69.7 ms | 14.4 fps |
+
+The live app, same input size and factor, runs at **~9.4 fps**.
+
+**Live throughput is half the detector's standalone rate.** Roughly 50% of the
+single core goes to everything except detection: the display thread's ~60 fps
+poll/atomic-commit/buffer-recycle loop, the detect context capturing at 60 fps
+and discarding ~5 of every 6 frames, the ISP writing those discarded NV12
+frames to DDR, the OSD draw/publish, and the §3A snapshot copy.
+
+This also explains a null result that would otherwise be puzzling: `--rvv` is
+12% faster than scalar in the benchmark but makes **no difference live**
+(8.9-9.9 fps either way). The detector has ~9 fps of headroom it cannot use.
+
+### Ranked from here
+
+1. **Cap the display rate.** Do this first: it is independent of the camera
+   mode, the detector and the sensor tuning, so once it is settled it stays
+   settled regardless of what happens to the rest. The display thread flips at
+   ~60 fps while detections change at ~9 fps; the camera image is on a hardware
+   plane and the OSD only updates at detection rate, so most of those
+   poll/atomic-commit/buffer-recycle cycles are CPU overhead for no visible
+   benefit. Test at 30 fps, and note the panel is 480x800 — there is no
+   information above the detection rate to show.
+2. **Then the capture side: a native 1280x720@30 sensor mode.** §5 already
+   priced 60 fps capture: 1080p30 yields 15 fps detect, 720p60 yields 9 fps for
+   the same 1280x720 detector input — i.e. the app runs at 80% of standalone
+   detector throughput at 30 fps capture but only 50% at 60 fps. That is ~40% of
+   detection throughput spent on freshness that §3A bounded at ~19 ms. A 720p30
+   mode keeps the native binned readout (no ISP downscale) at half the capture
+   load. In the register table it is only VTS: `0x380e`/`0x380f` 851 -> 1702,
+   everything else unchanged. It also **doubles the exposure ceiling**, which
+   should cut the analog gain the AE currently rails at (14.7-24x) and with it
+   the sensor noise — see docs/notes/ov5647-720p-mode.md §8.
+3. **Then detector work.** RVV (+12% standalone) and factor/min-blob tuning
+   become worth enabling once the contention above is removed.
+
+**Deliberately not next:** raising `DETECT_BUFFER_NUM`/`BUFFER_NUM` from 3. It
+buys freshness only, and at 30 fps capture the bound changes anyway —
+iteration_period / frame_period drops from ~6 to ~3, which 3 buffers already
+covers.
+
+**Prerequisite for any latency claim:** the vvcam video driver returns
+`v4l2_buffer.timestamp == 0` despite advertising
+`V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC` (`vvcam_video_register.c:1221`), so
+staleness cannot be measured, only derived. Fix that before tuning latency
+further.
+
+
+---
+
+## 7. The second core: what §6 implies for the AMP plan (2026-09-02)
+
+Everything in §6 redistributes one core. The second core changes how many
+there are, and §6 sized that prize: the live app reaches ~50% of the
+detector's standalone throughput, so giving the compute a core to itself is
+worth roughly **2x** — more than the rest of this note combined.
+
+**This is already planned work, not a new idea.** See
+`docs/amp_bigcore_rvv_plan.md` and `docs/k230_amp_payload_slots.md`. This
+section only records what §6's measurements add to them, and two constraints
+that a perf-motivated reading should not trip over.
+
+### What §6 contributes
+
+A concrete value case. Those documents motivate AMP mainly by RVV capability
+and architecture; §6 supplies the throughput argument, measured: apriltag's
+detector needs 47.6 ms/frame and gets ~106 ms of wall clock, because the
+capture, display and OSD work is timesharing the same core. That is the gap a
+second slot would close.
+
+### Two constraints on the "infrastructure on the small core" split
+
+The natural perf framing — put camera capture, OSD draw, display flip, ai2d
+setup and KPU launch on one core and leave the heavy compute on the other —
+runs into two facts already established in those docs:
+
+- **The small core has no vector unit,** and the AI/NN stack (libnncase,
+  AI2D_KPU) is RVV-only. So `ai2d` setup and KPU launch specifically *cannot*
+  move to the small core; they have to stay wherever the vector core is. The
+  non-vector infrastructure (V4L2 dequeue, DRM flips, OSD drawing) is the part
+  that could move.
+- **Userspace on `dev` is built vector-wide** (`-mcpu=c908v
+  -mrvv-auto-vectorize`), so nothing currently built can execute on a
+  non-vector core. A small-core slot needs its own non-vector sysroot, not
+  just a scheduling decision.
+
+### And SMP is not the mechanism
+
+`docs/k230_amp_payload_slots.md` lists SMP as an explicit **non-goal**:
+inter-core cache coherency is unresolved pending the TRM, and K230's two CPU
+subsystems are not a conventional SMP pair. Consistent with that, the
+small-core branch logged `CPU1: failed to come online`, and `dev`'s device
+tree describes a single hart on purpose. So the way to a second core here is
+an AMP payload slot with explicitly flushed shared buffers — not booting Linux
+SMP across both harts. A perf-driven attempt to "just enable the second CPU"
+would be rediscovering a settled question.
+
+### Verified on k230_canmv_v3 while measuring §6
+
+Consistent with those docs, and worth having in one place:
+
+- `/sys/devices/system/cpu/possible` is `0` — one hart, by DT design
+  (`k230.dtsi` declares only `cpu@0`), not a core sitting offline.
+- The kernel is built SMP (`Linux version 6.6.36 ... #2 SMP`), so the config
+  is not what bounds this.
+- `/proc/cpuinfo` reports `hart : 0` with ISA `rv64imafdcv...`. Per
+  `k230_amp_payload_slots.md`, the big RVV core *is* architectural hart 0, so
+  this confirms `dev` runs Linux on the **big core with vector** — which is
+  also why §6's RVV benchmark beats scalar. (Note for anyone carrying the
+  older assumption: on `dev` this is *not* the no-vector small core.)
+
+### Sequencing
+
+Independent of §6. The §6 items are app-level, cheap and measurable today; the
+AMP work is a boot/firmware project gated by an open question that one serial
+console boot would settle (does the small core report `mhartid == 0` or `1`?).
+Do §6 first regardless — a second core is not a reason to keep spending ~40%
+of the first one on frames that get discarded.
