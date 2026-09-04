@@ -16,6 +16,16 @@ config SYS_CONFIG_NAME
 config BOARD_SPECIFIC_OPTIONS # dummy
 	def_bool y
 	select RISCV_THEAD
+
+config LINUX_RUN_CORE_ID
+	int "Linux boot core"
+	range 0 1
+	default 1
+	help
+	  Select the K230 SoC CPU slot that runs U-Boot and Linux. Slot 0 keeps
+	  execution on the booted small core; slot 1 releases the big core and
+	  parks the small core, preserving the vendor single-Linux behavior.
+
 choice
 	prompt "ddr typy freq"
     default CANMV_LPDDR3_2133

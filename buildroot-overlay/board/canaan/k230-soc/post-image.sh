@@ -252,6 +252,7 @@ gen_boot_ext4()
 	cp Image boot/;
 	[ ! -f "Image_ilp32" ] ||  cp Image_ilp32 boot/;
 	cp *.dtb boot;
+	[ ! -f "metal-v-k230.bin" ] || cp metal-v-k230.bin boot/;
 	[ -z "${logo}" ]  ||  cp ${BUILDROOT_PATH}/${logo} boot/logo.yuv;
 	cd boot; rm -rf k.dtb;ln -s ${first_dtb} k.dtb; cd -;
 	${UBOOT_BUILD_DIR}/tools/mkimage -A riscv -O linux -T kernel -C none -a 0 -e 0 -n linux -d ${BINARIES_DIR}/fw_jump.bin  boot/fw_jump_add_uboot_head.bin

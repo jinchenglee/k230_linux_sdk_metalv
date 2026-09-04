@@ -68,7 +68,10 @@ add_subdirectory(v4l2-drm-scene)
 
 install(TARGETS ${PROJECT_NAME} DESTINATION /usr/lib)
 install(TARGETS vvcam-capabilities DESTINATION /usr/lib)
-install(PROGRAMS ${CMAKE_CURRENT_SOURCE_DIR}/isp_media_server DESTINATION /usr/bin)
+set(VVCAM_ISP_MEDIA_SERVER "isp_media_server" CACHE STRING
+    "ISA-appropriate prebuilt ISP media server")
+install(PROGRAMS ${CMAKE_CURRENT_SOURCE_DIR}/${VVCAM_ISP_MEDIA_SERVER}
+        DESTINATION /usr/bin RENAME isp_media_server)
 install(DIRECTORY include/ DESTINATION /usr/include)
 install(DIRECTORY configs/ DESTINATION /etc/vvcam)
 install(FILES ${OV5647_720P_STARTER_PROFILES} DESTINATION /etc/vvcam)

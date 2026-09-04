@@ -1,0 +1,7 @@
+config BR2_PACKAGE_METAL_V_AMP
+	bool "Metal-V K230 AMP console payload"
+	depends on BR2_riscv && BR2_RISCV_64
+	help
+	  Build a freestanding RV64GCV diagnostic payload for the K230 big
+	  core. It starts at 0x1c000000 and provides a polling UART3 console
+	  on the second CH342 ACM channel.

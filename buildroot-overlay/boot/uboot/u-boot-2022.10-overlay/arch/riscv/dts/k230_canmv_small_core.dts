@@ -1,0 +1,11 @@
+/*
+ * CanMV-K230 U-Boot device tree for the scalar small-core Linux slot.
+ *
+ * Keep the normal board pinmux and devices, but do not advertise V on the
+ * CPU that executes U-Boot/OpenSBI/Linux in this configuration.
+ */
+#include "k230_canmv.dts"
+
+&{/cpus/cpu@0} {
+	riscv,isa = "rv64imafdcsu";
+};

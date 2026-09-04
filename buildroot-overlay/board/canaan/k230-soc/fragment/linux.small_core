@@ -1,0 +1,2 @@
+# The scalar C908 does not implement the RISC-V Vector extension.
+# CONFIG_RISCV_ISA_V is not set

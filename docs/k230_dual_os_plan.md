@@ -23,8 +23,8 @@ This plan complements two existing documents:
 - `docs/amp_bigcore_rvv_plan.md` records earlier investigation and useful
   low-level evidence.  Treat branch-specific details in it as historical.
 - `docs/k230_amp_payload_slots.md` describes the longer-term configurable
-  payload-slot model in which either core may run Linux, RT-Smart,
-  bare-metal firmware, or nothing.
+  payload-slot model in which either core may run Linux, bare-metal/Embassy
+  firmware, or nothing.
 
 The reproducible scalar nncase experiment is documented in
 `docs/notes/rvv-free-nncase-v2.11.0.md`.
@@ -56,8 +56,9 @@ most useful CPU acceleration unavailable.
 - Do not process alternating complete frames independently on each core.  The
   small core is approximately half the clock rate of the big core, so completion
   order and tail latency would be poor even if average throughput rose.
-- Do not begin by porting all of RT-Smart.  Its official implementation is a
-  reference for boot and IPC, not the desired big-core application environment.
+- RT-Smart is not a runtime target. Its official implementation may be read as
+  a hardware reference for reset, UART, mailbox, and cache handling, but no
+  application or transport code should depend on RT-Smart APIs.
 - Do not pass image payloads through RPMsg buffers.  RPMsg carries control and
   descriptors; a separate shared-memory pool carries frames and ROIs.
 - Do not redesign camera timing yet.  Keep the 720p camera path at 60 fps for
@@ -125,12 +126,14 @@ The official `k230_canmv_defconfig` partitions the low 256 MiB as follows:
 | RT-Smart system | `0x00200000` | `0x07e00000` |
 | Linux system | `0x08000000` | `0x08000000` |
 
-It enables both OSes and sets `CONFIG_LINUX_RUN_CORE_ID=0`.  SoC labels such as
-CPU0/CPU1 must not be assumed to equal architectural hart IDs.  Capture the
-OpenSBI banner and read `mhartid` in the test firmware before finalizing hart
-masks, interrupt routing, or OpenSBI domains.  The big core is known to be the
-RVV-capable architectural hart 0; the small-core raw hart ID still needs to be
-recorded from the actual boot.
+It enables both OSes and sets `CONFIG_LINUX_RUN_CORE_ID=0`. SoC labels such as
+CPU0/CPU1 must not be assumed to equal architectural hart IDs. Hardware
+bring-up on 2026-09-04 confirmed that both independent CPU subsystems report
+`mhartid == 0`: the RVV big-core payload read it directly in M-mode while
+small-core OpenSBI simultaneously reported boot hart 0 with a scalar ISA. A
+single OpenSBI instance therefore cannot address them as globally distinct
+harts. Use independent firmware instances and SoC CPU0/CPU1 reset controls for
+cross-core launch.
 
 The official IPCM layout contains:
 
@@ -203,9 +206,9 @@ Bring up the smallest possible firmware first:
 
 The first heartbeat should not depend on an allocator, scheduler, RPMsg, or
 camera stack.  Once reset, vector, interrupt, and cache behavior are proven, the
-service may use heapless queues or a deliberately bounded allocator.  RT-Smart
-can be used temporarily as a diagnostic reference, but application code should
-target a narrow transport/service API rather than RT-Smart APIs.
+service may use heapless queues or a deliberately bounded allocator. RT-Smart
+sources may be consulted for low-level register behavior only; the payload
+targets freestanding bare metal and a later Rust `no_std`/Embassy runtime.
 
 ## Memory map and isolation
 
@@ -564,4 +567,4 @@ the current scene.
 
 This ordering produces useful proof at each step, keeps the current product path
 available, and makes the platform work reusable by AprilTag, TinyTag, a future
-RT-Smart payload, or a later dual-Linux experiment.
+bare-metal/Embassy payload, or a later dual-Linux experiment.

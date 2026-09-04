@@ -1,0 +1,59 @@
+From: K230 AMP development <noreply@example.com>
+Subject: [PATCH] riscv: dts: k230: describe small-core AMP Linux slot
+
+The AMP image keeps Linux on the scalar small core and reserves UART3 plus
+the top 64 MiB of RAM for the big-core firmware and shared payload pool.
+Do not advertise the V extension to Linux/OpenSBI in this configuration.
+
+diff --git a/arch/riscv/boot/dts/canaan/k230.dtsi b/arch/riscv/boot/dts/canaan/k230.dtsi
+--- a/arch/riscv/boot/dts/canaan/k230.dtsi
++++ b/arch/riscv/boot/dts/canaan/k230.dtsi
+@@ -34,9 +34,9 @@
+ 			compatible = "thead,c908", "riscv";
+ 			device_type = "cpu";
+ 			reg = <0>;
+-			riscv,isa = "rv64imafdcv_zba_zbb_zbc_zbs_zicbom_zicbop_zicboz_svpbmt";
++			riscv,isa = "rv64imafdc_zba_zbb_zbc_zbs_zicbom_zicbop_zicboz_svpbmt";
+ 			riscv,isa-base = "rv64i";
+-			riscv,isa-extensions = "i", "m", "a", "f", "d", "c", "v", "zba", "zbb",
++			riscv,isa-extensions = "i", "m", "a", "f", "d", "c", "zba", "zbb",
+ 					       "zbc", "zbs", "zicbom", "zicbop", "zicboz",
+ 					       "zicntr", "zicsr", "zifencei", "zihpm", "svpbmt";
+ 			riscv,cbom-block-size = <64>;
+diff --git a/arch/riscv/boot/dts/canaan/k230-canmv.dts b/arch/riscv/boot/dts/canaan/k230-canmv.dts
+--- a/arch/riscv/boot/dts/canaan/k230-canmv.dts
++++ b/arch/riscv/boot/dts/canaan/k230-canmv.dts
+@@ -24,6 +24,22 @@
+ 		device_type = "memory";
+ 		reg = <0x0 0x0 0x0 0x20000000>;
+ 	};
++
++	reserved-memory {
++		#address-cells = <2>;
++		#size-cells = <2>;
++		ranges;
++
++		big_core_firmware: big-core-firmware@1c000000 {
++			reg = <0x0 0x1c000000 0x0 0x01000000>;
++			no-map;
++		};
++
++		amp_shared_memory: amp-shared-memory@1d000000 {
++			reg = <0x0 0x1d000000 0x0 0x03000000>;
++			no-map;
++		};
++	};
+ 
+ 	sound {
+ 		status                      = "okay";
+@@ -37,8 +53,9 @@
+ &uart0 {
+ 	status = "okay";
+ };
++/* UART3 is connected to CH342 channel B and belongs to big-core firmware. */
+ &uart3 {
+-	status = "okay";
++	status = "disabled";
+ };
+ &mmc_sd1{
+ 	status = "okay";

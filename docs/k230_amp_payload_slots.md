@@ -11,7 +11,6 @@ on each core selected by configuration rather than baked into the boot path.**
 Concretely, "what runs on core N" becomes a build-time choice per core:
 
 - Linux
-- RT-Smart
 - a bare-metal / `no_std` payload (the RVV image-processing engine is the
   motivating case)
 - nothing
@@ -136,36 +135,23 @@ is **parked in `wfi` forever**, not available for a second payload. Generalizing
 this constant into a per-slot selection -- and replacing the `wfi` park with a
 second payload launch -- is a concrete, small first step toward Model B.
 
-### Hart ID space: partially known, and it gates Model A
+### Hart ID space: local to each CPU subsystem
 
-- **Big core: architectural hart 0.** OpenSBI reports `Boot HART ID : 0` with
-  a vector-capable ISA when running there. That comes from `mhartid` in
-  M-mode, independent of any device tree. So `dev`'s
-  `cpu@0 { reg = <0>; ... "rv64imafdcv..." }` is **correct**, and
-  `kernel(0, dtb)` passes a truthful hartid.
-- **Small core: mhartid NOT established.** A big-core boot log showing hart 0
-  says nothing about what the small core reports when *it* is the boot core.
-  The SoC labels ("CPU0" = small, "CPU1" = big, used by `k230_img.c:170` and
-  by the reset/clock register names) are a *subsystem* numbering and must not
-  be assumed to equal architectural hart IDs.
+Hardware bring-up on 2026-09-04 confirmed that both physical cores report
+`mhartid == 0`. The RVV big-core payload read hart 0 and
+`misa = 0x8000000000b4112f` directly in M-mode. While that payload continued
+running, small-core OpenSBI independently reported boot hart 0 with scalar
+`rv64imafdcbx`.
 
-**This is now the question that decides whether Model A is even possible.**
-K230's two CPU subsystems are not a conventional SMP pair, and each may
-present itself as hart 0 when independently booted. If both cores report
-`mhartid == 0`:
+Architectural hart ID therefore does not distinguish the two K230 CPU
+subsystems. SoC CPU0/CPU1 labels and their reset-vector/reset controls identify
+the physical target. Consequently:
 
 - a single OpenSBI instance cannot manage both -- domains assume one coherent
   hart-ID space, and `sbi_hsm_device.hart_start(hartid, ...)` cannot address a
   core it cannot name;
-- Model A as described collapses, and the realistic target becomes **two
-  independent firmware instances**, one per core -- architecturally much
-  closer to Model B, with IPC over mailbox/hardlock rather than SBI.
-
-If instead the small core reports `mhartid == 1`, Model A stands as written,
-and the `sbi_hsm_device` needs a hartid -> SoC-label mapping (arch hart 0 =
-SoC "CPU1" = registers `0x91102104`/`0x9110100c`; small core = SoC "CPU0" =
-`0x91102100`/`0x91101004`) which is **inverted** and must not be coded as
-identity.
+- Model A is ruled out, and the target is **two independent firmware
+  instances**, one per core, with IPC over mailbox/hardlock rather than SBI.
 
 ### PMP budget is already partially spent
 
@@ -189,12 +175,9 @@ Note also that this overlay is confined to PMP handling: **it does not touch
 hartid**, so the banner's `Boot HART ID` is unmodified upstream behavior
 printing raw `mhartid`, and can be trusted.
 
-**How to settle it:** boot a `CONFIG_LINUX_RUN_CORE_ID = 0` image and read the
-OpenSBI banner. `Boot HART ID` gives the small core's `mhartid`, and
-`Boot HART Base ISA` / `Boot HART ISA Extensions` (`sbi_init.c:174,176`) are
-read from `misa` -- hardware truth, DT-independent -- so they also confirm
-which core it is. `Boot HART PMP Count` in the same block tells us how much
-PMP is available for domain isolation.
+The small-core OpenSBI banner reports 64 PMP entries with two reserved. This
+remains relevant to protecting Linux firmware, but not to constructing one
+OpenSBI domain across the two independent CPU subsystems.
 
 ### Hart numbering: truthful, but only because one hart is described
 
@@ -207,19 +190,11 @@ arch/riscv/kernel/smp.c:45   cpuid_to_hartid_map(0) = boot_cpu_hartid;
 arch/riscv/kernel/cpu.c:285  seq_printf(m, "hart\t\t: %lu\n", cpuid_to_hartid_map(cpu_id));
 ```
 
-So `/proc/cpuinfo`'s `hart` field echoes U-Boot's assertion and cannot
-identify the physical hart. `mhartid` is M-mode-only and unreadable from
-Linux. This is harmless on one hart and becomes a correctness problem the
-moment a second hart and firmware domains are introduced, because OpenSBI
-addresses harts by physical ID.
-
-**Confirmed benign on `dev`.** OpenSBI reports `Boot HART ID : 0` with a
-vector-capable ISA, so the boot hart really is 0 and `kernel(0, dtb)` is
-truthful. The hazard is not a present-day bug; it is that `a0` is a hardcoded
-constant rather than a derived value. The moment a slot is meant to boot on
-the small core, `kernel(0, ...)` becomes actively wrong and must be replaced
-by the real hartid. Under Model A this disappears entirely -- OpenSBI hands
-each domain its own `next_addr` with the correct hartid.
+So `/proc/cpuinfo`'s `hart` field cannot identify the physical core.
+`mhartid` is M-mode-only and unreadable from Linux, and both CPU subsystems
+legitimately return zero anyway. U-Boot's `kernel(0, dtb)` is truthful for
+either single-hart Linux placement. Track physical identity out of band using
+the selected image and DT, ISA, and SoC CPU slot.
 
 ## The slot model
 
@@ -300,19 +275,15 @@ driver has it).
 
 Ordered by how much they gate work.
 
-1. **Does the small core report `mhartid == 0` or `1`?** Gates whether Model A
-   (one OpenSBI, two domains) is possible at all -- see "Hart ID space" above.
-   Settled by one boot of a `CONFIG_LINUX_RUN_CORE_ID = 0` image with the
-   serial console attached; no patch required.
-2. **Inter-core cache coherency.** Unresolved; needs the TRM. Gates SMP
+1. **Inter-core cache coherency.** Unresolved; needs the TRM. Gates SMP
    entirely (hence the non-goal). AMP works either way via explicitly flushed
    shared buffers, but the answer determines how much flushing the IPC layer
    must do.
-3. **PLIC hart-context numbering.** Current DT wires one hart only:
+2. **PLIC hart-context numbering.** Current DT wires one hart only:
    `plic: interrupts-extended = <&cpu0_intc 11>, <&cpu0_intc 9>` and
    `clint: <&cpu0_intc 3>, <&cpu0_intc 7>`. Real context ordering needed from
    the TRM before a second slot can take interrupts.
-4. **Can a core be cleanly re-reset at runtime?** Decides whether swapping a
+3. **Can a core be cleanly re-reset at runtime?** Decides whether swapping a
    slot's payload requires a full reboot.
 5. **DDR map.** `amp_bigcore_rvv_plan.md`'s placeholder reserved region
    collides with the current CMA range. Needs a real map; CMA is adjustable

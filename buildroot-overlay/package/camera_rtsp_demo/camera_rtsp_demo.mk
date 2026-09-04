@@ -9,6 +9,7 @@ define CAMERA_RTSP_DEMO_BUILD_CMDS
 endef
 
 define CAMERA_RTSP_DEMO_INSTALL_TARGET_CMDS
+	$(INSTALL) -d $(TARGET_DIR)/root/app
 	$(INSTALL) -m 0755 $(@D)/camera_rtsp_demo $(TARGET_DIR)/root/app/camera_rtsp_demo
 endef
 

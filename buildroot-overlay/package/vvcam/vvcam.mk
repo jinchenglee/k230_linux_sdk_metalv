@@ -15,6 +15,16 @@ VVCAM_SUPPORTS_IN_SOURCE_BUILD = NO
 
 VVCAM_MODULE_MAKE_OPTS += BR2_PACKAGE_VVCAM_DEF_SENSOR=$(BR2_PACKAGE_VVCAM_DEF_SENSOR)
 
+ifeq ($(BR2_RISCV_ISA_RVV),y)
+VVCAM_ISP_MEDIA_SERVER = isp_media_server
+VVCAM_DEBIAN_ISP_MEDIA_SERVER = isp_media_server_debian
+else
+VVCAM_ISP_MEDIA_SERVER = isp_media_server_scalar
+VVCAM_DEBIAN_ISP_MEDIA_SERVER = isp_media_server_scalar
+endif
+
+VVCAM_CONF_OPTS += -DVVCAM_ISP_MEDIA_SERVER=$(VVCAM_ISP_MEDIA_SERVER)
+
 $(eval $(kernel-module))
 
 
@@ -24,7 +34,7 @@ define VVCAM_BUILD_DEB
 	$(call COPYFILE ,$(TARGET_DIR)/usr/lib/libvvcam.so,$(@D)/deb/usr/lib/riscv64-linux-gnu/)
 	$(call COPYFILE ,$(TARGET_DIR)/usr/lib/libv4l2-drm.so,$(@D)/deb/usr/lib/riscv64-linux-gnu/)
 	$(call COPYFILE ,$(TARGET_DIR)/usr/lib/libdisplay.so,$(@D)/deb/usr/lib/riscv64-linux-gnu/)
-	$(call COPYFILE ,$(@D)/isp_media_server_debian,$(@D)/deb/usr/bin/)
+	$(INSTALL) -D -m 0755 $(@D)/$(VVCAM_DEBIAN_ISP_MEDIA_SERVER) $(@D)/deb/usr/bin/isp_media_server_debian
 	$(call COPYFILE ,$(TARGET_DIR)/usr/bin/v4l2-drm           ,$(@D)/deb/usr/bin/)
 	$(call COPYFILE ,$(TARGET_DIR)/lib/modules/6.6.36/updates/,$(@D)/deb/usr/lib/modules/6.6.36/)
 	$(call COPYFILE ,$(BR2_ROOTFS_OVERLAY)/etc/init.d/S41adb_mtp ,$(@D)/deb/etc/vvcam/)
