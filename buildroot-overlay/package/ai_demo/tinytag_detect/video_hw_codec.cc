@@ -169,7 +169,7 @@ int run_video_file_hw(const char *kmodel_path, const char *video_path, float hea
     cout << "hw codec: software decode -> TinyTagDet -> h264_v4l2m2m (hardware) encode, " << width << "x" << height
          << endl;
 
-    auto decoder = make_crop_decoder(); // TINYTAG_CV_DETECTOR=rvv for AprilTagRVVDecoder, default AprilTagCDecoder
+    auto decoder = make_crop_decoder(); // Default AprilTagRVVDecoder; TINYTAG_CV_DETECTOR=c selects AprilTagCDecoder
     TinyTagDet det(kmodel_path, heatmap_thres, max_proposals, roi_expand, roi_iou_thres, decoder, debug_mode);
 
     cv::Mat frame, gray, yuv_i420;

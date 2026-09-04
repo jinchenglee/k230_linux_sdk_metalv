@@ -98,9 +98,9 @@ notes in `docs/commits/tinytag-crop-threshold-commit.txt`.
                      (no .clone() -- AprilTagCDecoder::detect()
                       reads crop.step as a real stride, see below)
                                    |
-                     AprilTagCDecoder::detect(crop)
-                     [quad_decimate=1.0, traditional CV,
-                      ~2.2ms/ROI -- the dominant real-deployment cost]
+                     TagCropDecoder::detect(crop)
+                     [apriltag-rvv by default, quad_decimate=1.0;
+                      dominant real-deployment CPU cost]
                                    |
                                    v
                      TagDetection[] -> TinyTagResult[] -> dedupe()
@@ -110,7 +110,7 @@ notes in `docs/commits/tinytag-crop-threshold-commit.txt`.
                      (under result_mutex, DRM overlay plane)
 ```
 
-Real per-frame budget (measured, `bos_logs_video` real match footage):
+Historical reference-C per-frame budget (measured on `bos_logs_video` real match footage):
 **~15.25ms** = pre_process (2.4ms) + inference (2.2ms) + post_process
 (10.7ms, crop-decode dominated). See "Pipeline optimizations" below for
 what each stage used to cost and why.
@@ -223,15 +223,18 @@ Two crop-decode backends, both `TagCropDecoder` implementations, both
 zero-copy (accept a plain `cv::Mat` ROI view, no clone -- see above), both
 default to no quad-search decimation (factor 1.0):
 
-- **`AprilTagCDecoder`** (default): the reference AprilRobotics C library,
-  same one this app always used.
-- **`AprilTagRVVDecoder`** (`TINYTAG_CV_DETECTOR=rvv`): the apriltag-rvv
-  Rust crate (`apriltag_demo/lib/libapriltag_rvv.a`), the same
+- **`AprilTagRVVDecoder`** (unset or `TINYTAG_CV_DETECTOR=rvv`, default):
+  the apriltag-rvv Rust crate (`apriltag_demo/lib/libapriltag_rvv.a`), the same
   RVV-accelerated detector `apriltag_demo.elf --rvv` uses. Selected via
   `make_crop_decoder()`, used consistently by every call site (live
-  camera, video-file, image mode) so they can't drift out of sync.
+  camera, video-file, image mode) so they cannot drift out of sync.
+- **`AprilTagCDecoder`** (`TINYTAG_CV_DETECTOR=c`): the reference
+  AprilRobotics C library. It retains factor 1 but explicitly matches the
+  demo defaults for the other controls: minimum blob 25, exact codewords,
+  edge refinement off, and decode sharpening off.
 
-**Measured, 499-frame real footage (`bos_logs_video/log181_main_bot_left.mp4`,
+**Historical measurement (before RVV became the default and before the C
+backend settings were aligned), 499-frame real footage (`bos_logs_video/log181_main_bot_left.mp4`,
 2228 total ROIs), per-ROI, split by outcome** -- a naive aggregate
 comparison is confounded here: a detector that gives up on more ROIs does
 *less work on average* for reasons unrelated to raw per-op speed (a miss
@@ -241,23 +244,21 @@ separately, not just the overall average:
 
 | | avg time, hit (found >=1 tag) | avg time, miss (found 0) | total detections |
 |---|---:|---:|---:|
-| `c` (default) | 2.70ms (n=1209) | 1.55ms (n=1019) | 1209 |
+| `c` (old default) | 2.70ms (n=1209) | 1.55ms (n=1019) | 1209 |
 | `rvv` | 1.57ms (n=1116) | 0.84ms (n=1112) | 1116 |
 | **ratio (c/rvv)** | **1.72x** | **1.85x** | -- |
 
-RVV is genuinely **~1.7-1.9x faster** even controlling for outcome (not
-the far larger ratio a single-frame example or the raw unmatched aggregate
-suggested -- both of those were skewed by RVV's higher miss rate, misses
-being cheaper). It also finds **~7.7% fewer** detections than the
-reference C library on the same footage -- two real, separate effects,
-not one masquerading as the other. Neither is root-caused yet (candidates
-for the recall gap: `min_blob_size=25`, copied from `apriltag_demo`'s own
-default without checking whether it's right for an already-cropped small
-ROI, same category of issue `quad_decimate` turned out to be; or a
-genuine algorithmic difference between the reference and Rust-reimplemented
-detector). **`c` stays the default** until the recall gap is understood --
-`rvv` is available today for anyone who wants faster crop-decode with a
-real, understood, if not-yet-explained recall cost.
+In that historical run RVV was **~1.7-1.9x faster**, but it found 7.7%
+fewer detections. The C side still used upstream defaults (blob 5, two-bit
+correction, edge refinement, and sharpening), while RVV used the demo
+settings, so the table is not a controlled comparison of the current
+backends. Re-run the corpus after this default/configuration change before
+using those recall totals for a production decision.
+
+A 2026-09-04 live-board factor-1 RVV run with two large, nearby tags took
+13.19 ms and 11.04 ms for the two successful ROIs; three misses added about
+2.17 ms, for 26.50 ms across five proposals. This confirms the speedup but
+also shows that large factor-1 ROI decoding remains the dominant cost.
 
 ## Hardware video codec (video-file mode only)
 

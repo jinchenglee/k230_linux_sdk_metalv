@@ -39,8 +39,12 @@ AprilTagCDecoder::AprilTagCDecoder(const std::string &family_name, float quad_de
 {
     apriltag_family_t *fam = create_family(family_name_);
     apriltag_detector_t *det = apriltag_detector_create();
-    apriltag_detector_add_family(det, fam);
-    det->quad_decimate = quad_decimate; // see tag_crop_decoder.h's constructor doc -- not the library's own 2.0 default
+    // Match apriltag_demo defaults while retaining factor 1 for TinyTag ROIs.
+    apriltag_detector_add_family_bits(det, fam, 0);
+    det->qtp.min_cluster_pixels = 25;
+    det->quad_decimate = quad_decimate;
+    det->refine_edges = false;
+    det->decode_sharpening = 0.0;
     detector_ = det;
     family_ = fam;
 }
@@ -134,7 +138,7 @@ std::vector<TagDetection> AprilTagRVVDecoder::detect(const cv::Mat &crop)
 std::shared_ptr<TagCropDecoder> make_crop_decoder()
 {
     const char *env = std::getenv("TINYTAG_CV_DETECTOR");
-    if (env && std::string(env) == "rvv")
-        return std::make_shared<AprilTagRVVDecoder>();
-    return std::make_shared<AprilTagCDecoder>();
+    if (env && std::string(env) == "c")
+        return std::make_shared<AprilTagCDecoder>();
+    return std::make_shared<AprilTagRVVDecoder>();
 }

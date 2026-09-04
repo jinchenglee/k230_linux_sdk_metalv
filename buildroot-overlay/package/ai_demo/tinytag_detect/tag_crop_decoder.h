@@ -51,6 +51,8 @@ public:
     // consumers); pass a different family name to get a clear error rather
     // than a silent wrong-family mismatch.
     //
+    // Defaults otherwise match apriltag_demo: min_blob_size=25, exact
+    // codewords, edge refinement off, and decode sharpening off.
     // quad_decimate default is 1.0 (no decimation), NOT the apriltag
     // library's own default of 2.0. That 2.0 default exists for full-frame
     // detection (tag is a small fraction of a large image, decimating the
@@ -108,8 +110,9 @@ private:
 };
 
 // Picks a crop-decode backend based on the TINYTAG_CV_DETECTOR environment
-// variable: unset/"c" -> AprilTagCDecoder (default, the reference library),
-// "rvv" -> AprilTagRVVDecoder. All call sites (live camera, video-file,
+// variable: unset/"rvv" -> AprilTagRVVDecoder (production default),
+// "c" -> AprilTagCDecoder (reference fallback). All call sites (live camera,
+// video-file,
 // image mode) should construct their decoder through this instead of
 // naming a concrete class directly, so they can't drift out of sync with
 // each other.
