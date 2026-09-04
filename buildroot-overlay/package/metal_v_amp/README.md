@@ -128,6 +128,18 @@ request IRQ plus response polling, or no option for pure polling. Deployment,
 rollback, expected counters, and diagnosis are documented in
 `docs/notes/k230_amp_mailbox.md`.
 
+## Notification latency profiling
+
+For notification profiling without payload CRC/transform cost, run:
+
+```sh
+/root/amp/amp-shm-test --latency
+```
+
+This performs 100 warm-up exchanges followed by 10,000 zero-payload
+bidirectional samples and reports min/mean/p50/p95/p99/max. An optional sample
+count may follow `--latency`.
+
 ## Current assumptions
 
 The first payload relies on SPL/U-Boot having enabled the UART3 clock and board

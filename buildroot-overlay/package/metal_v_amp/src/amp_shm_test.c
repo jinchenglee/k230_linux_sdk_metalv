@@ -16,6 +16,8 @@
 #include "mailbox.h"
 
 #define TEST_TIMEOUT_NS UINT64_C(2000000000)
+#define LATENCY_WARMUP 100UL
+#define LATENCY_MAX_SAMPLES 1000000UL
 
 enum notify_mode {
 	NOTIFY_POLL,
@@ -56,7 +58,8 @@ static uint8_t pattern_byte(uint32_t seed, uint32_t index)
 
 static int run_exchange(volatile uint8_t *mapping, uint64_t sequence,
 			uint32_t length, enum notify_mode mode,
-			volatile uint8_t *mailbox, int mailbox_fd, uint64_t *completion_irq)
+			volatile uint8_t *mailbox, int mailbox_fd,
+			uint64_t *completion_irq, uint64_t *elapsed_ns, int verbose)
 {
 	volatile struct amp_shm_request *request = (void *)(mapping +
 		AMP_SHM_REQUEST_OFFSET);
@@ -145,6 +148,8 @@ static int run_exchange(volatile uint8_t *mapping, uint64_t sequence,
 		return -1;
 	}
 	elapsed = monotonic_ns() - started;
+	if (elapsed_ns)
+		*elapsed_ns = elapsed;
 
 	if (response->request_sequence != sequence ||
 	    response->result != AMP_SHM_OK || response->length != length ||
@@ -178,18 +183,84 @@ static int run_exchange(volatile uint8_t *mapping, uint64_t sequence,
 		return -1;
 	}
 
-	printf("PASS seq=%" PRIu64 " bytes=%" PRIu32
-	       " round_trip=%.3f ms"
-	       " big_cycles{invalidate=%" PRIu64 ",request_crc=%" PRIu64
-	       ",transform=%" PRIu64 ",response_crc=%" PRIu64
-	       ",clean=%" PRIu64 "}\n",
-	       sequence, length, elapsed / 1000000.0,
-	       response->timing.request_invalidate_cycles,
-	       response->timing.request_crc_cycles,
-	       response->timing.transform_cycles,
-	       response->timing.response_crc_cycles,
-	       response->timing.response_clean_cycles);
+	if (verbose)
+		printf("PASS seq=%" PRIu64 " bytes=%" PRIu32
+		       " round_trip=%.3f ms"
+		       " big_cycles{invalidate=%" PRIu64 ",request_crc=%" PRIu64
+		       ",transform=%" PRIu64 ",response_crc=%" PRIu64
+		       ",clean=%" PRIu64 "}\n",
+		       sequence, length, elapsed / 1000000.0,
+		       response->timing.request_invalidate_cycles,
+		       response->timing.request_crc_cycles,
+		       response->timing.transform_cycles,
+		       response->timing.response_crc_cycles,
+		       response->timing.response_clean_cycles);
 	return 0;
+}
+
+static int compare_u64(const void *left, const void *right)
+{
+	uint64_t a = *(const uint64_t *)left;
+	uint64_t b = *(const uint64_t *)right;
+
+	return (a > b) - (a < b);
+}
+
+static uint64_t percentile(const uint64_t *samples, size_t count,
+			   unsigned int percent)
+{
+	size_t rank = (count * percent + 99U) / 100U;
+
+	if (!rank)
+		rank = 1;
+	return samples[rank - 1];
+}
+
+static int run_latency_benchmark(volatile uint8_t *mapping,
+				 uint64_t *sequence, int mailbox_fd,
+				 uint64_t *completion_irq, size_t sample_count)
+{
+	uint64_t *samples;
+	long double total = 0;
+	size_t i;
+	int ret = -1;
+
+	samples = calloc(sample_count, sizeof(*samples));
+	if (!samples) {
+		perror("allocate latency samples");
+		return -1;
+	}
+
+	for (i = 0; i < LATENCY_WARMUP + sample_count; ++i) {
+		uint64_t elapsed;
+
+		if (run_exchange(mapping, ++*sequence, 0, NOTIFY_MAILBOX_IRQ,
+				 NULL, mailbox_fd, completion_irq, &elapsed, 0) != 0)
+			goto out;
+		if (i >= LATENCY_WARMUP) {
+			samples[i - LATENCY_WARMUP] = elapsed;
+			total += elapsed;
+		}
+	}
+
+	qsort(samples, sample_count, sizeof(*samples), compare_u64);
+	printf("AMP zero-payload bidirectional-mailbox latency: "
+	       "samples=%zu warmup=%lu\n",
+	       sample_count, LATENCY_WARMUP);
+	printf("round_trip_us min=%.3f p50=%.3f p95=%.3f p99=%.3f "
+	       "max=%.3f mean=%.3Lf\n",
+	       samples[0] / 1000.0,
+	       percentile(samples, sample_count, 50) / 1000.0,
+	       percentile(samples, sample_count, 95) / 1000.0,
+	       percentile(samples, sample_count, 99) / 1000.0,
+	       samples[sample_count - 1] / 1000.0,
+	       total / sample_count / 1000.0L);
+	printf("Scope: userspace write through big-core service and both mailbox "
+	       "IRQs to Linux poll/read completion.\n");
+	ret = 0;
+out:
+	free(samples);
+	return ret;
 }
 
 int main(int argc, char **argv)
@@ -203,6 +274,7 @@ int main(int argc, char **argv)
 	uint64_t sequence;
 	uint64_t completion_irq = 0;
 	unsigned long loops = 1;
+	int latency_mode = 0;
 	char *end = NULL;
 	size_t i;
 	unsigned long loop;
@@ -217,18 +289,26 @@ int main(int argc, char **argv)
 	} else if (arg < argc && !strcmp(argv[arg], "--mailbox-poll")) {
 		mode = NOTIFY_MAILBOX_POLL;
 		++arg;
+	} else if (arg < argc && !strcmp(argv[arg], "--latency")) {
+		mode = NOTIFY_MAILBOX_IRQ;
+		latency_mode = 1;
+		loops = 10000;
+		++arg;
 	}
 	if (argc - arg > 1) {
 		fprintf(stderr,
-			"usage: %s [--mailbox|--mailbox-poll] [loops]\n",
-			argv[0]);
+			"usage: %s [--mailbox|--mailbox-poll] [loops]\n"
+			"       %s --latency [samples]\n",
+			argv[0], argv[0]);
 		return EXIT_FAILURE;
 	}
 	if (arg < argc) {
 		errno = 0;
 		loops = strtoul(argv[arg], &end, 0);
-		if (errno || !end || *end || loops == 0) {
-			fprintf(stderr, "invalid loop count: %s\n", argv[arg]);
+		if (errno || !end || *end || loops == 0 ||
+		    (latency_mode && loops > LATENCY_MAX_SAMPLES)) {
+			fprintf(stderr, "invalid %s: %s\n",
+				latency_mode ? "sample count" : "loop count", argv[arg]);
 			return EXIT_FAILURE;
 		}
 	}
@@ -277,10 +357,19 @@ int main(int argc, char **argv)
 		sequence = 1;
 	sequence ^= header->generation << 1;
 
+	if (latency_mode) {
+		int status = run_latency_benchmark(mapping, &sequence, mailbox_fd,
+						   &completion_irq, loops);
+
+		close(mailbox_fd);
+		munmap((void *)(uintptr_t)mapping, AMP_SHM_MAP_SIZE);
+		return status == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+	}
+
 	for (loop = 0; loop < loops; ++loop) {
 		for (i = 0; i < sizeof(sizes) / sizeof(sizes[0]); ++i) {
 			if (run_exchange(mapping, ++sequence, sizes[i], mode, mailbox,
-					 mailbox_fd, &completion_irq) != 0) {
+					 mailbox_fd, &completion_irq, NULL, 1) != 0) {
 				if (mailbox_fd >= 0)
 					close(mailbox_fd);
 				if (mailbox)

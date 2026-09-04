@@ -172,3 +172,40 @@ Their close agreement confirms that large-message time is dominated by the
 deliberately diagnostic CRC/byte-transform passes rather than mailbox
 notification. Measure zero-payload notification latency separately before
 using this test to choose RPMsg-Lite queue or payload sizing.
+
+## Notification latency profiling
+
+After the integrity tests pass, isolate transport overhead with a zero-payload
+run:
+
+```sh
+/root/amp/amp-shm-test --latency
+/root/amp/amp-shm-test --latency 100000
+```
+
+The default is 10,000 measured samples after 100 unreported warm-up exchanges;
+the accepted maximum is 1,000,000. Output reports minimum, mean, p50, p95, p99,
+and maximum in microseconds. The interval starts immediately before the
+userspace mailbox-driver `write(2)` and ends after Linux receives the reverse
+IRQ and `poll(2)` plus `read(2)` complete. It therefore measures the complete
+request/completion notification path plus the fixed zero-payload protocol work,
+not raw mailbox hardware latency. Keep the system workload and logging state in
+the benchmark record because scheduler interference primarily affects the tail.
+
+## Profiling results
+
+Idle-system measurements on 2026-09-04:
+
+| Samples | Minimum | p50 | p95 | p99 | Maximum | Mean |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 10,000 | 7.592 us | 8.000 us | 15.556 us | 32.630 us | 217.926 us | 9.640 us |
+| 100,000 | 7.777 us | 8.185 us | 27.186 us | 32.741 us | 178.185 us | 10.002 us |
+
+The stable approximately 8 us median and 33 us p99 show that descriptor-sized
+mailbox notification is negligible relative to millisecond-scale detection
+work. The p95 movement with a stable p99 indicates a secondary latency band,
+most likely Linux scheduling, timer, or background-service interference; this
+is an inference rather than a component-level measurement. Repeat the same
+benchmark under camera/display load and report p50/p95/p99/max before finalizing
+application queue depth or latency budgets. The idle result is sufficient to
+start RPMsg-Lite integration.
