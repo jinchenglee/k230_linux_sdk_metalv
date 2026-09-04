@@ -1,0 +1,30 @@
+#!/bin/sh
+
+case "$1" in
+	start)
+		printf 'Starting K230 AMP mailbox: '
+		module="/lib/modules/$(uname -r)/updates/k230_amp_mailbox.ko"
+		if [ -f "$module" ]; then
+			loader="insmod $module"
+		else
+			loader="modprobe k230_amp_mailbox"
+		fi
+		if $loader; then
+			echo OK
+		else
+			echo FAIL
+			exit 1
+		fi
+		;;
+	stop)
+		rmmod k230_amp_mailbox 2>/dev/null || true
+		;;
+	restart|reload)
+		"$0" stop
+		"$0" start
+		;;
+	*)
+		echo "Usage: $0 {start|stop|restart}"
+		exit 1
+		;;
+esac

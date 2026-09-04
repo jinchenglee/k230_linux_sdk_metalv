@@ -2,6 +2,7 @@
 
 #include "amp_shm.h"
 #include "cache.h"
+#include "mailbox.h"
 #include "uart3.h"
 
 extern char __firmware_start[];
@@ -9,6 +10,7 @@ extern char __firmware_end[];
 
 static unsigned long transactions;
 static unsigned long errors;
+static unsigned long polling_transactions;
 
 #define SHM_PTR(type, offset) \
 	((volatile type *)(uintptr_t)(AMP_SHM_PHYS_BASE + (offset)))
@@ -46,15 +48,22 @@ static void print_info(void)
 	uart3_puthex64((unsigned long)__firmware_end);
 	uart3_puts("\nAMP transactions: ");
 	uart3_puthex64(transactions);
-	uart3_puts(" errors: ");
+	uart3_puts("\nAMP errors: ");
 	uart3_puthex64(errors);
+	uart3_puts("\nAMP mailbox IRQs: ");
+	uart3_puthex64(mailbox_interrupt_count());
+	uart3_puts("\nAMP poll fallback: ");
+	uart3_puthex64(polling_transactions);
+	uart3_puts("\nAMP unhandled IRQs: ");
+	uart3_puthex64(mailbox_unhandled_count());
 	uart3_puts("\n");
 }
 
 static void publish_response(uint64_t sequence, uint32_t result,
 			     uint32_t length, uint32_t request_crc,
 			     uint32_t response_crc,
-			     const struct amp_shm_timing *timing)
+			     const struct amp_shm_timing *timing,
+			     uint32_t notify)
 {
 	volatile struct amp_shm_response *response =
 		SHM_PTR(struct amp_shm_response, AMP_SHM_RESPONSE_OFFSET);
@@ -75,9 +84,11 @@ static void publish_response(uint64_t sequence, uint32_t result,
 	amp_release_fence();
 	publish->sequence = sequence;
 	cache_clean_range((const void *)publish, sizeof(*publish));
+	if (notify)
+		mailbox_notify_small_core();
 }
 
-static uint64_t service_request(uint64_t last_sequence)
+static uint64_t service_request(uint64_t last_sequence, uint32_t mailbox_pending)
 {
 	volatile struct amp_shm_header *header =
 		SHM_PTR(struct amp_shm_header, AMP_SHM_HEADER_OFFSET);
@@ -107,19 +118,26 @@ static uint64_t service_request(uint64_t last_sequence)
 	    header->cache_line != AMP_SHM_CACHE_LINE ||
 	    header->max_payload != AMP_SHM_MAX_PAYLOAD) {
 		++errors;
-		publish_response(sequence, AMP_SHM_BAD_HEADER, 0, 0, 0, &timing);
+		publish_response(sequence, AMP_SHM_BAD_HEADER, 0, 0, 0, &timing,
+				 mailbox_pending);
 		return sequence;
 	}
 
+	if ((request->flags & AMP_SHM_REQUEST_F_MAILBOX) && !mailbox_pending)
+		return last_sequence;
+	if (!(request->flags & AMP_SHM_REQUEST_F_MAILBOX))
+		++polling_transactions;
 	length = request->length;
 	if (request->command != AMP_SHM_COMMAND_XOR) {
 		++errors;
-		publish_response(sequence, AMP_SHM_BAD_COMMAND, 0, 0, 0, &timing);
+		publish_response(sequence, AMP_SHM_BAD_COMMAND, 0, 0, 0, &timing,
+				 mailbox_pending);
 		return sequence;
 	}
 	if (length > AMP_SHM_MAX_PAYLOAD) {
 		++errors;
-		publish_response(sequence, AMP_SHM_BAD_LENGTH, 0, 0, 0, &timing);
+		publish_response(sequence, AMP_SHM_BAD_LENGTH, 0, 0, 0, &timing,
+				 mailbox_pending);
 		return sequence;
 	}
 
@@ -132,7 +150,7 @@ static uint64_t service_request(uint64_t last_sequence)
 	if (request_crc != request->crc32) {
 		++errors;
 		publish_response(sequence, AMP_SHM_BAD_CRC, length,
-				 request_crc, 0, &timing);
+				 request_crc, 0, &timing, mailbox_pending);
 		return sequence;
 	}
 
@@ -148,7 +166,7 @@ static uint64_t service_request(uint64_t last_sequence)
 	timing.response_clean_cycles = read_cycle() - started;
 	amp_release_fence();
 	publish_response(sequence, AMP_SHM_OK, length, request_crc,
-			 response_crc, &timing);
+			 response_crc, &timing, mailbox_pending);
 	++transactions;
 	return sequence;
 }
@@ -166,6 +184,7 @@ void main(void)
 	/* Shared RAM survives a payload restart; do not replay an old request. */
 	cache_invalidate_range((const void *)request_publish,
 			       sizeof(*request_publish));
+	mailbox_init();
 	last_sequence = request_publish->sequence;
 	response_publish->sequence = 0;
 	cache_clean_range((const void *)response_publish,
@@ -174,12 +193,14 @@ void main(void)
 	uart3_puts("\nMetal-V K230 AMP console\n");
 	uart3_puts("big-core UART3 is alive\n");
 	print_info();
-	uart3_puts("Shared-memory polling service is ready at 0x1d000000.\n");
+	uart3_puts("Shared-memory service is ready at 0x1d000000.\n");
+	uart3_puts("Mailbox IRQ 109 is enabled; polling fallback remains available.\n");
 	uart3_puts("Type characters to test RX; CR prints core info.\n");
 	uart3_puts("metal-v> ");
 
 	for (;;) {
-		last_sequence = service_request(last_sequence);
+		last_sequence = service_request(last_sequence,
+						mailbox_take_pending());
 		if (!uart3_try_getc(&ch))
 			continue;
 		if (ch == '\r' || ch == '\n') {

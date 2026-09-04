@@ -1,0 +1,6 @@
+config BR2_PACKAGE_K230_AMP_MAILBOX
+	bool "K230 AMP mailbox driver"
+	depends on BR2_LINUX_KERNEL
+	help
+	  Build the minimal K230 mailbox notification driver used between
+	  small-core Linux and the big-core Metal-V AMP payload.

@@ -3,16 +3,25 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
+#include <poll.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/mman.h>
+#include <string.h>
 #include <time.h>
 #include <unistd.h>
 
 #include "amp_shm.h"
+#include "mailbox.h"
 
 #define TEST_TIMEOUT_NS UINT64_C(2000000000)
+
+enum notify_mode {
+	NOTIFY_POLL,
+	NOTIFY_MAILBOX_IRQ,
+	NOTIFY_MAILBOX_POLL,
+};
 
 static uint64_t monotonic_ns(void)
 {
@@ -46,7 +55,8 @@ static uint8_t pattern_byte(uint32_t seed, uint32_t index)
 }
 
 static int run_exchange(volatile uint8_t *mapping, uint64_t sequence,
-			uint32_t length)
+			uint32_t length, enum notify_mode mode,
+			volatile uint8_t *mailbox, int mailbox_fd, uint64_t *completion_irq)
 {
 	volatile struct amp_shm_request *request = (void *)(mapping +
 		AMP_SHM_REQUEST_OFFSET);
@@ -69,19 +79,71 @@ static int run_exchange(volatile uint8_t *mapping, uint64_t sequence,
 	request->length = length;
 	request->crc32 = request_crc;
 	request->seed = seed;
+	request->flags = mode == NOTIFY_POLL ? 0 : AMP_SHM_REQUEST_F_MAILBOX;
 	io_release_fence();
 	request_publish->sequence = sequence;
 	io_release_fence();
-
 	started = monotonic_ns();
-	while (response_publish->sequence != sequence) {
-		if (monotonic_ns() - started > TEST_TIMEOUT_NS) {
-			fprintf(stderr, "timeout: seq=%" PRIu64 " length=%" PRIu32 "\n",
-				sequence, length);
+	if (mode == NOTIFY_MAILBOX_IRQ) {
+		struct pollfd descriptor = {
+			.fd = mailbox_fd,
+			.events = POLLIN,
+		};
+		ssize_t bytes;
+		int ready;
+
+		if (write(mailbox_fd, &sequence, sizeof(sequence)) !=
+		    (ssize_t)sizeof(sequence)) {
+			perror("ring K230 mailbox");
 			return -1;
+		}
+		do {
+			ready = poll(&descriptor, 1, TEST_TIMEOUT_NS / 1000000);
+		} while (ready < 0 && errno == EINTR);
+		if (ready <= 0) {
+			if (!ready)
+				fprintf(stderr,
+					"completion IRQ timeout: seq=%" PRIu64
+					" length=%" PRIu32 "\n",
+					sequence, length);
+			else
+				perror("poll K230 mailbox");
+			return -1;
+		}
+		bytes = read(mailbox_fd, completion_irq,
+			     sizeof(*completion_irq));
+		if (bytes != (ssize_t)sizeof(*completion_irq)) {
+			if (bytes < 0)
+				perror("read K230 mailbox");
+			else
+				fprintf(stderr, "short K230 mailbox read: %zd\n",
+					bytes);
+			return -1;
+		}
+	} else {
+		if (mode == NOTIFY_MAILBOX_POLL) {
+			*(volatile uint32_t *)(mailbox +
+				K230_CPU2DSP_INT_SET0) = 0;
+			io_release_fence();
+		}
+		while (response_publish->sequence != sequence) {
+			if (monotonic_ns() - started > TEST_TIMEOUT_NS) {
+				fprintf(stderr,
+					"response timeout: seq=%" PRIu64
+					" length=%" PRIu32 "\n",
+					sequence, length);
+				return -1;
+			}
 		}
 	}
 	io_acquire_fence();
+	if (response_publish->sequence != sequence) {
+		fprintf(stderr,
+			"completion before response publication: expected=%" PRIu64
+			" actual=%" PRIu64 "\n",
+			sequence, response_publish->sequence);
+		return -1;
+	}
 	elapsed = monotonic_ns() - started;
 
 	if (response->request_sequence != sequence ||
@@ -137,22 +199,36 @@ int main(int argc, char **argv)
 	};
 	volatile struct amp_shm_header *header;
 	volatile uint8_t *mapping;
+	volatile uint8_t *mailbox = NULL;
 	uint64_t sequence;
+	uint64_t completion_irq = 0;
 	unsigned long loops = 1;
 	char *end = NULL;
 	size_t i;
 	unsigned long loop;
 	int fd;
+	enum notify_mode mode = NOTIFY_POLL;
+	int mailbox_fd = -1;
+	int arg = 1;
 
-	if (argc > 2) {
-		fprintf(stderr, "usage: %s [loops]\n", argv[0]);
+	if (arg < argc && !strcmp(argv[arg], "--mailbox")) {
+		mode = NOTIFY_MAILBOX_IRQ;
+		++arg;
+	} else if (arg < argc && !strcmp(argv[arg], "--mailbox-poll")) {
+		mode = NOTIFY_MAILBOX_POLL;
+		++arg;
+	}
+	if (argc - arg > 1) {
+		fprintf(stderr,
+			"usage: %s [--mailbox|--mailbox-poll] [loops]\n",
+			argv[0]);
 		return EXIT_FAILURE;
 	}
-	if (argc == 2) {
+	if (arg < argc) {
 		errno = 0;
-		loops = strtoul(argv[1], &end, 0);
+		loops = strtoul(argv[arg], &end, 0);
 		if (errno || !end || *end || loops == 0) {
-			fprintf(stderr, "invalid loop count: %s\n", argv[1]);
+			fprintf(stderr, "invalid loop count: %s\n", argv[arg]);
 			return EXIT_FAILURE;
 		}
 	}
@@ -164,10 +240,29 @@ int main(int argc, char **argv)
 	}
 	mapping = mmap(NULL, AMP_SHM_MAP_SIZE, PROT_READ | PROT_WRITE,
 		       MAP_SHARED, fd, (off_t)AMP_SHM_PHYS_BASE);
-	close(fd);
 	if (mapping == MAP_FAILED) {
 		perror("mmap AMP shared memory");
+		close(fd);
 		return EXIT_FAILURE;
+	}
+	if (mode == NOTIFY_MAILBOX_POLL) {
+		mailbox = mmap(NULL, K230_MAILBOX_MAP_SIZE, PROT_READ | PROT_WRITE,
+			       MAP_SHARED, fd, (off_t)K230_MAILBOX_PHYS_BASE);
+		if (mailbox == MAP_FAILED) {
+			perror("mmap K230 mailbox");
+			munmap((void *)(uintptr_t)mapping, AMP_SHM_MAP_SIZE);
+			close(fd);
+			return EXIT_FAILURE;
+		}
+	}
+	close(fd);
+	if (mode == NOTIFY_MAILBOX_IRQ) {
+		mailbox_fd = open("/dev/k230-amp-mailbox", O_RDWR | O_CLOEXEC);
+		if (mailbox_fd < 0) {
+			perror("open /dev/k230-amp-mailbox");
+			munmap((void *)(uintptr_t)mapping, AMP_SHM_MAP_SIZE);
+			return EXIT_FAILURE;
+		}
 	}
 
 	header = (void *)(mapping + AMP_SHM_HEADER_OFFSET);
@@ -184,15 +279,31 @@ int main(int argc, char **argv)
 
 	for (loop = 0; loop < loops; ++loop) {
 		for (i = 0; i < sizeof(sizes) / sizeof(sizes[0]); ++i) {
-			if (run_exchange(mapping, ++sequence, sizes[i]) != 0) {
+			if (run_exchange(mapping, ++sequence, sizes[i], mode, mailbox,
+					 mailbox_fd, &completion_irq) != 0) {
+				if (mailbox_fd >= 0)
+					close(mailbox_fd);
+				if (mailbox)
+					munmap((void *)(uintptr_t)mailbox,
+					       K230_MAILBOX_MAP_SIZE);
 				munmap((void *)(uintptr_t)mapping, AMP_SHM_MAP_SIZE);
 				return EXIT_FAILURE;
 			}
 		}
 	}
 
-	printf("AMP shared-memory test passed: %lu loops, %zu exchanges\n",
-	       loops, loops * (sizeof(sizes) / sizeof(sizes[0])));
+	printf("AMP shared-memory %s test passed: %lu loops, %zu exchanges\n",
+	       mode == NOTIFY_MAILBOX_IRQ ? "bidirectional-mailbox" :
+	       mode == NOTIFY_MAILBOX_POLL ? "request-mailbox/response-poll" :
+	       "polling", loops,
+	       loops * (sizeof(sizes) / sizeof(sizes[0])));
+	if (mode == NOTIFY_MAILBOX_IRQ)
+		printf("Linux completion IRQ count: %" PRIu64 "\n", completion_irq);
+	if (mailbox_fd >= 0)
+		close(mailbox_fd);
+
+	if (mailbox)
+		munmap((void *)(uintptr_t)mailbox, K230_MAILBOX_MAP_SIZE);
 	munmap((void *)(uintptr_t)mapping, AMP_SHM_MAP_SIZE);
 	return EXIT_SUCCESS;
 }

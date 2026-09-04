@@ -106,11 +106,27 @@ timeout. A successful default run prints nine `PASS` lines. Press Enter on ACM1
 afterward to confirm that the firmware reports nine transactions and zero
 errors.
 
-Protocol ABI version 2 also reports big-core cycle counts for request cache
+Protocol ABI version 3 also reports big-core cycle counts for request cache
 invalidation, request CRC, payload transform, response CRC, and response cache
 cleaning. Deploy `metal-v-k230.bin` and `amp-shm-test` as a matched pair whenever
 the ABI changes. These stage timings establish where mailbox and rpmsg-lite
 work should focus before the XOR operation is replaced by ROI processing.
+
+## Mailbox notification test
+
+The bidirectional mailbox stage uses K230 IRQ 109 for Linux-to-big-core request
+notification and the reverse DSP-to-CPU doorbell for completion. A minimal
+Linux driver exposes completion through `/dev/k230-amp-mailbox`. Run:
+
+```sh
+/root/amp/amp-shm-test --mailbox
+```
+
+Mailbox-tagged requests are not serviced until the IRQ is observed, so a pass
+cannot be produced by the fallback polling loop. Use `--mailbox-poll` to test
+request IRQ plus response polling, or no option for pure polling. Deployment,
+rollback, expected counters, and diagnosis are documented in
+`docs/notes/k230_amp_mailbox.md`.
 
 ## Current assumptions
 

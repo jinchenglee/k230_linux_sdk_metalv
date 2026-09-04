@@ -5,7 +5,7 @@ OBJCOPY := $(CROSS_COMPILE)objcopy
 ELF := metal-v-k230.elf
 BIN := metal-v-k230.bin
 LINUX_TEST := amp-shm-test
-OBJS := start.o main.o uart3.o cache.o
+OBJS := start.o main.o uart3.o cache.o mailbox.o
 LINUX_CC ?= riscv64-unknown-linux-gnu-gcc
 LINUX_CFLAGS ?= -O2 -Wall -Wextra
 
@@ -26,7 +26,7 @@ $(ELF): $(OBJS) k230.ld
 $(BIN): $(ELF)
 	$(OBJCOPY) -O binary $< $@
 
-$(LINUX_TEST): amp_shm_test.c amp_shm.h
+$(LINUX_TEST): amp_shm_test.c amp_shm.h mailbox.h
 	$(LINUX_CC) $(LINUX_CFLAGS) -o $@ amp_shm_test.c
 
 %.o: %.c

@@ -1,0 +1,23 @@
+From: K230 AMP development <noreply@example.com>
+Subject: [PATCH] riscv: dts: k230: add AMP mailbox endpoint
+
+Describe mailbox channel zero for the small-core Linux endpoint. The big-core
+firmware uses the opposite side of the same controller.
+
+diff --git a/arch/riscv/boot/dts/canaan/k230.dtsi b/arch/riscv/boot/dts/canaan/k230.dtsi
+--- a/arch/riscv/boot/dts/canaan/k230.dtsi
++++ b/arch/riscv/boot/dts/canaan/k230.dtsi
+@@ -267,6 +267,13 @@
+ 			interrupts-extended = <&cpu0_intc 3>, <&cpu0_intc 7>;
+ 		};
+ 
++		amp_mailbox: mailbox@91104000 {
++			compatible = "canaan,k230-amp-mailbox";
++			reg = <0x0 0x91104000 0x0 0x1000>;
++			interrupts = <109 IRQ_TYPE_LEVEL_HIGH>;
++			status = "okay";
++		};
++
+ 		uart0: serial@91400000 {
+ 			compatible = "snps,dw-apb-uart";
+ 			reg = <0x0 0x91400000 0x0 0x1000>;

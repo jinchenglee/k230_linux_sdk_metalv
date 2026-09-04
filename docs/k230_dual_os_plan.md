@@ -446,7 +446,17 @@ virtual-address cache operations with K230 U-Boot's physical-address
 `dcache.cpa`/`dcache.ipa` sequence, 100 hardware loops (900 exchanges) completed
 without corruption; the 64 KiB and 1 MiB round trips took approximately 3.675
 ms and 58.669 ms respectively. Sequence/ring wrap, non-aligned slot offsets,
-cache-cost instrumentation, and the mailbox latency portion remain open.
+and cache-cost analysis remain open.
+
+Mailbox stage-two implementation status: shared-memory ABI version 3 can tag a
+request as interrupt-driven. Small-core Linux publishes the request and writes
+the official `CPU2DSP_INT_SET0` doorbell at `0x91104004`; the M-mode
+big-core payload configures PLIC source 109, claims and acknowledges the
+interrupt, and only then services that request. The big core publishes its
+cache-clean response before ringing `DSP2CPU_INT_SET0`; a minimal Linux
+platform/misc driver handles the completion IRQ and exposes blocking poll/read
+semantics. Request-mailbox/response-poll and pure-poll modes remain available
+for diagnosis and rollback. See `docs/notes/k230_amp_mailbox.md`.
 
 ### Phase 4: RPMsg-Lite transport
 
@@ -570,15 +580,13 @@ the current scene.
 
 ## Immediate next actions
 
-1. Commit the current `dev` progress and create the AMP branch.
-2. Diff `opt_linux_on_small_core_cherry-picked` against its base and classify
-   commits into boot/config, toolchain/ISA, memory/device tree, and application
-   changes.
-3. Capture the official SDK's exact U-Boot release path, linker addresses,
-   mailbox register sequence, and interrupt routing in a small bring-up note.
-4. Draft the first AMP memory map against the current DT/CMA/MMZ reservations.
-5. Boot small-core Linux and archive the complete OpenSBI/U-Boot/Linux log.
-6. Build the minimal big-core heartbeat before introducing RPMsg-Lite or Rust.
+1. Deploy the matched ABI-v3 firmware, DTB, module, and Linux test.
+2. Pass `--mailbox 100`, `--mailbox-poll`, and pure-poll runs while checking
+   Linux completion and big-core IRQ/error counters.
+3. Measure notification-only latency separately from CRC, payload work, and
+   cache maintenance.
+4. Pin RPMsg-Lite, assign static vrings within the reserved AMP region, and use
+   the now-proven bidirectional mailbox path for virtqueue kicks.
 
 This ordering produces useful proof at each step, keeps the current product path
 available, and makes the platform work reusable by AprilTag, TinyTag, a future

@@ -5,7 +5,7 @@
 
 #define AMP_SHM_PHYS_BASE       UINT64_C(0x1d000000)
 #define AMP_SHM_ABI_MAGIC       UINT32_C(0x4d56414d) /* "MVAM" */
-#define AMP_SHM_ABI_VERSION     UINT32_C(2)
+#define AMP_SHM_ABI_VERSION     UINT32_C(3)
 #define AMP_SHM_CACHE_LINE      UINT32_C(64)
 #define AMP_SHM_MAX_PAYLOAD     UINT32_C(0x00100000)
 
@@ -21,6 +21,7 @@
 #define AMP_SHM_COMMAND_XOR     UINT32_C(1)
 #define AMP_SHM_XOR_VALUE       UINT32_C(0xa5)
 
+#define AMP_SHM_REQUEST_F_MAILBOX UINT32_C(1)
 enum amp_shm_result {
 	AMP_SHM_OK = 0,
 	AMP_SHM_BAD_HEADER = 1,
@@ -43,7 +44,8 @@ struct amp_shm_request {
 	uint32_t length;
 	uint32_t crc32;
 	uint32_t seed;
-	uint8_t reserved[48];
+	uint32_t flags;
+	uint8_t reserved[44];
 } __attribute__((aligned(64)));
 
 struct amp_shm_publish {
