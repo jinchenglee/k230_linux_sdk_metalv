@@ -1,0 +1,58 @@
+#!/bin/sh
+
+# Fast development boot for scalar small-core Linux. Keep hardware/media setup
+# synchronous, bring up Ethernet and SSH in the background, and leave optional
+# services installed for explicit use.
+
+run_init_script()
+{
+	script="$1"
+	case "$script" in
+		*.sh)
+			(
+				trap - INT QUIT TSTP
+				set start
+				. "$script"
+			)
+			;;
+		*)
+			"$script" start
+			;;
+	esac
+}
+
+network_started=0
+
+for i in /etc/init.d/S??*; do
+	[ ! -f "$i" ] && continue
+
+	case "${i##*/}" in
+		S30dbus|S40bluetoothd|S40k230_canmv_small_core_defconfig|\
+		S41adb_mtp|S48sntp|S49ntp|S50crond|S50telnet)
+			# Installed but intentionally omitted from the boot critical path.
+			continue
+			;;
+		S40network)
+			# The local console can become ready while DHCP and sshd start.
+			(
+				run_init_script "$i"
+				[ -x /etc/init.d/S50sshd ] &&
+					run_init_script /etc/init.d/S50sshd
+			) > /tmp/network-ssh-start.log 2>&1 &
+			network_started=1
+			;;
+		S50sshd)
+			# Started after networking above. Fall back to normal startup if
+			# the network script is absent.
+			[ "$network_started" -eq 1 ] || run_init_script "$i"
+			;;
+		*)
+			run_init_script "$i"
+			;;
+	esac
+done
+
+read -r uptime unused < /proc/uptime
+message="FASTBOOT uptime=${uptime}s rcS complete"
+printf '%s\n' "$message" > /dev/console
+printf '<6>%s\n' "$message" > /dev/kmsg

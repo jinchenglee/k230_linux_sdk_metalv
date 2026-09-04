@@ -219,7 +219,9 @@ gen_env_bin()
 
 
 	cd  "${BINARIES_DIR}/";
-	local default_env_file=${env_dir}/default.env;
+	local default_env_template=${env_dir}/default.env;
+	local default_env_file=${BINARIES_DIR}/default.env.generated;
+	cp "${default_env_template}" "${default_env_file}"
 
 	# if [ ${DTB} == "k230-canmv-01studio.dtb" ]; then
 	# 	default_env_file=${env_dir}/01studio.env;
@@ -232,10 +234,13 @@ gen_env_bin()
 		sed -i 's/^bootcmd=.*$/bootcmd=run bnuttx;run blinuxilp32;/g' ${default_env_file}
 	elif [ ${CONF} == "k230d_canmv_defconfig" ] || [ ${CONF} == "BPI-CanMV-K230D-Zero_defconfig" ]; then
 		sed -i 's/^bootcmd=.*$/bootcmd=run bnuttx;run blinux;/g' ${default_env_file}
+	elif [ ${CONF} == "k230_canmv_small_core_defconfig" ]; then
+		sed -i 's/^bootcmd=.*$/bootcmd=run amp_boot;/g' ${default_env_file}
 	else
 		sed -i 's/^bootcmd=.*$/bootcmd=run blinux;/g' ${default_env_file}
 	fi
 	${mkenvimage} -s 0x10000 -o uboot/env.env  ${default_env_file}
+	rm -f "${default_env_file}"
 }
 gen_boot_ext4()
 {

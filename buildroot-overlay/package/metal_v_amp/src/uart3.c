@@ -75,6 +75,14 @@ char uart3_getc(void)
 	return *uart_reg(UART_RBR) & 0xff;
 }
 
+int uart3_try_getc(char *ch)
+{
+	if (!(*uart_reg(UART_LSR) & UART_LSR_DR))
+		return 0;
+	*ch = *uart_reg(UART_RBR) & 0xff;
+	return 1;
+}
+
 void uart3_puthex64(unsigned long value)
 {
 	static const char digits[] = "0123456789abcdef";

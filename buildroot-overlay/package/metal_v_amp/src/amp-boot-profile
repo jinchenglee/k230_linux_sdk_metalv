@@ -1,0 +1,24 @@
+#!/bin/sh
+
+set -eu
+
+case "${1:-}" in
+	fast|full|profile)
+		profile="$1"
+		;;
+	*)
+		echo "Usage: ${0##*/} {fast|full|profile}" >&2
+		exit 2
+		;;
+esac
+
+source_file="/root/amp/rcS.$profile"
+if [ ! -r "$source_file" ]; then
+	echo "Missing boot profile: $source_file" >&2
+	exit 1
+fi
+
+cp "$source_file" /etc/init.d/rcS
+chmod 755 /etc/init.d/rcS
+sync
+echo "Boot profile '$profile' selected; reboot to apply it."

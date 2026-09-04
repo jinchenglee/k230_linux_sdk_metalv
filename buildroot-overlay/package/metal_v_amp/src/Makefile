@@ -4,7 +4,10 @@ OBJCOPY := $(CROSS_COMPILE)objcopy
 
 ELF := metal-v-k230.elf
 BIN := metal-v-k230.bin
-OBJS := start.o main.o uart3.o
+LINUX_TEST := amp-shm-test
+OBJS := start.o main.o uart3.o cache.o
+LINUX_CC ?= riscv64-unknown-linux-gnu-gcc
+LINUX_CFLAGS ?= -O2 -Wall -Wextra
 
 CFLAGS := -march=rv64gcv -mabi=lp64d -mcmodel=medany \
 	-O2 -g -ffreestanding -fno-builtin -fno-common -fno-pic \
@@ -15,13 +18,16 @@ LDFLAGS := -nostdlib -static -Wl,--build-id=none,--gc-sections,-Map=$(ELF).map \
 	-T k230.ld
 
 .PHONY: all clean
-all: $(BIN)
+all: $(BIN) $(LINUX_TEST)
 
 $(ELF): $(OBJS) k230.ld
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(OBJS)
 
 $(BIN): $(ELF)
 	$(OBJCOPY) -O binary $< $@
+
+$(LINUX_TEST): amp_shm_test.c amp_shm.h
+	$(LINUX_CC) $(LINUX_CFLAGS) -o $@ amp_shm_test.c
 
 %.o: %.c
 	$(CC) $(CFLAGS) -c -o $@ $<
@@ -30,4 +36,4 @@ $(BIN): $(ELF)
 	$(CC) $(ASFLAGS) -c -o $@ $<
 
 clean:
-	$(RM) $(OBJS) $(ELF) $(ELF).map $(BIN)
+	$(RM) $(OBJS) $(ELF) $(ELF).map $(BIN) $(LINUX_TEST)

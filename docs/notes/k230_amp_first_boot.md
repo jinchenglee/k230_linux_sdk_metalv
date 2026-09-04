@@ -71,5 +71,7 @@ and did not prevent display.
 - Reflash and smoke-test an image that selects the zero-vector daemon
   automatically.
 - Exercise scene switching and required mirror/flip controls.
-- Implement shared-memory ownership/cache handling and mailbox transport, then
+- Run and stress the new polling shared-memory CRC test on hardware, then add
+  sequence/ring-wrap coverage and cache-cost instrumentation.
+- Implement mailbox notification after polling integrity is established, then
   integrate rpmsg-lite.

@@ -1,0 +1,28 @@
+#!/bin/sh
+
+# Standard Buildroot startup behavior, retained as the full-service alternative
+# to the K230 small-core fast boot profile.
+for i in /etc/init.d/S??*; do
+	# Ignore dangling symlinks (if any).
+	[ ! -f "$i" ] && continue
+
+	# The lean image retains the vendor USB-gadget script but may intentionally
+	# omit its optional userspace daemons.
+	if [ "${i##*/}" = "S41adb_mtp" ] &&
+	   { ! command -v adbd >/dev/null 2>&1 ||
+	     ! command -v umtprd >/dev/null 2>&1; }; then
+		continue
+	fi
+	case "$i" in
+		*.sh)
+			(
+				trap - INT QUIT TSTP
+				set start
+				. "$i"
+			)
+			;;
+		*)
+			"$i" start
+			;;
+	esac
+done

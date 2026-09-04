@@ -1,0 +1,4 @@
+#!/bin/sh
+
+# Console-only autologin target selected by the Buildroot getty options.
+exec /bin/login -f root

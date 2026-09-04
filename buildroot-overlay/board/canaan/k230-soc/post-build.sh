@@ -109,7 +109,30 @@ EOF
 
 	chmod a+x ${auto_boot_f}
 }
+select_small_core_boot_profile()
+{
+	local CONF=$(basename "${BASE_DIR}")
+	local fast_rcs="${rootfs_dir}/root/amp/rcS.fast"
+
+	[ "${CONF}" = "k230_canmv_small_core_defconfig" ] || return 0
+	if [ ! -f "${fast_rcs}" ]; then
+		echo "missing small-core fast boot profile: ${fast_rcs}" >&2
+		return 1
+	fi
+	cp "${fast_rcs}" "${rootfs_dir}/etc/init.d/rcS"
+	chmod 0755 "${rootfs_dir}/etc/init.d/rcS"
+}
+remove_disabled_usb_gadget_files()
+{
+	local config="${BASE_DIR}/.config"
+
+	grep -q '^BR2_PACKAGE_VVCAM_USB_GADGET=y$' "${config}" && return 0
+	rm -f "${rootfs_dir}/usr/bin/adbd" "${rootfs_dir}/usr/sbin/umtprd"
+	rm -rf "${rootfs_dir}/etc/umtprd"
+}
 gen_version
 auto_boot_proc
+select_small_core_boot_profile
+remove_disabled_usb_gadget_files
 [ -f "${STAGING_DIR}/lib/libasan.so.8" ] && cp "${STAGING_DIR}/lib/libasan.so.8" "${TARGET_DIR}/lib/"
 cd ${TARGET_DIR};rm -rf app ; ln -s root/app app; cd -;

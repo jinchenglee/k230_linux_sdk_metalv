@@ -433,6 +433,21 @@ heartbeat loss.
 Gate: sustained bidirectional integrity testing reports zero corruption and
 documents the required cache/barrier sequence.
 
+Initial implementation status: the polling smoke-test transport uses the first
+`0x201000` bytes at physical `0x1d000000`. Linux maps it uncached through
+`/dev/mem` with `O_SYNC`; the big core performs explicit 64-byte C908 range
+invalidate/clean operations. Linux-owned request metadata, its publication
+sequence, big-core-owned response metadata, and its publication sequence each
+occupy separate cache lines. The producer publishes the sequence only after a
+release fence; the consumer applies acquire ordering before invalidating and
+reading metadata/payload. CRC-checked XOR responses exercise data flow in both
+directions at cache-line, page, 64 KiB, and 1 MiB boundaries. After replacing
+virtual-address cache operations with K230 U-Boot's physical-address
+`dcache.cpa`/`dcache.ipa` sequence, 100 hardware loops (900 exchanges) completed
+without corruption; the 64 KiB and 1 MiB round trips took approximately 3.675
+ms and 58.669 ms respectively. Sequence/ring wrap, non-aligned slot offsets,
+cache-cost instrumentation, and the mailbox latency portion remain open.
+
 ### Phase 4: RPMsg-Lite transport
 
 - Pin/import RPMsg-Lite and define static vrings in reserved memory.

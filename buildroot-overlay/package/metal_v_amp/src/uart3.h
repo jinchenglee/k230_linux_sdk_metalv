@@ -5,6 +5,7 @@ void uart3_init(void);
 void uart3_putc(char ch);
 void uart3_puts(const char *text);
 char uart3_getc(void);
+int uart3_try_getc(char *ch);
 void uart3_puthex64(unsigned long value);
 
 #endif

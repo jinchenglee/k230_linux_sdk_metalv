@@ -3,10 +3,18 @@ config BR2_PACKAGE_VVCAM
     select BR2_PACKAGE_MXML
     select BR2_PACKAGE_LIBMICROHTTPD
     select BR2_PACKAGE_DISPLAY
-    select  BR2_PACKAGE_ANDROID_TOOLS
-    select BR2_PACKAGE_UMTPRD
     help
         K230 ISP server
+
+config BR2_PACKAGE_VVCAM_USB_GADGET
+    bool "ADB/MTP USB gadget support"
+    depends on BR2_PACKAGE_VVCAM
+    default y
+    select BR2_PACKAGE_ANDROID_TOOLS
+    select BR2_PACKAGE_UMTPRD
+    help
+        Install the ADB daemon and userspace MTP responder used by the
+        optional USB gadget startup script. They are not required by the ISP.
 
 config BR2_PACKAGE_VVCAM_DEF_SENSOR
     string "default sensor"
