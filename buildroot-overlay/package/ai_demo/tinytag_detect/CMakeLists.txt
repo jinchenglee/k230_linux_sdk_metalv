@@ -66,6 +66,9 @@ if(CMAKE_TOOLCHAIN_FILE MATCHES "buildroot/toolchainfile.cmake")
     # hardware that it doesn't reproduce this corruption.
     install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/utils/tinytag-v11_k230-v4c.int8.kmodel
             DESTINATION /root/app/${PROJECT_NAME}/)
+    # PROGRAMS (not FILES) so the launcher lands executable on a fresh flash.
+    install(PROGRAMS ${CMAKE_CURRENT_SOURCE_DIR}/utils/run.sh
+            DESTINATION /root/app/${PROJECT_NAME}/)
 else()
     message(FATAL_ERROR
         "tinytag_detect: standalone (non-Buildroot) build is not implemented, "

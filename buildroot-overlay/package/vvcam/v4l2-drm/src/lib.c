@@ -1200,6 +1200,12 @@ retry:
                 break; /* done queue drained */
             return -1;
         }
+        /* Count every dequeued buffer, not just the one handed back. This
+         * is the capture load the caller's context actually costs -- the
+         * drained ones are discarded but were still produced and requeued.
+         * v4l2_drm_run_impl maintains frame_count for display contexts; a
+         * capture-only context has no other place to learn its frame rate. */
+        context->frame_count += 1;
         if (have && ioctl(context->video_fd, VIDIOC_QBUF, &held) < 0) {
             /* vb is not retained by the caller on this error path. */
             (void)ioctl(context->video_fd, VIDIOC_QBUF, &vb);

@@ -48,6 +48,21 @@ static std::atomic<int> g_denoise_mode(0);  // 0=off, 1=median3, 2=gaussian3
 static int g_usb_video       = -1;    // /dev/videoX; required before pressing 'u'
 static unsigned g_csi_width  = SENSOR_WIDTH;
 static unsigned g_csi_height = SENSOR_HEIGHT;
+// Upper bound on display atomic submissions per second, and on the HDMI
+// mode's refresh when one can be chosen. 0 means uncapped, which also
+// restores the pre-cap connector-mode choice -- that is the A/B baseline.
+static unsigned g_display_fps = 30;
+// Headless: no DRM display, no OSD plane, no display thread. This is the
+// shape production actually runs in (detected tag -> pose, nothing drawn),
+// so it is the configuration whose detector budget matters. See
+// docs/notes/perf_todo.md 6.1 "The measurement nobody has taken: headless".
+static bool g_no_display = false;
+// Detection telemetry, so a headless run is observable and -- more to the
+// point -- so two runs can be shown to have seen the SAME scene. Whether a
+// tag is present changes the per-frame cost a lot (decode work only happens
+// on a hit), so an A/B without these counts is not comparable.
+static std::atomic<unsigned long> g_tag_total(0);   // tags summed over frames
+static std::atomic<unsigned long> g_hit_frames(0);  // frames with >= 1 tag
 #ifdef APRILTAG_C_BACKEND
 static int g_c_threads = 1;
 static int g_c_bits_corrected = 0;
@@ -119,7 +134,8 @@ static void print_usage(const char* name)
     cout << " [--rvv] [--local-ccl-scratch]";
 #endif
     cout << " [--factor 1|1.5|2] [--min-blob N]"
-            " [--csi-size WxH] [--usb-video X] [--debug]" << endl;
+            " [--csi-size WxH] [--usb-video X] [--display-fps N]"
+            " [--no-display] [--debug]" << endl;
 #ifndef APRILTAG_C_BACKEND
     cout << "  --rvv         use RVV kernels (default: scalar)" << endl;
     cout << "  --local-ccl-scratch  allocate CCL scratch per detection"
@@ -140,6 +156,12 @@ static void print_usage(const char* name)
     cout << "  --csi-size    CSI detection stream size (default: "
          << SENSOR_WIDTH << "x" << SENSOR_HEIGHT << ")" << endl;
     cout << "  --usb-video   USB camera node number X for /dev/videoX" << endl;
+    cout << "  --display-fps cap display submissions at N fps, 0 = uncapped"
+            " (default: 30)" << endl;
+    cout << "  --no-display  headless: no DRM output, no OSD, no display"
+            " thread (production shape)." << endl;
+    cout << "                Prints a per-second [headless] line with detect"
+            " fps and tag counts." << endl;
 #ifndef APRILTAG_C_BACKEND
     cout << "  --debug       enable live pipeline views and decode diagnostics"
             " (default: off)" << endl;
@@ -191,7 +213,17 @@ static void detect_proc(int video_device)
     pthread_setname_np(pthread_self(), "apriltag-detect");
 
     struct v4l2_drm_context context;
-    #define DETECT_BUFFER_NUM 3
+    // 6, not 3. The ISP fills every free capture buffer and then stalls until
+    // one is returned, so the detect node's delivery rate is capped at roughly
+    // (buffer_num - 1) frames per loop iteration -- it is buffer-starved, not
+    // rate-limited. Measured headless on a v3 board (720p60 sensor, ~95 ms
+    // iterations), camera delivery vs buffer count: 3 -> 18.4 fps, 4 -> 28.2,
+    // 6 -> 52.3, 8 -> 56.0, 12 -> 56.2. It saturates at the sensor rate from 6
+    // onwards, so 6 is the knee; detect throughput also rises 9.19 -> 10.45 fps.
+    // Each 1280x720 NV12 buffer is ~1.4 MB and CmaFree is ~400 MB, so the extra
+    // 3 cost ~4 MB. APRILTAG_DEMO_BUFS overrides for re-measuring.
+    // See docs/notes/perf_todo.md 6.3.
+    #define DETECT_BUFFER_NUM (getenv("APRILTAG_DEMO_BUFS") ? atoi(getenv("APRILTAG_DEMO_BUFS")) : 6)
 
     // Do not touch g_osd until display_proc has created and committed it.
     {
@@ -298,12 +330,14 @@ static void detect_proc(int video_device)
         const int selected_debug_stage =
             g_debug_enabled ? g_debug_stage.load() : 0;
         const bool use_lcd_fastpath =
-            selected_debug_stage == 0 && selected_source == 0 &&
+            !g_no_display && selected_debug_stage == 0 && selected_source == 0 &&
             display->width < display->height;
-        k230_osd_set_mode(g_osd,
-            (display->width > display->height || use_lcd_fastpath)
-                ? K230_OSD_MODE_FAST : K230_OSD_MODE_SLOW_ROTATE);
-        k230_osd_prepare(g_osd);
+        if (!g_no_display) {
+            k230_osd_set_mode(g_osd,
+                (display->width > display->height || use_lcd_fastpath)
+                    ? K230_OSD_MODE_FAST : K230_OSD_MODE_SLOW_ROTATE);
+            k230_osd_prepare(g_osd);
+        }
         const char* source_name = selected_source == 0 ? "csi" : "usb";
         const uint8_t* gray = nullptr;
         size_t frame_width = 0;
@@ -342,6 +376,12 @@ static void detect_proc(int video_device)
                 fprintf(stderr, "\n[input] opening USB camera /dev/video%d ...\n",
                         g_usb_video);
                 if (!usb_capture.open(g_usb_video, cv::CAP_V4L2)) {
+                    if (g_no_display) {
+                        fprintf(stderr, "\n[input] cannot open USB camera "
+                                "/dev/video%d\n", g_usb_video);
+                        usleep(500000);
+                        continue;
+                    }
                     cv::Mat &osd = k230_osd_begin(g_osd);
                     osd.setTo(cv::Scalar(0, 0, 0, 255));
                     char message[96];
@@ -552,6 +592,48 @@ static void detect_proc(int video_device)
             detections.assign(out.begin(), out.begin() + n);
         }
 
+        if (n > 0) {
+            g_tag_total.fetch_add((unsigned long)n, std::memory_order_relaxed);
+            g_hit_frames.fetch_add(1, std::memory_order_relaxed);
+        }
+
+        if (g_no_display) {
+            // The display thread owns the once-a-second telemetry line, and
+            // there is no display thread here -- so report from this side.
+            // Tag counts are the point: they show the run actually saw tags,
+            // and let two runs be checked for having seen the same scene.
+            static struct timeval htv = {0, 0};
+            static unsigned long hframes = 0;
+            struct timeval hnow; gettimeofday(&hnow, NULL);
+            if (htv.tv_sec == 0) htv = hnow;
+            hframes++;
+            const uint64_t hus = 1000000ULL * (hnow.tv_sec - htv.tv_sec) +
+                                 hnow.tv_usec - htv.tv_usec;
+            if (hus >= 1000000) {
+                const unsigned long tags =
+                    g_tag_total.exchange(0, std::memory_order_relaxed);
+                const unsigned long hits =
+                    g_hit_frames.exchange(0, std::memory_order_relaxed);
+                const double secs = (double)hus / 1000000.;
+                fprintf(stderr,
+                        " camera: %.2f, detect: %.2f, tags/s: %.2f,"
+                        " hit_frames: %.2f (%.0f%% of frames)          \r",
+                        context.frame_count / secs, hframes / secs,
+                        tags / secs, hits / secs,
+                        hframes ? 100. * (double)hits / (double)hframes : 0.);
+                fflush(stderr);
+                context.frame_count = 0;
+                htv = hnow;
+                hframes = 0;
+            }
+            detect_frame_count += 1;
+            if (csi_frame_held) {
+                v4l2_drm_dump_release(&context);
+                csi_frame_held = false;
+            }
+            continue;
+        }
+
         cv::Mat &osd = k230_osd_begin(g_osd);
         if (use_lcd_fastpath) {
             // Plain CSI detections can be transformed while drawing, avoiding
@@ -722,7 +804,12 @@ void display_proc(int video_device)
         context.display_width = context.width;
         context.display_height = context.height;
     }
-    context.max_display_fps = display_is_hdmi(display) ? 30 : 0;
+    // Applies to every connector, not just HDMI. The DSI panel runs at a fixed
+    // 60 Hz and cannot renegotiate its mode, but this throttles the atomic
+    // submissions themselves -- which is where the CPU goes -- independently of
+    // the panel's scanout rate. Detections change at ~9 fps, so submitting at
+    // panel rate spends the single core on flips that show nothing new.
+    context.max_display_fps = g_display_fps;
     struct v4l2_streamparm display_parm = {};
     display_parm.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     if (ioctl(context.video_fd, VIDIOC_G_PARM, &display_parm) == 0 &&
@@ -850,6 +937,15 @@ static void parse_args(int argc, char* argv[])
             }
             g_csi_width = width;
             g_csi_height = height;
+        } else if (a == "--no-display") {
+            g_no_display = true;
+        } else if (a == "--display-fps" && i + 1 < argc) {
+            const int fps = atoi(argv[++i]);
+            if (fps < 0 || fps > 240) {
+                cerr << "--display-fps must be 0..240 (0 = uncapped)" << endl;
+                exit(2);
+            }
+            g_display_fps = (unsigned)fps;
         } else if (a == "--usb-video" && i + 1 < argc) {
             g_usb_video = atoi(argv[++i]);
             if (g_usb_video < 0) {
@@ -887,7 +983,10 @@ int main(int argc, char* argv[])
          << " min_blob=" << g_min_blob
          << " debug=" << (g_debug_enabled ? "on" : "off")
          << " input=CSI"
-         << " csi_request=" << g_csi_width << "x" << g_csi_height;
+         << " csi_request=" << g_csi_width << "x" << g_csi_height
+         << " display=" << (g_no_display ? std::string("off")
+             : (g_display_fps ? std::to_string(g_display_fps) + "fps"
+                              : std::string("uncapped")));
     if (g_usb_video >= 0) {
         cout << " usb=/dev/video" << g_usb_video;
     }
@@ -895,13 +994,18 @@ int main(int argc, char* argv[])
 
     signal(SIGUSR1, handle_view_cycle_signal);
 
-    display = display_init_refresh(0, 30);
-    if (!display) {
-        cerr << "display_init error, exit" << endl;
-        return -1;
+    if (g_no_display) {
+        fprintf(stderr, "[display] headless: no DRM output, no OSD, "
+                        "no display thread\n");
+    } else {
+        display = display_init_refresh(0, g_display_fps);
+        if (!display) {
+            cerr << "display_init error, exit" << endl;
+            return -1;
+        }
+        fprintf(stderr, "[display] selected mode %ux%u@%u\n",
+                display->width, display->height, display->mode.vrefresh);
     }
-    fprintf(stderr, "[display] selected mode %ux%u@%u\n",
-            display->width, display->height, display->mode.vrefresh);
     uint16_t sensor_width = 0, sensor_height = 0;
     uint32_t sensor_fps = 0;
     int sensor_mode_result = v4l2_drm_request_sensor_mode(
@@ -912,7 +1016,8 @@ int main(int argc, char* argv[])
     if (sensor_mode_result < 0) {
         cerr << "apriltag_demo: active camera supports neither "
              << "1280x720@60 nor 1920x1080@30" << endl;
-        display_exit(display);
+        if (display)
+            display_exit(display);
         return -1;
     }
     fprintf(stderr, "[input] sensor selected %ux%u@%u%s\n",
@@ -922,8 +1027,19 @@ int main(int argc, char* argv[])
     if (v4l2_drm_set_luma_only(kd_mpi_get_vvcam_video00(), true) < 0)
         fprintf(stderr, "[input] luma-only unavailable, keeping color path\n");
 
+    if (g_no_display) {
+        // detect_proc waits on display_ready, which frame_handler would
+        // normally set on the first displayed frame. Release it here.
+        {
+            std::lock_guard<std::mutex> lock(start_mutex);
+            display_ready = true;
+        }
+        start_cv.notify_all();
+    }
     std::thread detect_thread(detect_proc, kd_mpi_get_vvcam_video00() + 1);
-    std::thread display_thread(display_proc, kd_mpi_get_vvcam_video00());
+    std::thread display_thread;
+    if (!g_no_display)
+        display_thread = std::thread(display_proc, kd_mpi_get_vvcam_video00());
 
     print_key_help();
     TerminalRawMode terminal_mode;
@@ -980,6 +1096,7 @@ int main(int argc, char* argv[])
 
     detect_thread.join();
     display_stop.store(true);
-    display_thread.join();
+    if (display_thread.joinable())
+        display_thread.join();
     return 0;
 }

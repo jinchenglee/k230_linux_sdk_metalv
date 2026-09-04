@@ -39,7 +39,7 @@ void print_usage(const char *name)
 {
     cout << "Usage: " << name
          << " <kmodel> <input> <heatmap_thres> <max_proposals> <roi_expand> <profile_mode>"
-         << " [roi_iou_thres] [--debug]" << endl
+         << " [roi_iou_thres] [--display-fps N] [--no-display] [--debug]" << endl
          << "Options:" << endl
          << "  kmodel          tinytag kmodel path\n"
          << "  input           one of:\n"
@@ -71,6 +71,13 @@ void print_usage(const char *name)
          << "                  CV decode. The spec's 3x3 NMS only suppresses heatmap *cells*, so\n"
          << "                  well-separated peaks can still decode to near-identical boxes.\n"
          << "                  Pass 0 to disable and match the reference spec exactly.\n"
+         << "  --display-fps   cap display atomic submissions at N fps, 0 = uncapped\n"
+         << "                  (default 30). Live camera mode only. The panel/monitor keeps\n"
+         << "                  scanning out at its own rate; this bounds how often the app\n"
+         << "                  submits, which is the CPU cost on this single-core part.\n"
+         << "  --no-display    headless: no DRM output, no OSD, no display thread -- the\n"
+         << "                  production shape. Prints a per-second [headless] line with\n"
+         << "                  AI fps and tag counts instead of the display telemetry.\n"
          << "  --debug         emit live-loop timing (capture wait/requeue, ROI copy, OSD,\n"
          << "                  and whole-frame wall time) for confirmed detections\n"
          << "\n"
@@ -155,6 +162,25 @@ static struct timeval tv, tv2;
 static struct display *g_display;
 static struct k230_osd *g_osd;
 static bool g_live_timing_debug = false;
+// Upper bound on display atomic submissions per second, and on the HDMI
+// mode's refresh when one can be chosen. 0 means uncapped.
+//
+// 30 costs this app some preview smoothness -- its AI loop runs at ~35 fps,
+// above the cap, so staged overlays fall 24 -> 14 fps and k230_osd
+// dropped_frames rises from ~10/s to ~24/s (measured on a v3 board, 480x800
+// DSI at 60 Hz, 720p60 sensor). AI throughput (~36 fps) and cpu0 idle (~12%)
+// are unaffected either way. That trade is accepted deliberately: the preview
+// is a development aid, and production runs headless (--no-display), where
+// none of it exists. See docs/notes/perf_todo.md 6.1.
+static unsigned g_display_fps = 30;
+// Headless: no DRM display, no OSD plane, no display thread -- the shape
+// production actually runs in (detected tag -> pose, nothing drawn).
+static bool g_no_display = false;
+// Detection telemetry for headless runs. Whether a tag is present changes
+// the per-frame cost a lot (the CV crop-decode only runs on proposals), so
+// an A/B without these counts is not comparable.
+static std::atomic<unsigned long> g_tag_total(0);
+static std::atomic<unsigned long> g_hit_frames(0);
 
 // Latest once-a-second camera/AI fps, for the on-screen "cam:/det:" HUD
 // text (drawn from ai_proc, right after the detection overlay). Written
@@ -197,7 +223,16 @@ static void draw_fps_stats(cv::Mat &osd, double cam_fps, double det_fps)
 void ai_proc(char *argv[], int video_device)
 {
     struct v4l2_drm_context context;
-#define BUFFER_NUM 3
+// 6, not 3. The ISP fills every free capture buffer and then stalls until one
+// is returned, so this node's delivery rate is set by the buffer count, not by
+// any sensor or ISP rate limit. The effect is dramatic here because this app's
+// loop is fast enough to consume everything offered: measured headless on a v3
+// board (720p60 sensor), AI throughput vs buffer count was 3 -> 28.3 fps,
+// 4 -> 27.9, 6 -> 55.2, 8 -> 56.4, 12 -> 56.4. Six buffers doubles it to the
+// full sensor rate and still leaves ~38% of the core idle. Each 1280x720 NV12
+// buffer is ~1.4 MB against ~400 MB CmaFree. TINYTAG_BUFS overrides for
+// re-measuring. See docs/notes/perf_todo.md 6.3.
+#define BUFFER_NUM (getenv("TINYTAG_BUFS") ? atoi(getenv("TINYTAG_BUFS")) : 6)
 
     // Do not touch g_osd until display_proc has created and committed it.
     {
@@ -273,7 +308,8 @@ void ai_proc(char *argv[], int video_device)
             frame_start = std::chrono::steady_clock::now();
             stage_start = frame_start;
         }
-        k230_osd_prepare(g_osd);
+        if (!g_no_display)
+            k230_osd_prepare(g_osd);
         if (g_live_timing_debug)
             append_live_timing("osd_prepare", stage_start);
 
@@ -377,6 +413,53 @@ void ai_proc(char *argv[], int video_device)
             for (const auto &p : proposals)
                 fprintf(stderr, "[ai]   proposal conf=%.3f roi=(%.0f,%.0f,%.0f,%.0f)\n", p.confidence,
                         p.roi.x, p.roi.y, p.roi.x + p.roi.width, p.roi.y + p.roi.height);
+        }
+
+        if (!results.empty())
+        {
+            g_tag_total.fetch_add((unsigned long)results.size(),
+                                  std::memory_order_relaxed);
+            g_hit_frames.fetch_add(1, std::memory_order_relaxed);
+        }
+
+        if (g_no_display)
+        {
+            // The display thread owns the once-a-second telemetry line and
+            // there is no display thread here, so report from this side.
+            // Unlike that line, this one prints every interval including
+            // zero-detection ones -- a headless A/B needs to see the hit
+            // rate, not just the intervals that had a tag.
+            static struct timeval htv = {0, 0};
+            static unsigned long hframes = 0;
+            struct timeval hnow;
+            gettimeofday(&hnow, NULL);
+            if (htv.tv_sec == 0)
+                htv = hnow;
+            hframes++;
+            const uint64_t hus = 1000000ULL * (hnow.tv_sec - htv.tv_sec) +
+                                 hnow.tv_usec - htv.tv_usec;
+            if (hus >= 1000000)
+            {
+                const unsigned long tags =
+                    g_tag_total.exchange(0, std::memory_order_relaxed);
+                const unsigned long hits =
+                    g_hit_frames.exchange(0, std::memory_order_relaxed);
+                const double secs = (double)hus / 1000000.;
+                fprintf(stderr,
+                        " camera: %.2f, AI: %.2f, tags/s: %.2f,"
+                        " hit_frames: %.2f (%.0f%% of frames)          \r",
+                        context.frame_count / secs, hframes / secs,
+                        tags / secs, hits / secs,
+                        hframes ? 100. * (double)hits / (double)hframes : 0.);
+                fflush(stderr);
+                context.frame_count = 0;
+                htv = hnow;
+                hframes = 0;
+            }
+            ai_frame_count += 1;
+            if (!results.empty() && (profile_mode > 0 || g_live_timing_debug))
+                cout << frame_diagnostics << std::flush;
+            continue;
         }
 
         if (g_live_timing_debug)
@@ -501,7 +584,11 @@ void display_proc(int video_device)
         context.display_width = g_display->width;
         context.display_height = g_display->height;
     }
-    context.max_display_fps = display_is_hdmi(g_display) ? 30 : 0;
+    // Applies to every connector, not just HDMI. The DSI panel runs at a fixed
+    // 60 Hz and cannot renegotiate its mode, but this throttles the atomic
+    // submissions themselves -- which is where the CPU goes -- independently of
+    // the panel's scanout rate.
+    context.max_display_fps = g_display_fps;
 
     if (v4l2_drm_setup(&context, 1, &g_display))
     {
@@ -629,6 +716,34 @@ void __attribute__((destructor)) cleanup()
 int main(int argc, char *argv[])
 {
     cout << "case " << argv[0] << " built at " << __DATE__ << " " << __TIME__ << endl;
+    // The remaining arguments are strictly positional, so pull the named
+    // options out of argv first and compact it before the count is checked.
+    for (int i = 1; i < argc; )
+    {
+        if (strcmp(argv[i], "--no-display") == 0)
+        {
+            g_no_display = true;
+            for (int j = i; j + 1 < argc; ++j)
+                argv[j] = argv[j + 1];
+            argc -= 1;
+            continue;
+        }
+        if (strcmp(argv[i], "--display-fps") != 0 || i + 1 >= argc)
+        {
+            ++i;
+            continue;
+        }
+        const int fps = atoi(argv[i + 1]);
+        if (fps < 0 || fps > 240)
+        {
+            cerr << "--display-fps must be 0..240 (0 = uncapped)" << endl;
+            return -1;
+        }
+        g_display_fps = (unsigned)fps;
+        for (int j = i; j + 2 < argc; ++j)
+            argv[j] = argv[j + 2];
+        argc -= 2;
+    }
     if (argc > 1 && strcmp(argv[argc - 1], "--debug") == 0)
     {
         g_live_timing_debug = true;
@@ -657,11 +772,19 @@ int main(int argc, char *argv[])
 
     if (strcmp(image_path, "None") == 0)
     {
-        g_display = display_init_refresh(0, 30);
-        if (!g_display)
+        if (g_no_display)
         {
-            cerr << "display_init error, exit" << endl;
-            return -1;
+            cerr << "[display] headless: no DRM output, no OSD, "
+                    "no display thread" << endl;
+        }
+        else
+        {
+            g_display = display_init_refresh(0, g_display_fps);
+            if (!g_display)
+            {
+                cerr << "display_init error, exit" << endl;
+                return -1;
+            }
         }
 
         uint16_t sensor_width = 0, sensor_height = 0;
@@ -674,7 +797,8 @@ int main(int argc, char *argv[])
         if (sensor_mode_result < 0) {
             cerr << "tinytag_detect: active camera supports neither "
                  << "1280x720@60 nor 1920x1080@30" << endl;
-            display_exit(g_display);
+            if (g_display)
+                display_exit(g_display);
             return -1;
         }
         cerr << "[input] sensor selected " << sensor_width << "x" << sensor_height
@@ -684,8 +808,20 @@ int main(int argc, char *argv[])
         if (v4l2_drm_set_luma_only(kd_mpi_get_vvcam_video00(), true) < 0)
             cerr << "[input] luma-only unavailable, keeping color path" << endl;
 
+        if (g_no_display)
+        {
+            // ai_proc waits on display_ready, which frame_handler would
+            // normally set on the first displayed frame. Release it here.
+            {
+                std::lock_guard<std::mutex> lock(start_mutex);
+                display_ready = true;
+            }
+            start_cv.notify_all();
+        }
         std::thread ai_thread(ai_proc, argv, kd_mpi_get_vvcam_video00() + 1);
-        std::thread display_thread(display_proc, kd_mpi_get_vvcam_video00());
+        std::thread display_thread;
+        if (!g_no_display)
+            display_thread = std::thread(display_proc, kd_mpi_get_vvcam_video00());
 
         cout << "输入 'q'回车退出" << endl;
         std::string input;
@@ -713,7 +849,8 @@ int main(int argc, char *argv[])
         // on quit, not a functional loss.
         ai_thread.join();
         display_stop.store(true);
-        display_thread.join();
+        if (display_thread.joinable())
+            display_thread.join();
         return 0;
     }
 
