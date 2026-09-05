@@ -1,14 +1,42 @@
 #!/bin/sh
-bootddev=$(cat /proc/cmdline  | sed  -n  "s#root=\(\/dev\/mmcblk[0-9]\).*#\1#p" )
 
-mount ${bootddev}p1 /boot
-modprobe vvcam_isp
-modprobe vvcam_mipi
-modprobe vvcam_vb
-modprobe vvcam_isp_subdev
-modprobe vvcam_video
-modprobe nonai2d
-ISP_MEDIA_SENSOR_DRIVER=/usr/lib/libvvcam.so /usr/bin/isp_media_server > /dev/null 2> /tmp/isp.err.log &
+start()
+{
+	bootddev=$(sed -n "s#.*root=\(\/dev\/mmcblk[0-9]\).*#\1#p" /proc/cmdline)
 
+	if [ -n "$bootddev" ] && ! grep -qs " /boot " /proc/mounts; then
+		mount "${bootddev}p1" /boot
+	fi
+	modprobe vvcam_isp
+	modprobe vvcam_mipi
+	modprobe vvcam_vb
+	modprobe vvcam_isp_subdev
+	modprobe vvcam_video
+	modprobe nonai2d
+	ISP_MEDIA_SENSOR_DRIVER=/usr/lib/libvvcam.so \
+		/usr/bin/isp_media_server >/dev/null 2>/tmp/isp.err.log &
+	vo_init &
+}
 
-vo_init &
+stop()
+{
+	killall isp_media_server 2>/dev/null || true
+	killall vo_init 2>/dev/null || true
+}
+
+case "$1" in
+	start)
+		start
+		;;
+	stop)
+		stop
+		;;
+	restart|reload)
+		stop
+		start
+		;;
+	*)
+		echo "Usage: $0 {start|stop|restart}"
+		exit 1
+		;;
+esac

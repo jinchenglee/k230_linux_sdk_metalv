@@ -1,5 +1,7 @@
 #!/bin/bash
-/etc/vvcam/S41adb_mtp  start
+if [ -x /etc/vvcam/S41adb_mtp ]; then
+    /etc/vvcam/S41adb_mtp start
+fi
 modprobe vvcam_isp
 modprobe vvcam_mipi
 modprobe vvcam_vb
