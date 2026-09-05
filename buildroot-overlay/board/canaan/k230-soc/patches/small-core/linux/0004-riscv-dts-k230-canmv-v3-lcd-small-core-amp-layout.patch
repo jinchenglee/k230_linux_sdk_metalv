@@ -1,0 +1,50 @@
+From: K230 AMP development <noreply@example.com>
+Subject: [PATCH] riscv: dts: k230: describe small-core AMP slot on CanMV-K230 V3 LCD
+
+k230-canmv-v3-lcd.dts is a sibling of k230-canmv-v3.dts, not a child: both
+include k230.dtsi directly, so the AMP carveout and the UART3 handover do not
+propagate and have to be repeated here.
+
+This matters on V3 because the LCD device tree is the board default -- it is
+listed first in BR2_LINUX_KERNEL_INTREE_DTS_NAME, and post-image.sh symlinks
+k.dtb to the first entry. Without this patch the AMP configuration has to boot
+the non-LCD DTB to stay clear of the big core's memory, which leaves the panel
+undescribed; with it, the default LCD DTB is safe to boot alongside the
+big-core firmware.
+
+--- a/arch/riscv/boot/dts/canaan/k230-canmv-v3-lcd.dts
++++ b/arch/riscv/boot/dts/canaan/k230-canmv-v3-lcd.dts
+@@ -27,6 +27,22 @@
+ 		reg = <0x0 0x0 0x0 0x40000000>;
+ 	};
+ 
++	reserved-memory {
++		#address-cells = <2>;
++		#size-cells = <2>;
++		ranges;
++
++		big_core_firmware: big-core-firmware@1c000000 {
++			reg = <0x0 0x1c000000 0x0 0x01000000>;
++			no-map;
++		};
++
++		amp_shared_memory: amp-shared-memory@1d000000 {
++			reg = <0x0 0x1d000000 0x0 0x03000000>;
++			no-map;
++		};
++	};
++
+ 	sound {
+ 		status                      = "okay";
+ 		compatible                  = "canaan,k230-audio-inno";
+@@ -39,8 +55,9 @@
+ &uart0 {
+ 	status = "okay";
+ };
++/* UART3 is connected to CH342 channel B and belongs to big-core firmware. */
+ &uart3 {
+-	status = "okay";
++	status = "disabled";
+ };
+ &mmc_sd1{
+ 	status = "okay";

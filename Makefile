@@ -77,6 +77,7 @@ list-def list_def:
 	@echo "	k230_canmv_defconfig                  --canmv 1.0/1.1 board"
 	@echo "\tk230_canmv_small_core_defconfig       --canmv 1.0/1.1, Linux on small core (AMP)"
 	@echo "	k230_canmv_v3_defconfig               --canmv v3 board"
+	@echo "\tk230_canmv_v3_small_core_defconfig    --canmv v3, Linux on small core (AMP)"
 	@echo "	k230_canmv_01studio_defconfig         --01studio board"
 	@echo "	k230_canmv_dongshanpi_defconfig       --dongshanpi board"
 	@echo "	k230_canmv_lckfb_defconfig            --lushanpi ,jialichuang board"

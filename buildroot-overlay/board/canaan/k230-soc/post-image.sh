@@ -234,7 +234,10 @@ gen_env_bin()
 		sed -i 's/^bootcmd=.*$/bootcmd=run bnuttx;run blinuxilp32;/g' ${default_env_file}
 	elif [ ${CONF} == "k230d_canmv_defconfig" ] || [ ${CONF} == "BPI-CanMV-K230D-Zero_defconfig" ]; then
 		sed -i 's/^bootcmd=.*$/bootcmd=run bnuttx;run blinux;/g' ${default_env_file}
-	elif [ ${CONF} == "k230_canmv_small_core_defconfig" ]; then
+	elif [[ ${CONF} == *_small_core_defconfig ]]; then
+		# Every small-core (AMP) configuration boots the big-core firmware
+		# first. Match on the suffix so a new board's small-core defconfig
+		# does not silently fall through to the plain Linux bootcmd below.
 		sed -i 's/^bootcmd=.*$/bootcmd=run amp_boot;/g' ${default_env_file}
 	else
 		sed -i 's/^bootcmd=.*$/bootcmd=run blinux;/g' ${default_env_file}

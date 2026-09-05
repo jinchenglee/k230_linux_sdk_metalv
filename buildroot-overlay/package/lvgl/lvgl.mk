@@ -5,7 +5,11 @@
 ################################################################################
 LVGL_VERSION = $(call qstrip,$(BR2_PACKAGE_LVGL_CUSTOM_VERSION))
 
-LVGL_DEPENDENCIES += libdrm vg_lite
+# The K230 DRM backend (src/lib/display_backends/drm_k230_v4l2.c) requires the
+# display and v4l2-drm pkg-config modules; v4l2-drm is installed to staging by
+# vvcam. Without this, build order is unconstrained and lvgl can configure
+# before vvcam has staged v4l2-drm.pc, failing pkg_check_modules(... REQUIRED).
+LVGL_DEPENDENCIES += libdrm vg_lite display vvcam
 
 LVGL_CFLAG = -I$(STAGING_DIR)/usr/include/libdrm
 

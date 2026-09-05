@@ -1,0 +1,49 @@
+From: K230 AMP development <noreply@example.com>
+Subject: [PATCH] riscv: dts: k230: describe small-core AMP slot on CanMV-K230 V3
+
+Same AMP carveout as the CanMV-K230 board, applied to the V3 device tree.
+k230-canmv-v3.dts includes k230.dtsi directly rather than the CanMV board DTS,
+so the reservation and the UART3 handover have to be repeated here; the ISA and
+mailbox changes in k230.dtsi are shared and are not duplicated.
+
+The carveout keeps the same physical addresses as the 512 MiB CanMV board even
+though V3 declares 1 GiB of RAM, so one big-core firmware binary and one set of
+driver constants serve both boards. On V3 this is a hole in the middle of RAM
+rather than the top 64 MiB; Linux keeps everything above it.
+
+--- a/arch/riscv/boot/dts/canaan/k230-canmv-v3.dts
++++ b/arch/riscv/boot/dts/canaan/k230-canmv-v3.dts
+@@ -27,6 +27,22 @@
+ 		reg = <0x0 0x0 0x0 0x40000000>;
+ 	};
+ 
++	reserved-memory {
++		#address-cells = <2>;
++		#size-cells = <2>;
++		ranges;
++
++		big_core_firmware: big-core-firmware@1c000000 {
++			reg = <0x0 0x1c000000 0x0 0x01000000>;
++			no-map;
++		};
++
++		amp_shared_memory: amp-shared-memory@1d000000 {
++			reg = <0x0 0x1d000000 0x0 0x03000000>;
++			no-map;
++		};
++	};
++
+ 	sound {
+ 		status                      = "okay";
+ 		compatible                  = "canaan,k230-audio-inno";
+@@ -39,8 +55,9 @@
+ &uart0 {
+ 	status = "okay";
+ };
++/* UART3 is connected to CH342 channel B and belongs to big-core firmware. */
+ &uart3 {
+-	status = "okay";
++	status = "disabled";
+ };
+ &mmc_sd1{
+ 	status = "okay";
