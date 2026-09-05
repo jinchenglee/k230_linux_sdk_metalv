@@ -8,6 +8,7 @@
 #include <linux/of.h>
 #include <linux/platform_device.h>
 #include <linux/poll.h>
+#include <linux/remoteproc.h>
 #include <linux/slab.h>
 #include <linux/uaccess.h>
 #include <linux/wait.h>
@@ -17,8 +18,19 @@
 #define DSP2CPU_INT_EN0     0x0014
 #define DSP2CPU_INT_CLEAR0  0x001c
 #define MAILBOX_ENABLE      (BIT(16) | BIT(0))
+#define RPMSG_RSC_SIZE      0x1000
+#define RPMSG_VRING_SIZE    0x8000
+#define RPMSG_VRING0_DA     0x1d400000
+#define RPMSG_VRING1_DA     0x1d408000
+
+/* Exported by remoteproc_virtio.c but intentionally not in the public header. */
+extern irqreturn_t rproc_vq_interrupt(struct rproc *rproc, int notifyid);
 
 struct k230_amp_mailbox {
+	void __iomem *rsc_table;
+	void __iomem *vring[2];
+	struct rproc *rproc;
+	bool rproc_added;
 	void __iomem *base;
 	int irq;
 	atomic64_t completions;
@@ -30,6 +42,88 @@ struct k230_amp_file {
 	struct k230_amp_mailbox *mailbox;
 	u64 seen;
 };
+static struct k230_amp_mailbox *rproc_to_mailbox(struct rproc *rproc)
+{
+	return *(struct k230_amp_mailbox **)rproc->priv;
+}
+
+static int k230_amp_rproc_prepare(struct rproc *rproc)
+{
+	struct k230_amp_mailbox *mailbox = rproc_to_mailbox(rproc);
+	static const u32 da[] = { RPMSG_VRING0_DA, RPMSG_VRING1_DA };
+	struct rproc_mem_entry *mem;
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(da); ++i) {
+		mem = rproc_mem_entry_init(rproc->dev.parent,
+					   (void *)mailbox->vring[i], da[i],
+					   RPMSG_VRING_SIZE, da[i], NULL, NULL,
+					   "vdev0vring%d", i);
+		if (!mem)
+			return -ENOMEM;
+		mem->is_iomem = true;
+		rproc_add_carveout(rproc, mem);
+	}
+	return 0;
+}
+
+static int k230_amp_rproc_attach(struct rproc *rproc)
+{
+	return 0;
+}
+
+static int k230_amp_rproc_detach(struct rproc *rproc)
+{
+	return 0;
+}
+
+static void k230_amp_rproc_kick(struct rproc *rproc, int vqid)
+{
+	struct k230_amp_mailbox *mailbox = rproc_to_mailbox(rproc);
+
+	(void)vqid;
+	wmb();
+	iowrite32(0, mailbox->base + CPU2DSP_INT_SET0);
+}
+
+static void *k230_amp_rproc_da_to_va(struct rproc *rproc, u64 da,
+				     size_t len, bool *is_iomem)
+{
+	struct k230_amp_mailbox *mailbox = rproc_to_mailbox(rproc);
+
+	if (len > RPMSG_VRING_SIZE)
+		return NULL;
+	if (da >= RPMSG_VRING0_DA &&
+	    da + len <= RPMSG_VRING0_DA + RPMSG_VRING_SIZE) {
+		*is_iomem = true;
+		return (void *)mailbox->vring[0] + (da - RPMSG_VRING0_DA);
+	}
+	if (da >= RPMSG_VRING1_DA &&
+	    da + len <= RPMSG_VRING1_DA + RPMSG_VRING_SIZE) {
+		*is_iomem = true;
+		return (void *)mailbox->vring[1] + (da - RPMSG_VRING1_DA);
+	}
+	return NULL;
+}
+
+static struct resource_table *
+k230_amp_get_loaded_rsc_table(struct rproc *rproc, size_t *size)
+{
+	struct k230_amp_mailbox *mailbox = rproc_to_mailbox(rproc);
+
+	*size = RPMSG_RSC_SIZE;
+	return (struct resource_table *)mailbox->rsc_table;
+}
+
+static const struct rproc_ops k230_amp_rproc_ops = {
+	.prepare = k230_amp_rproc_prepare,
+	.attach = k230_amp_rproc_attach,
+	.detach = k230_amp_rproc_detach,
+	.kick = k230_amp_rproc_kick,
+	.da_to_va = k230_amp_rproc_da_to_va,
+	.get_loaded_rsc_table = k230_amp_get_loaded_rsc_table,
+};
+
 
 static irqreturn_t k230_amp_mailbox_irq(int irq, void *data)
 {
@@ -38,6 +132,10 @@ static irqreturn_t k230_amp_mailbox_irq(int irq, void *data)
 	iowrite32(0, mailbox->base + DSP2CPU_INT_CLEAR0);
 	atomic64_inc(&mailbox->completions);
 	wake_up_interruptible(&mailbox->wait);
+	if (mailbox->rproc_added) {
+		rproc_vq_interrupt(mailbox->rproc, 0);
+		rproc_vq_interrupt(mailbox->rproc, 1);
+	}
 	return IRQ_HANDLED;
 }
 
@@ -149,9 +247,21 @@ static int k230_amp_mailbox_probe(struct platform_device *pdev)
 	if (!mailbox)
 		return -ENOMEM;
 
-	mailbox->base = devm_platform_ioremap_resource(pdev, 0);
+	mailbox->base = devm_platform_ioremap_resource_byname(pdev, "mailbox");
 	if (IS_ERR(mailbox->base))
 		return PTR_ERR(mailbox->base);
+	mailbox->rsc_table = devm_platform_ioremap_resource_byname(
+		pdev, "resource-table");
+	if (IS_ERR(mailbox->rsc_table))
+		return PTR_ERR(mailbox->rsc_table);
+	mailbox->vring[0] = devm_platform_ioremap_resource_byname(
+		pdev, "vdev0vring0");
+	if (IS_ERR(mailbox->vring[0]))
+		return PTR_ERR(mailbox->vring[0]);
+	mailbox->vring[1] = devm_platform_ioremap_resource_byname(
+		pdev, "vdev0vring1");
+	if (IS_ERR(mailbox->vring[1]))
+		return PTR_ERR(mailbox->vring[1]);
 	mailbox->irq = platform_get_irq(pdev, 0);
 	if (mailbox->irq < 0)
 		return mailbox->irq;
@@ -170,6 +280,20 @@ static int k230_amp_mailbox_probe(struct platform_device *pdev)
 	iowrite32(MAILBOX_ENABLE, mailbox->base + CPU2DSP_INT_EN0);
 	iowrite32(MAILBOX_ENABLE, mailbox->base + DSP2CPU_INT_EN0);
 
+	mailbox->rproc = devm_rproc_alloc(&pdev->dev, "k230-big-core",
+					  &k230_amp_rproc_ops, NULL,
+					  sizeof(struct k230_amp_mailbox *));
+	if (!mailbox->rproc) {
+		ret = -ENOMEM;
+		goto disable_mailbox;
+	}
+	*(struct k230_amp_mailbox **)mailbox->rproc->priv = mailbox;
+	mailbox->rproc->state = RPROC_DETACHED;
+	ret = devm_rproc_add(&pdev->dev, mailbox->rproc);
+	if (ret)
+		goto disable_mailbox;
+	mailbox->rproc_added = true;
+
 	mailbox->miscdev.minor = MISC_DYNAMIC_MINOR;
 	mailbox->miscdev.name = "k230-amp-mailbox";
 	mailbox->miscdev.fops = &k230_amp_mailbox_fops;
@@ -185,7 +309,7 @@ static int k230_amp_mailbox_probe(struct platform_device *pdev)
 	if (ret)
 		goto deregister_misc;
 
-	dev_info(&pdev->dev, "IRQ %d, /dev/%s ready\n",
+	dev_info(&pdev->dev, "IRQ %d, /dev/%s and attach-only RPMsg ready\n",
 		 mailbox->irq, mailbox->miscdev.name);
 	return 0;
 

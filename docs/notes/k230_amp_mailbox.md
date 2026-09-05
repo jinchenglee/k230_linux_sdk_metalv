@@ -3,7 +3,8 @@
 This note records the first interrupt-backed notification layer between
 small-core Linux and the big-core Metal-V payload. It deliberately keeps the
 validated shared-memory ABI and cache-maintenance path unchanged. RPMsg-Lite
-will reuse the same mailbox directions after this lower-level test passes.
+now reuses the same mailbox directions; its integration is documented in
+`k230_amp_rpmsg_lite.md`.
 
 ## Hardware contract
 
@@ -153,8 +154,9 @@ If `--mailbox` times out:
   handling; and
 - CRC/data errors point to ABI pairing or cache visibility.
 
-Do not proceed to RPMsg-Lite until all three modes and the 100-loop
-bidirectional integrity run pass.
+These tests were the prerequisite for RPMsg-Lite integration. Keep them as a
+lower-level regression test, but do not run mailbox mode concurrently with
+RPMsg because the two protocols share the hardware doorbell.
 
 ## Hardware validation
 
@@ -207,5 +209,5 @@ work. The p95 movement with a stable p99 indicates a secondary latency band,
 most likely Linux scheduling, timer, or background-service interference; this
 is an inference rather than a component-level measurement. Repeat the same
 benchmark under camera/display load and report p50/p95/p99/max before finalizing
-application queue depth or latency budgets. The idle result is sufficient to
-start RPMsg-Lite integration.
+application queue depth or latency budgets. The idle result justified starting
+the RPMsg-Lite integration recorded in `k230_amp_rpmsg_lite.md`.

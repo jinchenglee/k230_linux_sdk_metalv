@@ -36,9 +36,10 @@ Artifacts:
 output/k230_canmv_small_core_defconfig/build/metal_v_amp/metal-v-k230.bin
 output/k230_canmv_small_core_defconfig/build/metal_v_amp/metal-v-k230.elf
 output/k230_canmv_small_core_defconfig/build/metal_v_amp/amp-shm-test
+output/k230_canmv_small_core_defconfig/build/metal_v_amp/rpmsg-echo-test
 ```
 
-The full root filesystem installs both under `/root/amp/`.
+The full root filesystem installs all four under `/root/amp/`.
 
 The package also installs two opt-in replacements for `/etc/init.d/rcS`:
 `/root/amp/rcS.profile` timestamps every startup service, while
@@ -139,6 +140,22 @@ For notification profiling without payload CRC/transform cost, run:
 This performs 100 warm-up exchanges followed by 10,000 zero-payload
 bidirectional samples and reports min/mean/p50/p95/p99/max. An optional sample
 count may follow `--latency`.
+
+## RPMsg-Lite echo service
+
+The big-core firmware includes a standards-compatible RPMsg-Lite remote and
+announces endpoint 30 as `rpmsg-raw`. Linux attaches to the already-running
+core through the mailbox driver's remoteproc support. After booting the
+matched kernel, DTB, root filesystem, and firmware, run:
+
+```sh
+/root/amp/rpmsg-echo-test
+```
+
+RPMsg uses 512-byte messages (496-byte payloads) for control traffic. Keep
+frames and ROIs in separately managed shared memory and send descriptors over
+RPMsg. See `docs/notes/k230_amp_rpmsg_lite.md` for the memory map, build and
+flash requirements, validation procedure, and troubleshooting.
 
 ## Current assumptions
 

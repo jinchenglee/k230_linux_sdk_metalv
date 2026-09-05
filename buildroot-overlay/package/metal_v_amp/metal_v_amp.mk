@@ -10,7 +10,8 @@ METAL_V_AMP_INSTALL_IMAGES = YES
 
 define METAL_V_AMP_BUILD_CMDS
 	$(TARGET_MAKE_ENV) $(MAKE) -C $(@D) CROSS_COMPILE="$(TARGET_CROSS)" \
-		LINUX_CC="$(TARGET_CC)" LINUX_CFLAGS="$(TARGET_CFLAGS)"
+		LINUX_CC="$(TARGET_CC)" LINUX_CFLAGS="$(TARGET_CFLAGS)" \
+		RPMSG_LITE_DIR="$(realpath $(TOPDIR)/../../third_party/rpmsg-lite)"
 endef
 
 define METAL_V_AMP_INSTALL_TARGET_CMDS
@@ -20,6 +21,8 @@ define METAL_V_AMP_INSTALL_TARGET_CMDS
 		$(TARGET_DIR)/root/amp/metal-v-k230.elf
 	$(INSTALL) -D -m 0755 $(@D)/amp-shm-test \
 		$(TARGET_DIR)/root/amp/amp-shm-test
+	$(INSTALL) -D -m 0755 $(@D)/rpmsg-echo-test \
+		$(TARGET_DIR)/root/amp/rpmsg-echo-test
 	$(INSTALL) -D -m 0755 $(@D)/rcS.profile \
 		$(TARGET_DIR)/root/amp/rcS.profile
 	$(INSTALL) -D -m 0755 $(@D)/rcS.fast \

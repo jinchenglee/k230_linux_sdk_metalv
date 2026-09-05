@@ -7,13 +7,18 @@ firmware uses the opposite side of the same controller.
 diff --git a/arch/riscv/boot/dts/canaan/k230.dtsi b/arch/riscv/boot/dts/canaan/k230.dtsi
 --- a/arch/riscv/boot/dts/canaan/k230.dtsi
 +++ b/arch/riscv/boot/dts/canaan/k230.dtsi
-@@ -267,6 +267,13 @@
+@@ -267,6 +267,18 @@
  			interrupts-extended = <&cpu0_intc 3>, <&cpu0_intc 7>;
  		};
  
 +		amp_mailbox: mailbox@91104000 {
 +			compatible = "canaan,k230-amp-mailbox";
-+			reg = <0x0 0x91104000 0x0 0x1000>;
++			reg = <0x0 0x91104000 0x0 0x1000>,
++			      <0x0 0x1d300000 0x0 0x1000>,
++			      <0x0 0x1d400000 0x0 0x8000>,
++			      <0x0 0x1d408000 0x0 0x8000>;
++			reg-names = "mailbox", "resource-table", "vdev0vring0",
++				    "vdev0vring1";
 +			interrupts = <109 IRQ_TYPE_LEVEL_HIGH>;
 +			status = "okay";
 +		};

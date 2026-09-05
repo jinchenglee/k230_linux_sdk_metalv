@@ -3,6 +3,7 @@
 #include "amp_shm.h"
 #include "cache.h"
 #include "mailbox.h"
+#include "rpmsg_service.h"
 #include "uart3.h"
 
 extern char __firmware_start[];
@@ -56,6 +57,12 @@ static void print_info(void)
 	uart3_puthex64(polling_transactions);
 	uart3_puts("\nAMP unhandled IRQs: ");
 	uart3_puthex64(mailbox_unhandled_count());
+	uart3_puts("\nRPMsg link/rx/tx: ");
+	uart3_puthex64(rpmsg_service_link_up());
+	uart3_puts("/");
+	uart3_puthex64(rpmsg_service_rx_count());
+	uart3_puts("/");
+	uart3_puthex64(rpmsg_service_tx_count());
 	uart3_puts("\n");
 }
 
@@ -185,6 +192,8 @@ void main(void)
 	cache_invalidate_range((const void *)request_publish,
 			       sizeof(*request_publish));
 	mailbox_init();
+	if (rpmsg_service_init())
+		uart3_puts("RPMsg-Lite initialization failed.\n");
 	last_sequence = request_publish->sequence;
 	response_publish->sequence = 0;
 	cache_clean_range((const void *)response_publish,
@@ -199,8 +208,10 @@ void main(void)
 	uart3_puts("metal-v> ");
 
 	for (;;) {
-		last_sequence = service_request(last_sequence,
-						mailbox_take_pending());
+		uint32_t mailbox_pending = mailbox_take_pending();
+
+		last_sequence = service_request(last_sequence, mailbox_pending);
+		rpmsg_service_poll(mailbox_pending);
 		if (!uart3_try_getc(&ch))
 			continue;
 		if (ch == '\r' || ch == '\n') {
