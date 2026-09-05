@@ -6,7 +6,8 @@ the validated bidirectional mailbox and cache-maintenance layers documented in
 `k230_amp_mailbox.md`.
 
 This stage is source-complete and build-verified as of 2026-09-04. Hardware
-enumeration and echo remain to be validated on the board.
+enumeration, a 21-byte echo, and the threaded mailbox IRQ path have been
+validated on the board.
 
 ## Architecture
 
@@ -139,3 +140,125 @@ or first-kick handling. Link one without an RPMsg device points to name-service
 announcement or queue/cache visibility. A created device with echo timeout
 points to endpoint dispatch, reverse notification, or descriptor-buffer cache
 maintenance.
+
+## Correctness and performance matrix
+
+The RPMsg test accepts a deterministic payload size and loop count. Each reply
+is compared byte-for-byte with the transmitted pattern; failures and timeouts
+make the command fail even if some earlier exchanges succeeded.
+
+```sh
+# 1,000 exchanges at the default 21-byte payload
+/root/amp/rpmsg-echo-test --loops 1000 --timeout-ms 1000
+
+# Exercise the complete Linux/RPMsg-Lite payload range
+/root/amp/rpmsg-echo-test --sweep --loops 1000 --timeout-ms 1000
+```
+
+`--sweep` tests 1, 16, 64, 128, 256, and 496 bytes (the 512-byte RPMsg
+buffer minus its 16-byte header). Each line reports minimum, average, p50,
+p95, p99, maximum, and successful messages per second. Repeat each matrix
+after a cold boot, after a warm reboot, and while observing ACM1's firmware
+`RPMsg link/rx/tx` counters. Do not run the mailbox-only test concurrently;
+both protocols use the same doorbell.
+
+The measured round trip includes Linux `write(2)`, the mailbox interrupt and
+thread wakeup, virtqueue/RPMsg-Lite dispatch, the firmware echo callback, the
+reverse notification, Linux `poll(2)` wakeup, and `read(2)`. It is therefore
+the application-visible control-plane cost, not raw mailbox latency. Compare
+the size sweep against a local loopback baseline if isolating syscall and
+userspace timing. For sustained-load testing, run separate finite batches and
+record timeout/mismatch counts, p95/p99, and rate; do not infer frame-payload
+performance from RPMsg messages because large images belong in the Phase 5
+shared-slot data plane.
+
+## Bring-up debug results (2026-09-04)
+
+### Root cause: descriptor read before the coherency fix could apply
+
+`virtqueue_k230.c` overrode `virtqueue_get_available_buffer()` to invalidate and
+reread the descriptor, because Linux writes `desc->len` before publishing and
+upstream RPMsg-Lite assumes descriptors are coherent. The override was correct
+in intent but applied too late:
+
+    buffer = virtqueue_get_available_buffer_unfixed(vq, avail_idx, len);
+    if (buffer == VQ_NULL)
+            return VQ_NULL;              /* bails out here ... */
+    desc = &vq->vq_ring.desc[*avail_idx];
+    VQUEUE_INVALIDATE(desc, sizeof(*desc));   /* ... before this ever runs */
+
+Upstream derives `buffer` from a possibly stale `desc->addr` and has already
+advanced `vq_available_idx` by that point. On the first pass over the ring this
+core still holds the zeroed descriptor lines it cached before Linux populated
+them, so the stale `addr` reads as 0, `env_map_patova(0)` yields NULL, and the
+wrapper returns "no buffer" *after* the ring slot was consumed. The message is
+silently dropped and never retried.
+
+Symptom: exactly 192 of the first 256 messages after every boot were lost, then
+the link was perfect forever (each surviving access refreshes a 64-byte line
+covering four descriptors, so the table self-heals after one pass).
+
+Fix: implement the accessor directly -- invalidate `avail->idx`, the avail ring
+slot, and the descriptor, and only advance `vq_available_idx` once the buffer
+has actually been taken. See `virtqueue_k230.c`.
+
+### Second defect: name service announced before Linux attached
+
+Scanning the vrings unconditionally (rather than only on a mailbox edge) meant
+`link_up` could be raised from uninitialized carveout memory before Linux
+attached, burning the one-shot `rpmsg_ns_announce()` into a vring Linux had not
+set up. `/dev/rpmsg0` then never appeared. Both the scan and the announce are
+now gated on the virtio status byte in the resource table having DRIVER_OK set.
+
+### Verified after the fix
+
+All on hardware, cold boot each time:
+
+- First traffic after boot: 1000 ping-pong and 300-message burst, zero loss.
+  This is the case that used to lose 192 messages.
+- Sweep 6 x 2000 messages, 1..496 B: zero timeouts, zero mismatches.
+- Soak 50,000 x 496 B and 50,000 x 1 B: zero loss.
+- Queue full: bursts of 64/1024/4096 with no reader draining: zero loss,
+  back-pressure correct, `tx_failed == 0`.
+- Firmware accounting exact: `rvq_avail_idx == rvq_consumed == fetch_rx ==
+  rx_callbacks`, across a counter wrap.
+- Latency 0.076..0.090 ms avg, p99 ~0.13 ms, ~11-13k msg/s.
+
+### Measurements that were reported earlier and are wrong
+
+U-Boot loads the payload from `/root/amp/metal-v-k230.bin` on the rootfs, not
+from `/boot` (`default.env:8`). Firmware builds deployed to `/boot` were never
+executed, so an earlier round of conclusions was drawn from an unchanged
+firmware. Specifically:
+
+- The "unconditional poll fixes a lost doorbell" result was not real. With the
+  descriptor fix in place, an edge-gated build is equally lossless, so the
+  doorbell was never being missed. The unconditional scan is retained only as
+  defence in depth (`K230_RPMSG_EDGE_GATED_POLL=1` selects the edge-gated
+  build); measured cost on the small core is within noise: memcpy 1134/1130 vs
+  1128 MB/s, compute 2.748/2.733 vs 2.735 s.
+- The "latency improved 0.210 -> 0.088 ms" claim was an artifact: 0.210 ms was
+  a single cold sample, 0.088 ms is a warm average. There was no speedup.
+- `used->flags` is still cleared at init because this core is the virtio device
+  for both vrings and nothing else initializes that field, but it was not the
+  cause of any observed failure.
+
+### Peer restart
+
+Not an issue: a small-core `reboot` resets the big core too (firmware counters
+reset), so there is no stale-generation desync.
+
+### Diagnostics
+
+The big-core UART3 drops characters under sustained output, which made console
+counters unreliable and cost real debugging time. The firmware now publishes a
+counter block into the AMP shm page at `0x1d000200`; read it from Linux with
+`rpmsg-echo-test --stats`. Prefer it over the UART for anything quantitative.
+
+### Regression suite
+
+`/root/amp/rpmsg-regression.sh` (installed by the package). Run
+`--post-boot` as the first rpmsg traffic after a boot to cover the cold-start
+case; plain for a full run including soak; `--quick` for a smoke check. Verified
+to catch the original defect: `--burst --loops 300` reported `lost=192` before
+the fix and `lost=0` after.

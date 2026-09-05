@@ -10,7 +10,7 @@ RPMSG_LITE_DIR ?= ../../../../third_party/rpmsg-lite
 RPMSG_INC := -I. -I$(RPMSG_LITE_DIR)/lib/include \
 	-I$(RPMSG_LITE_DIR)/lib/include/environment/bm
 RPMSG_OBJS := rpmsg_lite.o rpmsg_ns.o virtqueue.o llist.o rpmsg_env_bm.o \
-	rpmsg_platform.o rpmsg_service.o mini_libc.o
+	virtqueue_k230.o rpmsg_platform.o rpmsg_service.o mini_libc.o
 OBJS := start.o main.o uart3.o cache.o mailbox.o $(RPMSG_OBJS)
 LINUX_CC ?= riscv64-unknown-linux-gnu-gcc
 LINUX_CFLAGS ?= -O2 -Wall -Wextra
@@ -51,7 +51,9 @@ rpmsg_ns.o: $(RPMSG_LITE_DIR)/lib/rpmsg_lite/rpmsg_ns.c
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 virtqueue.o: $(RPMSG_LITE_DIR)/lib/virtio/virtqueue.c
-	$(CC) $(CFLAGS) -c -o $@ $<
+	$(CC) $(CFLAGS) \
+		-Dvirtqueue_get_available_buffer=virtqueue_get_available_buffer_unfixed \
+		-c -o $@ $<
 
 llist.o: $(RPMSG_LITE_DIR)/lib/common/llist.c
 	$(CC) $(CFLAGS) -c -o $@ $<

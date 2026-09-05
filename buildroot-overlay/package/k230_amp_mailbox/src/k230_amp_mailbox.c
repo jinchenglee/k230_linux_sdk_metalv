@@ -22,6 +22,8 @@
 #define RPMSG_VRING_SIZE    0x8000
 #define RPMSG_VRING0_DA     0x1d400000
 #define RPMSG_VRING1_DA     0x1d408000
+#define RPMSG_BUFFER_DA     0x1d500000
+#define RPMSG_BUFFER_SIZE   0x00040000
 
 /* Exported by remoteproc_virtio.c but intentionally not in the public header. */
 extern irqreturn_t rproc_vq_interrupt(struct rproc *rproc, int notifyid);
@@ -64,6 +66,18 @@ static int k230_amp_rproc_prepare(struct rproc *rproc)
 		mem->is_iomem = true;
 		rproc_add_carveout(rproc, mem);
 	}
+
+	/*
+	 * remoteproc_virtio recognizes this name and declares the range as the
+	 * coherent DMA pool for virtio-rpmsg.  Keep the buffers in the AMP
+	 * carveout: arbitrary Linux System RAM is not coherent with the big core.
+	 */
+	mem = rproc_mem_entry_init(rproc->dev.parent, NULL, RPMSG_BUFFER_DA,
+				   RPMSG_BUFFER_SIZE, RPMSG_BUFFER_DA,
+				   NULL, NULL, "vdev0buffer");
+	if (!mem)
+		return -ENOMEM;
+	rproc_add_carveout(rproc, mem);
 	return 0;
 }
 
@@ -132,6 +146,13 @@ static irqreturn_t k230_amp_mailbox_irq(int irq, void *data)
 	iowrite32(0, mailbox->base + DSP2CPU_INT_CLEAR0);
 	atomic64_inc(&mailbox->completions);
 	wake_up_interruptible(&mailbox->wait);
+	return IRQ_WAKE_THREAD;
+}
+
+static irqreturn_t k230_amp_mailbox_irq_thread(int irq, void *data)
+{
+	struct k230_amp_mailbox *mailbox = data;
+
 	if (mailbox->rproc_added) {
 		rproc_vq_interrupt(mailbox->rproc, 0);
 		rproc_vq_interrupt(mailbox->rproc, 1);
@@ -231,7 +252,9 @@ static const struct file_operations k230_amp_mailbox_fops = {
 static ssize_t completions_show(struct device *device,
 				struct device_attribute *attribute, char *buffer)
 {
-	struct k230_amp_mailbox *mailbox = dev_get_drvdata(device);
+	struct miscdevice *miscdev = dev_get_drvdata(device);
+	struct k230_amp_mailbox *mailbox =
+		container_of(miscdev, struct k230_amp_mailbox, miscdev);
 
 	return sysfs_emit(buffer, "%lld\n",
 			  atomic64_read(&mailbox->completions));
@@ -270,8 +293,9 @@ static int k230_amp_mailbox_probe(struct platform_device *pdev)
 	init_waitqueue_head(&mailbox->wait);
 	iowrite32(0, mailbox->base + DSP2CPU_INT_CLEAR0);
 
-	ret = devm_request_irq(&pdev->dev, mailbox->irq,
-			       k230_amp_mailbox_irq, 0,
+	ret = devm_request_threaded_irq(&pdev->dev, mailbox->irq,
+			       k230_amp_mailbox_irq,
+			       k230_amp_mailbox_irq_thread, 0,
 			       dev_name(&pdev->dev), mailbox);
 	if (ret)
 		return dev_err_probe(&pdev->dev, ret,
@@ -293,6 +317,14 @@ static int k230_amp_mailbox_probe(struct platform_device *pdev)
 	if (ret)
 		goto disable_mailbox;
 	mailbox->rproc_added = true;
+	/*
+	 * The already-running remote can publish its name-service message and
+	 * interrupt us from inside devm_rproc_add(), before rproc_added allows
+	 * the IRQ handler to dispatch the virtqueues.  Drain both queues once
+	 * attachment is complete so that an early notification is not lost.
+	 */
+	rproc_vq_interrupt(mailbox->rproc, 0);
+	rproc_vq_interrupt(mailbox->rproc, 1);
 
 	mailbox->miscdev.minor = MISC_DYNAMIC_MINOR;
 	mailbox->miscdev.name = "k230-amp-mailbox";
@@ -303,7 +335,6 @@ static int k230_amp_mailbox_probe(struct platform_device *pdev)
 		goto disable_mailbox;
 
 	platform_set_drvdata(pdev, mailbox);
-	dev_set_drvdata(mailbox->miscdev.this_device, mailbox);
 	ret = device_create_file(mailbox->miscdev.this_device,
 				 &dev_attr_completions);
 	if (ret)

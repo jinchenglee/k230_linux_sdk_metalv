@@ -33,5 +33,10 @@ void *platform_patova(uintptr_t addr);
 int32_t platform_init(void);
 int32_t platform_deinit(void);
 void rpmsg_platform_poll(void);
+unsigned long virtqueue_k230_fetch_count(uint32_t queue);
+uint32_t virtqueue_k230_first_desc_len(uint32_t i);
+uint32_t virtqueue_k230_first_desc_idx(uint32_t i);
+uintptr_t rpmsg_platform_last_buffer(void);
+uint32_t rpmsg_platform_last_buffer_word(uint32_t index);
 
 #endif

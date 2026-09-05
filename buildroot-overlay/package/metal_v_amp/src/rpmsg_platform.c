@@ -2,8 +2,15 @@
 
 #include "cache.h"
 #include "mailbox.h"
+#include "rpmsg_config.h"
 #include "rpmsg_env.h"
 #include "rpmsg_platform.h"
+
+#define K230_RPMSG_VRING_BASE UINT64_C(0x1d400000)
+#define K230_RPMSG_VRING_END  UINT64_C(0x1d410000)
+
+static uintptr_t last_buffer;
+static uint32_t last_buffer_words[4];
 
 int32_t platform_init_interrupt(uint32_t vector_id, void *isr_data)
 {
@@ -76,7 +83,28 @@ void platform_cache_disable(void) {}
 
 void platform_cache_invalidate(void *data, uint32_t len)
 {
+#if K230_RPMSG_DEBUG_CAPTURE
+    uintptr_t address = (uintptr_t)data;
+    uint32_t words;
+    uint32_t i;
+#endif
+
     cache_invalidate_range(data, len);
+#if K230_RPMSG_DEBUG_CAPTURE
+    /* Avail/used rings are also invalidated through this hook. Record only
+     * an external RPMsg data buffer, after it is safe for this core to read. */
+    if ((address >= K230_RPMSG_VRING_BASE) &&
+        (address < K230_RPMSG_VRING_END))
+        return;
+    last_buffer = address;
+    words = len / sizeof(uint32_t);
+    if (words > 4U)
+        words = 4U;
+    for (i = 0; i < words; ++i)
+        last_buffer_words[i] = ((const uint32_t *)data)[i];
+    for (; i < 4U; ++i)
+        last_buffer_words[i] = 0U;
+#endif
 }
 
 void platform_cache_flush(void *data, uint32_t len)
@@ -102,4 +130,14 @@ int32_t platform_init(void)
 int32_t platform_deinit(void)
 {
     return 0;
+}
+
+uintptr_t rpmsg_platform_last_buffer(void)
+{
+    return last_buffer;
+}
+
+uint32_t rpmsg_platform_last_buffer_word(uint32_t index)
+{
+    return index < 4U ? last_buffer_words[index] : 0U;
 }

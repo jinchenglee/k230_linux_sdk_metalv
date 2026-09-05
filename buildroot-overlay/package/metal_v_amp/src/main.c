@@ -64,6 +64,7 @@ static void print_info(void)
 	uart3_puts("/");
 	uart3_puthex64(rpmsg_service_tx_count());
 	uart3_puts("\n");
+	rpmsg_service_print_debug();
 }
 
 static void publish_response(uint64_t sequence, uint32_t result,
@@ -200,7 +201,7 @@ void main(void)
 			  sizeof(*response_publish));
 	amp_release_fence();
 	uart3_puts("\nMetal-V K230 AMP console\n");
-	uart3_puts("big-core UART3 is alive\n");
+	uart3_puts("big-core UART3 is alive\nFWVER=3\n");
 	print_info();
 	uart3_puts("Shared-memory service is ready at 0x1d000000.\n");
 	uart3_puts("Mailbox IRQ 109 is enabled; polling fallback remains available.\n");
@@ -209,9 +210,16 @@ void main(void)
 
 	for (;;) {
 		uint32_t mailbox_pending = mailbox_take_pending();
+		static uint32_t stats_tick;
 
 		last_sequence = service_request(last_sequence, mailbox_pending);
 		rpmsg_service_poll(mailbox_pending);
+		/* Throttled: a clean of one line per loop iteration would be
+		 * constant DDR traffic on a free-spinning loop. */
+		if (++stats_tick >= 4096U) {
+			stats_tick = 0;
+			rpmsg_service_publish_stats();
+		}
 		if (!uart3_try_getc(&ch))
 			continue;
 		if (ch == '\r' || ch == '\n') {

@@ -163,3 +163,32 @@ The first payload relies on SPL/U-Boot having enabled the UART3 clock and board
 pinmux, as the existing Metal-V and official SDK paths do. If no banner appears,
 the next diagnostic step is to add explicit UART3 clock, reset, and pinmux setup
 before changing the UART divisor or console mapping.
+
+## Deploying a rebuilt firmware
+
+U-Boot loads the big-core image from the **rootfs**, not from `/boot`
+(`board/canaan/k230-soc/default.env`):
+
+    amp_load=ext4load mmc ${mmc_boot_dev_num}:2 ${amp_addr} /root/amp/metal-v-k230.bin
+
+So a rebuilt payload must be copied to `/root/amp/metal-v-k230.bin` and the
+board rebooted. Copying it to `/boot/metal-v-k230.bin` has no effect: that file
+is never read, and the board silently keeps running the previous firmware.
+
+Confirm which image actually booted by watching the U-Boot line on the Linux
+console (ttyACM0):
+
+    <N> bytes read in ...
+    boot_cpu = 1 boot_address = 0x1c000000 boot_size=0x<N>
+
+`boot_size` must match the size of the binary you just installed.
+
+## Regression suite
+
+    /root/amp/rpmsg-regression.sh --post-boot   # run as the first traffic after a boot
+    /root/amp/rpmsg-regression.sh               # full run including soak
+    /root/amp/rpmsg-regression.sh --quick       # fast smoke check
+
+`--post-boot` covers the cold-start case: the first pass over the vring
+descriptor table used to drop messages, and that is only observable on the
+first traffic after a boot.

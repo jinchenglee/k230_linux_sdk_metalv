@@ -23,6 +23,8 @@ define METAL_V_AMP_INSTALL_TARGET_CMDS
 		$(TARGET_DIR)/root/amp/amp-shm-test
 	$(INSTALL) -D -m 0755 $(@D)/rpmsg-echo-test \
 		$(TARGET_DIR)/root/amp/rpmsg-echo-test
+	$(INSTALL) -D -m 0755 $(@D)/rpmsg-regression.sh \
+		$(TARGET_DIR)/root/amp/rpmsg-regression.sh
 	$(INSTALL) -D -m 0755 $(@D)/rcS.profile \
 		$(TARGET_DIR)/root/amp/rcS.profile
 	$(INSTALL) -D -m 0755 $(@D)/rcS.fast \

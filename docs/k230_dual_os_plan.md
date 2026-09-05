@@ -113,7 +113,7 @@ Exact names may follow the repository's existing convention.
 
 ## Official SDK reference points
 
-Use `/mnt/sda_500gb/git_repo/k230_sdk` as the primary hardware reference.  Its
+Use `/work/git_repo/k230_sdk` as the primary hardware reference.  Its
 supported dual-OS arrangement is Linux on the small core and RT-Smart on the
 big core, which matches the intended core direction even though the big-core
 payload will be smaller.
@@ -155,6 +155,12 @@ Linux maps IPC memory with `ioremap_wc`; RT-Smart uses a write-through mapping.
 The Linux `__barrier__()` implementation in the reference appears empty while
 the RT side calls `dmb()`.  This is a warning to define and verify our own
 ordering and cache-maintenance contract, not a pattern to copy without proof.
+
+The reference data path copies each message header and body into one of the two
+fixed physical rings, executes its barrier, advances the shared write pointer,
+and then notifies the peer. It does not publish arbitrary Linux allocator pages
+to the other core. Although IPCM is not the ABI used by this project, that
+fixed-region property also needs to hold for the virtio-RPMsg buffer pool.
 
 U-Boot already provides the useful reset-vector and big-core release machinery,
 including `k230_boot_baremetal` and `de_reset_big_core`.  Reuse these mechanisms
@@ -469,6 +475,27 @@ for diagnosis and rollback. See `docs/notes/k230_amp_mailbox.md`.
 Gate: bidirectional messages, endpoint restart, queue-full behavior, and stale
 generation rejection pass reproducibly.
 
+Initial implementation status: Linux attaches to the already-running big-core
+firmware through a small remoteproc/mailbox driver, registers `virtio0`, receives
+the RPMsg-Lite name-service announcement, creates the `rpmsg-raw` channel, and
+exposes `/dev/rpmsg0`. Draining both virtqueues once after remoteproc attachment
+prevents an early name-service interrupt from being lost. A local RPMsg-Lite
+virtqueue wrapper also invalidates and rereads descriptors before consuming
+them.
+
+The first echo request exposed a separate visibility problem. Linux allocated
+the standard 256 KiB virtio-RPMsg buffer pool from ordinary System RAM and wrote
+a valid RPMsg header there, but the big core read zeros at the same physical
+address even after explicit cache invalidation. The official IPCM design above
+supports the corrective direction: register a named `vdev0buffer` remoteproc
+carveout at `0x1d500000` so Linux's unchanged `virtio_rpmsg_bus` allocates all
+512-byte control buffers from the known AMP shared region. Hardware validation
+of this change succeeded: `/dev/rpmsg0` returned a 21-byte echo in 0.210 ms
+round-trip on the board. That test also exposed that the mailbox hard-IRQ path
+was calling into RPMsg code that takes a mutex; the handler is now split into a
+minimal top half and a threaded bottom half. Repeating the test after that fix
+still passes, with no `sleeping function called from invalid context` warning.
+
 ### Phase 5: shared payload slots
 
 - Implement fixed-size buffer descriptors and ownership transitions.
@@ -580,13 +607,16 @@ the current scene.
 
 ## Immediate next actions
 
-1. Deploy the matched ABI-v3 firmware, DTB, module, and Linux test.
-2. Pass `--mailbox 100`, `--mailbox-poll`, and pure-poll runs while checking
-   Linux completion and big-core IRQ/error counters.
-3. Measure notification-only latency separately from CRC, payload work, and
-   cache maintenance.
-4. Pin RPMsg-Lite, assign static vrings within the reserved AMP region, and use
-   the now-proven bidirectional mailbox path for virtqueue kicks.
+1. Rebuild and deploy the mailbox/remoteproc module with the fixed
+   `vdev0buffer` carveout; the existing reserved-memory DT layout already covers
+   this address, so this test does not require a new DTB or SD-card reflash.
+2. After reboot, verify virtio descriptors point within
+   `0x1d500000-0x1d53ffff`, then repeat the `/dev/rpmsg0` echo test while checking
+   Linux completion and big-core RPMsg/IRQ counters.
+3. Exercise messages in both directions, ring wrap, queue-full handling, peer
+   restart, and stale-generation rejection.
+4. Keep RPMsg limited to control/descriptors and proceed to the separately
+   owned payload slots only after the Phase 4 gate passes.
 
 This ordering produces useful proof at each step, keeps the current product path
 available, and makes the platform work reusable by AprilTag, TinyTag, a future
