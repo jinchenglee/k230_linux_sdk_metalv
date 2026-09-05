@@ -1,7 +1,11 @@
 # Building an RVV-free nncase v2.11.0 runtime for K230 Linux
 
-Status: **experimental; archive build, host-side link, and big-core KPU probe
-validated; small-core hardware validation pending**. This note records the
+Status: **small-core KPU inference validated on hardware (2026-09-05)**. The
+scalar runtime was rebuilt, relinked into `tinytag_detect`, and executed on
+CanMV-K230 V3 small-core Linux: no illegal-instruction trap, and the KPU ran
+the TinyTag kmodel. Output comparison against the big-core baseline, AI2D-only
+tests, and sustained live-camera execution are still outstanding -- see
+section 14. Section 15 records the exact small-core reproduction. This note records the
 experiment performed on 2026-09-04. It is intended to be reproducible and to
 prevent the prebuilt K230 runtime from being mistaken for a hard blocker to
 running nncase under small-core Linux.
@@ -342,6 +346,67 @@ That discrepancy is probably caused by global build flags. It is encouraging,
 but because the backend source is unavailable it cannot replace a real
 small-core execution test.
 
+### 9.1 The nine omitted symbols, and what they mean for future models
+
+Reconfirmed on 2026-09-05 against the v3 small-core sysroot. The scalar archive
+defines exactly nine fewer global symbols than the distributed one:
+
+```
+layernorm_impl(float const*, float*, float const*, float const*,
+               gsl::span<unsigned long const>, int, float)
+reduce_max_impl (float const*, float*, unsigned long, unsigned long, unsigned long)
+reduce_min_impl (float const*, float*, unsigned long, unsigned long, unsigned long)
+reduce_sum_impl (float const*, float*, unsigned long, unsigned long, unsigned long)
+reduce_prod_impl(float const*, float*, unsigned long, unsigned long, unsigned long)
+log_softmax_block(int, int, float const*, float*, int)
+log_softmax_step1(int, float const*, float*)
+log_softmax_step_not1(int, float const*, float*, int)
+nncase::result<void> tile_impl<long>(long const*, long*,
+               gsl::span<unsigned long const> x5, gsl::span<unsigned long const>&)
+```
+
+These are **not operators**. They are the RVV inner-loop helpers that the
+`riscv64/` optimized kernels called, and the `riscv64/` directory is exactly
+what section 5's patch stops selecting when `ENABLE_RVV=OFF`. Every affected
+operator is still present in the scalar archive, in both namespaces:
+
+```
+optimized::layer_norm    reference::layer_norm
+optimized::reduce        reference::reduce      (176 entry points)
+optimized::log_softmax   reference::log_softmax
+optimized::tile          reference::tile
+                         reference::softmax
+```
+
+So a future model that uses LayerNorm, Reduce{Max,Min,Sum,Prod}, LogSoftmax,
+Softmax or Tile **will still run**. What it loses is the vectorized inner loop
+for the CPU-side fallback of those ops; the architecture-neutral optimized
+implementation runs instead, falling back to the reference kernel as needed.
+The consequence is throughput on CPU-executed ops, not missing functionality.
+
+Two failure modes remain worth checking when a new model is introduced:
+
+1. A link error, if some newly linked object references one of the nine
+   `_impl` symbols directly. Neither `libnncase.rt_modules.k230.a` nor
+   `libfunctional_k230.a` does (verified: zero of the nine appear in their
+   undefined-symbol sets), but a future nncase or K230 release could change
+   that. This shows up at build time, not at run time.
+2. A performance regression, if a model shifts significant work onto one of
+   these CPU fallbacks instead of the KPU. This is silent; compare per-op
+   timing against the big-core baseline with the app's `ProfileOps` mode.
+
+Re-run this check after any nncase or K230 runtime version change:
+
+```sh
+B=<toolchain>/riscv64-unknown-linux-gnu
+$B-nm --defined-only -g <distributed>.a | awk '{print $3}' | sort -u > old.syms
+$B-nm --defined-only -g <scalar>.a      | awk '{print $3}' | sort -u > new.syms
+comm -23 old.syms new.syms                      # what the scalar build omits
+cat <($B-nm -u <rt_modules.k230>.a) <($B-nm -u <functional_k230>.a) \
+    | awk '{print $2}' | sort -u > closed.undef
+comm -12 <(comm -23 old.syms new.syms) closed.undef   # must be empty
+```
+
 ## 10. Relink TinyTag as an ABI/KPU probe
 
 This optional step validates that the scalar generic runtime can link with the
@@ -494,7 +559,8 @@ performance on the big core.
 The experiment removes the known open-runtime RVV dependency, but the work is
 not complete until all of the following pass on small-core Linux:
 
-- a minimal interpreter/kmodel smoke test;
+- a minimal interpreter/kmodel smoke test -- **done 2026-09-05**, see
+  section 15;
 - AI2D-only tests (crop, resize, pad, affine as applicable);
 - TinyTag KPU inference with known input and output comparison;
 - sustained live-camera execution;
@@ -504,3 +570,126 @@ not complete until all of the following pass on small-core Linux:
 Treat an illegal-instruction-free, output-correct small-core run as the
 decisive result. The closed archives' lack of decoded RVV instructions is a
 strong reason to run the experiment, not a guarantee.
+
+## 15. Small-core reproduction (2026-09-05)
+
+Verbatim procedure used to build the scalar runtime and get KPU inference
+running under CanMV-K230 V3 small-core Linux. It differs from sections 3-10 in
+two deliberate ways, both noted inline.
+
+### 15.1 Prerequisites
+
+Deviation from section 3: use the **small-core** configuration's host tree, not
+`k230_canmv_defconfig`. The compiler is the same Xuantie GCC, but the sysroot
+must be the one the final application links against.
+
+```sh
+export K230_SDK_ROOT=/work/git_repo/k230_linux_sdk_metalv
+export SC=k230_canmv_v3_small_core_defconfig
+export RISCV_ROOT_PATH="$K230_SDK_ROOT/output/$SC/host"
+
+test -x "$RISCV_ROOT_PATH/bin/riscv64-unknown-linux-gnu-g++"
+test -f "$RISCV_ROOT_PATH/riscv64-buildroot-linux-gnu/sysroot/usr/lib/cmake/gsl-lite/gsl-lite-config.cmake"
+```
+
+Before this will produce a runnable binary, the application itself must be
+compiled without RVV. `package/ai_demo/common/ai_demo_cml_common` used to
+append `-mcpu=c908v -mrvv-v0p10-compatible -mrvv-auto-vectorize`
+unconditionally, after Buildroot's own `BR2_TARGET_OPTIMIZATION`, so it won
+regardless of the defconfig; GCC then auto-vectorized even
+`__static_initialization_and_destruction_0()` and the binary trapped before
+`main()`. Those flags are now gated on `BR2_RISCV_ISA_RVV`, passed through by
+`ai_demo_mk_common` as a CMake cache variable.
+
+### 15.2 Fetch, patch, build
+
+```sh
+export NNCASE_SRC=/path/to/scratch/nncase-v2.11.0
+git clone --branch v2.11.0 --depth 1 https://github.com/kendryte/nncase.git "$NNCASE_SRC"
+cd "$NNCASE_SRC"
+git rev-parse HEAD          # 1d49a3196ff44573e58c8422274a5c2702234ea1
+
+# section 5 patches, then section 6 toolchain file:
+#   toolchains/k230-small-linux.toolchain.cmake
+
+cmake -S . -B build-small-linux -G Ninja \
+    -DCMAKE_TOOLCHAIN_FILE=toolchains/k230-small-linux.toolchain.cmake \
+    -DCMAKE_BUILD_TYPE=Release -DENABLE_RVV=OFF -DBUILDING_RUNTIME=ON \
+    -DBUILD_TESTING=OFF -DBUILD_BENCHMARK=OFF \
+    -DBUILD_PYTHON_BINDING=OFF -DBUILD_CSHARP_BINDING=OFF
+
+cmake --build build-small-linux --target nncaseruntime -j"$(nproc)"
+
+export NNCASE_SCALAR="$NNCASE_SRC/build-small-linux/src/Native/src/runtime/libNncase.Runtime.Native.a"
+```
+
+`RISCV_ROOT_PATH` must be exported, not passed as `-D`: CMake's nested
+`try_compile` reloads the toolchain file and would not see a cache variable.
+
+Audit before using it:
+
+```sh
+B="$RISCV_ROOT_PATH/bin/riscv64-unknown-linux-gnu"
+$B-readelf -A "$NNCASE_SCALAR" | grep -m1 Tag_RISCV_arch   # no _v1p0, no zve*
+$B-readelf -A "$NNCASE_SCALAR" | grep -c _v1p0             # 0
+$B-objdump -d "$NNCASE_SCALAR" | grep -cE '\svset[i]?vli' # 0
+```
+
+Observed: `rv64i2p1_m2p0_a2p1_f2p2_d2p2_c2p0_zicsr2p0_zmmul1p0`, 0 objects
+advertising V, 0 vector instructions (the distributed archive has 358).
+
+### 15.3 Relink through Buildroot
+
+Deviation from section 10: rather than replaying `link.txt` by hand, substitute
+the staged archive and let Buildroot relink. This keeps the application's own
+link line, install path and packaging intact.
+
+```sh
+cd "$K230_SDK_ROOT/output/$SC"
+STAGED=host/riscv64-buildroot-linux-gnu/sysroot/usr/lib/libNncase.Runtime.Native.a
+cp -n "$STAGED" "$STAGED.rvv-orig"      # keep the distributed archive
+cp "$NNCASE_SCALAR" "$STAGED"
+
+cd "$K230_SDK_ROOT"
+make CONF=$SC tinytag_detect-dirclean
+make CONF=$SC tinytag_detect
+```
+
+This swap is **local to the output tree and not tracked by the build system**:
+`make CONF=$SC libnncase-dirclean` silently restores the distributed RVV
+archive. Section 13's packaged small-core libnncase variant is still the right
+long-term fix.
+
+### 15.4 Run on the small core
+
+`ProfileOps` needs no camera, image, video or display, which makes it the
+cheapest first proof point.
+
+```sh
+scp output/$SC/target/root/app/tinytag_detect/tinytag_detect.elf \
+    root@<board>:/root/app/tinytag_detect/
+ssh root@<board> 'cd /root/app/tinytag_detect && \
+    ./tinytag_detect.elf tinytag-v11_k230-v4c.int8.kmodel ProfileOps 0.35 20 1.5 1'
+```
+
+Result on CanMV-K230 V3 small-core Linux:
+
+```
+|stackvm tensor op |count |timing(ms) |percent(%)|
+|EXTCALL           |1     |2.10693    |99.6996   |
+|RET               |1     |0.00341797 |0.161738  |
+|LDARG             |1     |0.00170898 |0.0808688 |
+|LDC_I4            |2     |0.0012207  |0.0577634 |
+
+iteration 0 wall 6.79 ms (cold), iteration 1 2.84 ms, iteration 2 2.11 ms
+```
+
+No illegal-instruction trap and no device-ownership conflict. `EXTCALL` at
+99.7% is the closed K230 backend dispatching the graph to the KPU, so the
+hardware engine is doing the work and the scalar generic runtime is driving it.
+
+The linked executable still advertises `v1p0` and contains ~1979 vector
+instructions, all from `libapriltag_rvv.a` (the Rust AprilTag crop-decoder
+backend). They are linked but not reached on this path. Removing that
+dependency is still required by section 12 item 3 before any code path that
+uses the CV decoder can run on the small core.

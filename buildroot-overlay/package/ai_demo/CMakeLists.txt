@@ -3,8 +3,16 @@ set(CMAKE_CXX_STANDARD 17)
 project(ai_demo)
 
 #add_definitions(-DWITH_OPENCV)
-set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS}   -mcpu=c908v -mabi=lp64d  -mtune=c908 -mrvv-v0p10-compatible  -mrvv-auto-vectorize")
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}   -mcpu=c908v -mabi=lp64d  -mtune=c908 -mrvv-v0p10-compatible  -mrvv-auto-vectorize")
+# The vector flags below are appended after Buildroot's own
+# BR2_TARGET_OPTIMIZATION and therefore override it. On a small-core (AMP)
+# configuration the CPU has no V extension, so applying them unconditionally
+# produces binaries that take an illegal-instruction trap before main() --
+# GCC auto-vectorizes even static initializers. Bind them to the Kconfig
+# symbol instead; ai_mk_common passes it in.
+if(BR2_RISCV_ISA_RVV)
+    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS}   -mcpu=c908v -mabi=lp64d  -mtune=c908 -mrvv-v0p10-compatible  -mrvv-auto-vectorize")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}   -mcpu=c908v -mabi=lp64d  -mtune=c908 -mrvv-v0p10-compatible  -mrvv-auto-vectorize")
+endif()
 
 # 设置编译器路径
 set(CMAKE_C_COMPILER $ENV{GCC_PATH}/riscv64-unknown-linux-gnu-gcc)

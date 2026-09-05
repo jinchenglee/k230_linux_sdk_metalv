@@ -7,7 +7,15 @@ $(2)_SUPPORTS_IN_SOURCE_BUILD = NO
 
 $(2)_DEPENDENCIES += libmmz libnncase gsl-lite
 
-ifeq ($(OS), common)
+# Let the CMake side gate its RVV flags on the Linux build configuration
+# rather than hardcoding the big-core vector ISA.
+$(2)_CONF_OPTS += -DBR2_RISCV_ISA_RVV=$(if $(BR2_RISCV_ISA_RVV),ON,OFF)
+
+# $(OS) is not a Buildroot variable, so this test never fired and `common` was
+# only ever built by luck of ordering -- yet every ai_demo CMakeLists.txt does
+# include(../common/ai_demo_cml_common), which lives in common's build dir, and
+# the kmodel/font assets come from there too. Depend on it properly.
+ifeq ($(BR2_PACKAGE_COMMON), y)
 	$(2)_DEPENDENCIES += common
 endif
 

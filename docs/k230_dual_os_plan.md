@@ -418,6 +418,41 @@ display alignment and detector behavior.
 Gate: small-core Linux reaches a shell reliably and the big core is deliberately
 reserved rather than accidentally offline.
 
+Status: met. Small-core Linux boots to a shell reliably on CanMV-K230 and on
+CanMV-K230 V3, and the big core is held for the firmware rather than left
+offline by accident.
+
+The RVV audit part of this phase no longer holds for the V3 rootfs. To match
+the application intent of this plan, `k230_canmv_v3_small_core_defconfig`
+enables `apriltag_demo` and `tinytag_detect`, and their dependency chain reaches
+`libnncase`. The distributed nncase archives advertise
+`rv64i..._v1p0_..._zve64d1p0_zvl128b1p0`, and `tinytag_detect` additionally
+links `libapriltag_rvv.a`. Those objects build for the small core but must be
+expected to take an illegal-instruction trap there until the scalar hybrid of
+Phase 7 replaces them. They are present as the eventual target workload, not as
+something already validated: nothing in that chain should be treated as
+runnable on the small core before the Phase 7 gate passes.
+
+### Phase 1b: second board (CanMV-K230 V3)
+
+- Derive a small-core defconfig from the V3 board defconfig.
+- Repeat the AMP carveout and UART3 handover in the V3 device trees.
+- Provide the matching U-Boot board defconfig and device tree.
+
+Gate: the V3 image boots small-core Linux, releases the big core, and passes the
+RPMsg regression suite.
+
+Status: met. `k230_canmv_v3_small_core_defconfig` boots on hardware, the big
+core comes up, and `rpmsg-regression.sh --quick` passes 13/13 on the board.
+
+Two V3-specific details are worth keeping in mind. `k230-canmv-v3.dts` and
+`k230-canmv-v3-lcd.dts` both include `k230.dtsi` directly rather than deriving
+from a shared board DTS, so the carveout and the UART3 handover have to be
+repeated per file; the LCD variant is the V3 default because it is listed first
+and `post-image.sh` symlinks `k.dtb` to the first entry. The carveout keeps the
+CanMV addresses even though V3 declares 1 GiB rather than 512 MiB, so one
+firmware binary and one set of driver constants serve both boards.
+
 ### Phase 2: release a minimal big-core payload
 
 - Reuse official U-Boot reset-vector/release code.
@@ -427,6 +462,13 @@ reserved rather than accidentally offline.
 
 Gate: at least 100 cold/warm boot cycles complete without overlap, trap, or
 heartbeat loss.
+
+Status: functionally working, gate not evidenced. The payload boots, prints,
+takes its mailbox interrupt, and has survived every reboot performed so far on
+both boards without a trap, a lost heartbeat, or Linux memory corruption, but
+the count is on the order of a dozen cycles and was never run or recorded as
+the stated 100-cycle sequence. Treat this gate as open until an automated
+cold/warm cycle run is recorded.
 
 ### Phase 3: prove shared memory and cache maintenance
 
@@ -495,6 +537,39 @@ round-trip on the board. That test also exposed that the mailbox hard-IRQ path
 was calling into RPMsg code that takes a mutex; the handler is now split into a
 minimal top half and a threaded bottom half. Repeating the test after that fix
 still passes, with no `sleeping function called from invalid context` warning.
+
+A later cold-start defect is fixed and documented in
+`docs/notes/k230_amp_rpmsg_lite.md`: the local descriptor wrapper re-read the
+descriptor only after upstream had already derived a buffer pointer from a
+stale copy and advanced `vq_available_idx`, so on the first pass over the ring a
+zero address was reported as "no buffer" after the slot had been consumed.
+Exactly 192 of the first 256 messages after every boot were lost, silently, and
+the link was then perfect indefinitely. The accessor is now implemented
+directly, and the scan and the name-service announce are gated on DRIVER_OK so
+that neither acts on uninitialized carveout memory before Linux attaches.
+
+Gate status: partially met.
+
+- Bidirectional messaging: met. 100,000-message soak at 496 B and at 1 B, a
+  1..496 B sweep, zero loss and zero mismatch, with firmware accounting
+  (`rvq_avail_idx == rvq_consumed == fetch_rx == rx_callbacks`) exact across a
+  counter wrap. Round trip 0.076..0.090 ms, p99 about 0.13 ms, ~12k msg/s.
+- Queue-full behavior: met. Undrained bursts of 64/1024/4096 messages show no
+  silent drops, correct back pressure, and `tx_failed == 0`.
+- Transport statistics: met. The firmware publishes a counter block in the AMP
+  shm page, readable from Linux with `rpmsg-echo-test --stats`.
+- Endpoint restart: partially met. Repeatedly opening and closing
+  `/dev/rpmsg0` is exercised by every regression run; firmware-side endpoint
+  teardown and recreation is not tested.
+- Capability/version handshake: **not implemented**.
+- Restart generation and stale-generation rejection: **not implemented**. A
+  `generation` field exists only in the Phase 3 shared-memory ABI
+  (`amp_shm.h`), not in the RPMsg path. Note that a small-core `reboot` also
+  resets the big core, so the two sides cannot desync through that particular
+  path; the field is still required for firmware-only restart and for the
+  Phase 5 recovery protocol.
+
+Phase 5 remains blocked on the last two items.
 
 ### Phase 5: shared payload slots
 
@@ -607,16 +682,29 @@ the current scene.
 
 ## Immediate next actions
 
-1. Rebuild and deploy the mailbox/remoteproc module with the fixed
-   `vdev0buffer` carveout; the existing reserved-memory DT layout already covers
-   this address, so this test does not require a new DTB or SD-card reflash.
-2. After reboot, verify virtio descriptors point within
-   `0x1d500000-0x1d53ffff`, then repeat the `/dev/rpmsg0` echo test while checking
-   Linux completion and big-core RPMsg/IRQ counters.
-3. Exercise messages in both directions, ring wrap, queue-full handling, peer
-   restart, and stale-generation rejection.
-4. Keep RPMsg limited to control/descriptors and proceed to the separately
+The original list here (rebuild with the `vdev0buffer` carveout, verify
+descriptor addresses, repeat the echo test) is complete and has been folded into
+the Phase 4 status above.
+
+1. Close the Phase 4 gate: add a capability/version handshake and a restart
+   generation with stale-result rejection, then extend
+   `rpmsg-regression.sh` to assert both. Phase 5 is blocked on this.
+2. Record the Phase 2 gate properly: automate a cold/warm boot cycle run and
+   keep the counters and any trap output, rather than relying on the ad-hoc
+   reboots performed during bring-up.
+3. Decide how the RVV-linked packages are handled in the small-core rootfs.
+   They are currently built and installed but must be assumed to trap there;
+   either gate them behind the Phase 7 hybrid or accept them as staged payload
+   and document that they are not to be invoked before Phase 7 passes.
+4. Phase 7 can proceed independently of items 1 and 2. It needs a model and a
+   way to run inference from small-core Linux, and it does not depend on the
+   payload-slot or offload work.
+5. Keep RPMsg limited to control and descriptors; proceed to the separately
    owned payload slots only after the Phase 4 gate passes.
+
+Open items carried from earlier phases: sequence/ring wrap, non-aligned slot
+offsets, and cache-cost analysis from Phase 3; firmware-side endpoint teardown
+from Phase 4.
 
 This ordering produces useful proof at each step, keeps the current product path
 available, and makes the platform work reusable by AprilTag, TinyTag, a future
