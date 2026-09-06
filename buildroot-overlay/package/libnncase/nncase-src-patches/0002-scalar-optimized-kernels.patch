@@ -1,0 +1,25 @@
+Select the architecture-neutral optimized kernels when RVV is disabled.
+
+ENABLE_RVV exists and defaults to OFF, but the optimized-kernel CMake code
+picks the riscv64/ directory purely from CMAKE_SYSTEM_PROCESSOR. Some files
+there use RVV intrinsics directly, including code not fully guarded by
+#if __riscv_vector, so a scalar riscv64 build still emits vector instructions
+and traps with SIGILL on a core without the V extension.
+
+Gate the riscv64 kernel directory on ENABLE_RVV so a scalar build falls back
+to the architecture-neutral optimized implementations (and from there to the
+reference kernels as needed).
+
+Upstream: not submitted (local build-configuration change).
+Signed-off-by: K230 SDK <dev@example.com>
+
+--- a/src/Native/src/kernels/stackvm/optimized/CMakeLists.txt
++++ b/src/Native/src/kernels/stackvm/optimized/CMakeLists.txt
+@@ -1,6 +1,6 @@
+ cmake_minimum_required (VERSION 3.13)
+ 
+-if(${CMAKE_SYSTEM_PROCESSOR} MATCHES "riscv64")
++if(${CMAKE_SYSTEM_PROCESSOR} MATCHES "riscv64" AND ENABLE_RVV)
+     set(ARCH riscv64)
+ elseif(${CMAKE_SYSTEM_PROCESSOR} MATCHES "(x86)|(X86)|(amd64)|(AMD64)|(x86_64)|(X86_64)")
+     set(ARCH x86_64)

@@ -1,7 +1,8 @@
 # Small-core RVV pollution in tinytag_detect / apriltag_demo
 
-Status: **root cause established; fix (A) implemented and verified on hardware
-2026-09-06; fix (B) (libnncase) still open.** Investigated 2026-09-05
+Status: **resolved.** All four RVV sources are gone; `apriltag_demo`,
+`apriltag_c_demo` and `tinytag_detect` all run on small-core Linux, verified on
+hardware 2026-09-06. Investigated 2026-09-05
 against `k230_canmv_v3_small_core_defconfig` on the CanMV-K230 V3 board at
 192.168.10.125. Everything below is measured, not inferred; commands are
 included so the numbers can be re-derived.
@@ -218,12 +219,38 @@ apriltag_demo` (exit 0):
 | `apriltag_c_demo.elf` | 337 | **0** |
 | `lib/libapriltag_rvv.a` | (RVV) | **0** |
 
-On the board at 192.168.10.125, both binaries run headless with no SIGILL
-(`dmesg | grep -c "unhandled signal"` = 0). `apriltag_demo.elf --rvv --factor 2`
--- the Rust detector, i.e. the exact path that used to trap in
-`DetectBuffers::new` -- sustains camera ~29-34 fps, detect ~5.8-6.9 fps, tags
-decoded on 100% of frames. `apriltag_c_demo.elf` sustains camera ~27-28 fps,
-detect ~5.5 fps. Scalar throughput on the 800 MHz core, as expected.
+On the board at 192.168.10.125, both binaries run with no SIGILL
+(`dmesg | grep -c "unhandled signal"` = 0).
+
+Headless: `apriltag_demo.elf --rvv --factor 2 --no-display` -- the Rust
+detector, i.e. the exact path that used to trap in `DetectBuffers::new` --
+sustains camera ~29-34 fps, detect ~5.8-6.9 fps, tags decoded on 100% of
+frames. `apriltag_c_demo.elf` sustains camera ~27-28 fps, detect ~5.5 fps.
+Scalar throughput on the 800 MHz core, as expected.
+
+With the LCD (the V3 default DTB gives a single connector, DSI-1 at 480x800
+portrait; there is no HDMI): camera ~56 fps, display ~26 fps, detect ~6 fps,
+`drop: 0`, and dmesg shows a clean `vvcam_mipi_release`/`vvcam_isp_release` on
+exit with no atomic-commit errors. **Both applications show a good picture on
+the panel** (confirmed visually, 2026-09-06).
+
+Quit with `q`. A SIGINT followed by SIGKILL lands mid-teardown and can abort
+with `realloc(): invalid old size`; the `q` path exits 0 with no glibc
+diagnostics, with and without display.
+
+### The V3 dark-video-plane issue is gone
+
+Commit `32d7492` recorded an open V3 problem: "the ARGB8888 OSD plane
+composites correctly but the NV12 video plane stays dark", reproducing under
+plain `v4l2-drm` with no AI involved. That no longer reproduces.
+
+The cause was almost certainly the old scalar `isp_media_server`, not the
+display path: `isp-media-server-scalar-port-solution.md` opens by stating that
+"the older scalar daemon produces a black image with the otherwise identical
+setup" -- the same symptom. `32d7492` predates `df5949c`, which replaced that
+daemon with the de-vectorized `isp_media_server_scalar_v2`. So the dark plane
+was black ISP output reaching a working display path, and `df5949c` fixed it.
+Nothing in the present change touches the panel, DRM, or the video plane.
 
 Docker: `apriltag-rvv` builds inside `rvv-dev:latest` (present locally).
 `build_rust_lib.sh` already reproduces the `rvv-shell` invocation --
@@ -235,14 +262,61 @@ common *parent* directory so the `../async-rvv` path dependency resolves.
 `APRILTAG_DEMO_RVV_DIR` defaults to `$(TOPDIR)/../../../apriltag-rvv`, resolving
 to **`/work/git_repo/apriltag-rvv`** (not `/work/git_hub/...`).
 
-## 7. Fix (B): libnncase
+## 7. Fix (B): libnncase -- DONE
 
-Section 13 of `rvv-free-nncase-v2.11.0.md` -- a packaged small-core libnncase
-variant that survives `dirclean`. Not designed yet. This is Phase 7 work.
+Section 13 of `rvv-free-nncase-v2.11.0.md` asked for a packaged small-core
+libnncase variant that survives `dirclean`, replacing the manual output-tree
+substitution of section 15. Implemented in `package/libnncase`, gated on
+`BR2_RISCV_ISA_RVV` so the big core keeps the distributed RVV runtime:
 
-**Fix (A) alone will not make `tinytag_detect` run**; it relocates the SIGILL
-into nncase. It should make `apriltag_demo.elf` run, since that binary does not
-link libnncase. Both fixes are required for `tinytag_detect`.
+- the pinned source tag is an extra download
+  (`nncase/archive/refs/tags/v2.11.0.tar.gz`, sha256 `2a0dfbde...`, recorded in
+  `libnncase.hash`) rather than section 4's build-time `git clone` -- Buildroot
+  downloads must be hash-verified and work offline;
+- `nncase-src-patches/` carries section 5's two hunks (`nlohmann_json` gated on
+  `BUILDING_RUNTIME`; the optimized-kernel `ARCH` selector gated on
+  `ENABLE_RVV`);
+- `k230-small-linux.toolchain.cmake` is section 6's V-free toolchain file;
+- `LIBNNCASE_BUILD_CMDS` builds the `nncaseruntime` target with
+  `$(HOST_DIR)/bin/cmake` + ninja, exporting `RISCV_ROOT_PATH` in the
+  **environment** (section 7: a cache variable is not enough, because
+  `try_compile` reloads the toolchain file);
+- a version guard fails the build if the source tag is not
+  `$(NNCASE_VERSION_NUM)`, since mixing source and closed-archive versions is
+  not ABI-safe even when it links;
+- `readelf -A` and an objdump vector scan run **before** the archive can reach
+  the sysroot, and only then does it overwrite
+  `$(@D)/nncase/lib/libNncase.Runtime.Native.a` so the normal install path
+  stages it.
+
+The audit is inlined in `libnncase.mk` rather than calling
+`apriltag_demo/scripts/audit_vector_free.sh`, because libnncase must build in
+configurations where `apriltag_demo` is not enabled.
+
+The two closed archives (`libfunctional_k230.a`, `libnncase.rt_modules.k230.a`)
+and all headers keep coming from the distributed package. Both decode to zero
+vector instructions, confirming section 9.
+
+### Result, measured 2026-09-06
+
+| Artifact | Before | After |
+|---|---:|---:|
+| staged `libNncase.Runtime.Native.a` | 2001 | **0** |
+| `tinytag_detect.elf` | 9510 | **0** |
+
+The scalar archive reports
+`Tag_RISCV_arch: "rv64i2p1_m2p0_a2p1_f2p2_d2p2_c2p0_zicsr2p0_zmmul1p0"`,
+matching section 8 exactly. `tinytag_detect.mk`'s audit hook is now a hard gate
+(the `--report-only` flag is gone).
+
+On the board, `tinytag_detect` via `run.sh` with the LCD exits 0 and decodes
+tags -- 96 `hamming=0` decodes in an 18 s run, e.g.
+`[ai] proposals=2 detections=1 / id=0 hamming=0 margin=47.59`. All three
+applications run with no SIGILL newer than the run's uptime cutoff.
+
+Note when checking traps on the board: BusyBox `dmesg` has no `-C`, only `-c`.
+A `dmesg -C` silently does nothing, so stale entries look like fresh failures.
+Compare timestamps against `/proc/uptime` instead.
 
 ## 8. Open decision
 

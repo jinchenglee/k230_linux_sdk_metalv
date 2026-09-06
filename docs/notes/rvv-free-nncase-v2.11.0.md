@@ -539,6 +539,14 @@ there is no need to assign complete frames independently to unequal cores.
 
 ## 13. Integration recommendation
 
+**Implemented 2026-09-06** in `buildroot-overlay/package/libnncase`, gated on
+`BR2_RISCV_ISA_RVV`. Every bullet below is satisfied; the source tag arrives as
+a hash-pinned extra download rather than the section 4 `git clone`, so the
+build stays offline-capable. This supersedes the manual output-tree
+substitution of section 15, which no longer has to be repeated after a
+`dirclean`. See `docs/notes/small-core-rvv-pollution.md` section 7 for the
+implementation and measured results.
+
 Do not silently replace the normal `libnncase` package. Add an explicit
 small-core variant or Buildroot configuration that:
 
@@ -655,10 +663,12 @@ make CONF=$SC tinytag_detect-dirclean
 make CONF=$SC tinytag_detect
 ```
 
-This swap is **local to the output tree and not tracked by the build system**:
-`make CONF=$SC libnncase-dirclean` silently restores the distributed RVV
-archive. Section 13's packaged small-core libnncase variant is still the right
-long-term fix.
+This swap was **local to the output tree and not tracked by the build system**:
+`make CONF=$SC libnncase-dirclean` silently restored the distributed RVV
+archive. **Superseded 2026-09-06**: section 13's packaged variant is now
+implemented, so a scalar configuration produces the scalar archive by itself
+and survives `dirclean`. The manual procedure below is kept for reference and
+for bisecting.
 
 This is not hypothetical: on 2026-09-05 the
 `k230_canmv_v3_small_core_defconfig` tree had been rebuilt and the staged

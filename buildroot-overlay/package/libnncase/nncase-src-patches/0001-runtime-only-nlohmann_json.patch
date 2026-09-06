@@ -1,0 +1,23 @@
+Restrict nlohmann_json to the simulator/compiler build.
+
+The top-level CMakeLists requires nlohmann_json unconditionally, but a
+runtime-only build (BUILDING_RUNTIME=ON) never uses it. Requiring it would
+force an unrelated package into the SDK sysroot just to build the K230
+runtime.
+
+Upstream: not submitted (local build-configuration change).
+Signed-off-by: K230 SDK <dev@example.com>
+
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -39,7 +39,9 @@ project(nncase
+   VERSION ${NNCASE_VERSION}
+   LANGUAGES C CXX ASM)
+ 
+-find_package(nlohmann_json REQUIRED)
++if (NOT BUILDING_RUNTIME)
++    find_package(nlohmann_json REQUIRED)
++endif ()
+ include_directories(${nlohmann_json_INCLUDE_DIRS})
+ 
+ option(ENABLE_OPENMP "OpenMP support" OFF)
