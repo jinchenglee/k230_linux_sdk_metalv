@@ -660,6 +660,14 @@ This swap is **local to the output tree and not tracked by the build system**:
 archive. Section 13's packaged small-core libnncase variant is still the right
 long-term fix.
 
+This is not hypothetical: on 2026-09-05 the
+`k230_canmv_v3_small_core_defconfig` tree had been rebuilt and the staged
+`libNncase.Runtime.Native.a` was the distributed RVV archive again (2001 vector
+instructions), producing a SIGILL inside
+`nncase::(anon)::slice_contiguous_impl<unsigned>`. Verify the staged archive
+before debugging any small-core nncase trap -- see
+`docs/notes/small-core-rvv-pollution.md`.
+
 ### 15.4 Run on the small core
 
 `ProfileOps` needs no camera, image, video or display, which makes it the

@@ -8,16 +8,38 @@ APRILTAG_DEMO_FORCE_RUST_REBUILD ?= NO
 APRILTAG_DEMO_FORCE_WORKLOAD_REBUILD ?= NO
 APRILTAG_DEMO_FORCE_PROFILE_REBUILD ?= NO
 APRILTAG_DEMO_PKGDIR ?= $(TOPDIR)/package/apriltag_demo
-APRILTAG_DEMO_RVV_SOURCE_HASH := $(shell $(APRILTAG_DEMO_PKGDIR)/scripts/rust_source_hash.sh "$(APRILTAG_DEMO_RVV_DIR)" production 2>/dev/null)
-APRILTAG_DEMO_RVV_WORKLOAD_SOURCE_HASH := $(shell $(APRILTAG_DEMO_PKGDIR)/scripts/rust_source_hash.sh "$(APRILTAG_DEMO_RVV_DIR)" workload 2>/dev/null)
-APRILTAG_DEMO_RVV_PROFILE_SOURCE_HASH := $(shell $(APRILTAG_DEMO_PKGDIR)/scripts/rust_source_hash.sh "$(APRILTAG_DEMO_RVV_DIR)" profile 2>/dev/null)
+
+# The Rust archives follow the Linux ISA configuration rather than being pinned
+# to the big core. apriltag-rvv gates every vector path behind
+# #[cfg(target_feature = "v")], and build-capi.sh --no-rvv builds into its own
+# --target-dir with -Z build-std, so rust-std is recompiled scalar as well --
+# which matters, because most of the vector instructions in a linked
+# tinytag_detect.elf come from std/core/alloc, not from apriltag-rvv's own
+# kernels. See docs/notes/small-core-rvv-pollution.md.
+#
+# The variant is part of the source hash below: both variants publish the same
+# archive name and the same .apriltag_rvv*.source-hash stamp, so without it a
+# reconfigured tree would keep a vector archive and trap with SIGILL on the
+# scalar core.
+ifeq ($(BR2_RISCV_ISA_RVV),y)
+APRILTAG_DEMO_RVV_VARIANT = rvv
+APRILTAG_DEMO_RVV_ARGS =
+else
+APRILTAG_DEMO_RVV_VARIANT = scalar
+APRILTAG_DEMO_RVV_ARGS = --no-rvv
+endif
+
+APRILTAG_DEMO_RVV_SOURCE_HASH := $(shell $(APRILTAG_DEMO_PKGDIR)/scripts/rust_source_hash.sh "$(APRILTAG_DEMO_RVV_DIR)" production $(APRILTAG_DEMO_RVV_VARIANT) 2>/dev/null)
+APRILTAG_DEMO_RVV_WORKLOAD_SOURCE_HASH := $(shell $(APRILTAG_DEMO_PKGDIR)/scripts/rust_source_hash.sh "$(APRILTAG_DEMO_RVV_DIR)" workload $(APRILTAG_DEMO_RVV_VARIANT) 2>/dev/null)
+APRILTAG_DEMO_RVV_PROFILE_SOURCE_HASH := $(shell $(APRILTAG_DEMO_PKGDIR)/scripts/rust_source_hash.sh "$(APRILTAG_DEMO_RVV_DIR)" profile $(APRILTAG_DEMO_RVV_VARIANT) 2>/dev/null)
 APRILTAG_DEMO_RVV_COMBINED_SOURCE_HASH = $(shell printf '%s\n%s\n%s\n' "$(APRILTAG_DEMO_RVV_SOURCE_HASH)" "$(APRILTAG_DEMO_RVV_WORKLOAD_SOURCE_HASH)" "$(APRILTAG_DEMO_RVV_PROFILE_SOURCE_HASH)" | sha256sum | cut -d' ' -f1)
 APRILTAG_DEMO_RVV_GIT_SHA = $(shell sha=$$(git -C "$(APRILTAG_DEMO_RVV_DIR)" rev-parse --short=12 HEAD 2>/dev/null); test -n "$$sha" && { printf '%s' "$$sha"; test -z "$$(git -C "$(APRILTAG_DEMO_RVV_DIR)" status --porcelain 2>/dev/null)" || printf '%s' "-dirty-$$(printf '%s' "$(APRILTAG_DEMO_RVV_COMBINED_SOURCE_HASH)" | cut -c1-12)"; })
 APRILTAG_DEMO_SDK_DIR = $(realpath $(TOPDIR)/../..)
 APRILTAG_DEMO_SDK_GIT_SHA = $(shell bash $(APRILTAG_DEMO_PKGDIR)/scripts/git_source_identity.sh "$(APRILTAG_DEMO_SDK_DIR)" buildroot-overlay/package/apriltag_demo 2>/dev/null)
 APRILTAG_DEMO_CONF_OPTS += \
 	-DAPRILTAG_RVV_GIT_ID=$(APRILTAG_DEMO_RVV_GIT_SHA) \
-	-DAPRILTAG_SDK_GIT_ID=$(APRILTAG_DEMO_SDK_GIT_SHA)
+	-DAPRILTAG_SDK_GIT_ID=$(APRILTAG_DEMO_SDK_GIT_SHA) \
+	-DBR2_RISCV_ISA_RVV=$(if $(BR2_RISCV_ISA_RVV),ON,OFF)
 
 # Ensure the Rust staticlib (built in the rvv-dev docker image) is present in
 # Buildroot's copied source tree before CMake configures. Local package sources
@@ -39,7 +61,7 @@ define APRILTAG_DEMO_BUILD_RUST_LIB
 		APRILTAG_RVV_DIR="$(APRILTAG_DEMO_RVV_DIR)" \
 		APRILTAG_SOURCE_HASH="$(APRILTAG_DEMO_RVV_SOURCE_HASH)" \
 		APRILTAG_PACKAGE_LOCK_HELD=1 \
-			bash $(@D)/scripts/build_rust_lib.sh; \
+			bash $(@D)/scripts/build_rust_lib.sh $(APRILTAG_DEMO_RVV_ARGS); \
 	else \
 		echo "apriltag_demo: production Rust source hash matches; using packaged archive"; \
 	fi
@@ -57,7 +79,7 @@ define APRILTAG_DEMO_BUILD_RUST_LIB
 		APRILTAG_RVV_DIR="$(APRILTAG_DEMO_RVV_DIR)" \
 		APRILTAG_WORKLOAD_SOURCE_HASH="$(APRILTAG_DEMO_RVV_WORKLOAD_SOURCE_HASH)" \
 		APRILTAG_PACKAGE_LOCK_HELD=1 \
-			bash $(@D)/scripts/build_rust_lib.sh --workload-only; \
+			bash $(@D)/scripts/build_rust_lib.sh --workload-only $(APRILTAG_DEMO_RVV_ARGS); \
 	else \
 		echo "apriltag_demo: Rust workload source hash matches; using packaged archive"; \
 	fi
@@ -76,7 +98,7 @@ define APRILTAG_DEMO_BUILD_RUST_LIB
 		APRILTAG_RVV_DIR="$(APRILTAG_DEMO_RVV_DIR)" \
 		APRILTAG_PROFILE_SOURCE_HASH="$(APRILTAG_DEMO_RVV_PROFILE_SOURCE_HASH)" \
 		APRILTAG_PACKAGE_LOCK_HELD=1 \
-			bash $(@D)/scripts/build_rust_lib.sh --profile-only; \
+			bash $(@D)/scripts/build_rust_lib.sh --profile-only $(APRILTAG_DEMO_RVV_ARGS); \
 	else \
 		echo "apriltag_demo: Rust profile source hash matches; using packaged archive"; \
 	fi
@@ -110,5 +132,21 @@ define APRILTAG_DEMO_BUILD_DEB
 endef
 
 APRILTAG_DEMO_POST_INSTALL_TARGET_HOOKS += APRILTAG_DEMO_BUILD_DEB
+
+# On a scalar-core configuration a stray vector instruction does not fail the
+# build, it SIGILLs on the board -- and the traceback looks like a camera fault
+# because it lands right after capture negotiation. Gate it here instead.
+# Audit the build-tree binaries: the installed copies are stripped, so their
+# per-symbol attribution is unusable. apriltag_demo.elf links libapriltag_rvv.a
+# but not libnncase, so unlike tinytag_detect it can be held to zero.
+ifneq ($(BR2_RISCV_ISA_RVV),y)
+define APRILTAG_DEMO_AUDIT_VECTOR_FREE
+	bash $(APRILTAG_DEMO_PKGDIR)/scripts/audit_vector_free.sh \
+		$(TARGET_OBJDUMP) \
+		$(@D)/apriltag_demo.elf \
+		$(@D)/apriltag_c_demo.elf
+endef
+APRILTAG_DEMO_POST_INSTALL_TARGET_HOOKS += APRILTAG_DEMO_AUDIT_VECTOR_FREE
+endif
 
 $(eval $(cmake-package))

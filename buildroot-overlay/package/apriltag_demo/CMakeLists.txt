@@ -82,8 +82,17 @@ target_compile_definitions(${c_bin} PRIVATE
     APRILTAG_C_VERSION="3.4.5"
 )
 
-set(CMAKE_C_FLAGS   "${CMAKE_C_FLAGS}   -mcpu=c908v -mabi=lp64d -mtune=c908 -mrvv-v0p10-compatible -mrvv-auto-vectorize")
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -mcpu=c908v -mabi=lp64d -mtune=c908 -mrvv-v0p10-compatible -mrvv-auto-vectorize")
+# These land after Buildroot's own BR2_TARGET_OPTIMIZATION and override it, so
+# applying them unconditionally gives a small-core (AMP) build the big core's
+# vector ISA and produces binaries that SIGILL on the board -- GCC
+# auto-vectorizes ordinary drawing code and even static initializers. Bind them
+# to the Kconfig symbol instead; apriltag_demo.mk passes it in. Same fix as
+# commit 32d7492 made for ai_demo_cml_common.
+# See docs/notes/small-core-rvv-pollution.md.
+if(BR2_RISCV_ISA_RVV)
+    set(CMAKE_C_FLAGS   "${CMAKE_C_FLAGS}   -mcpu=c908v -mabi=lp64d -mtune=c908 -mrvv-v0p10-compatible -mrvv-auto-vectorize")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -mcpu=c908v -mabi=lp64d -mtune=c908 -mrvv-v0p10-compatible -mrvv-auto-vectorize")
+endif()
 
 if(CMAKE_TOOLCHAIN_FILE MATCHES "buildroot/toolchainfile.cmake")
     # Buildroot environment — compilers come from the toolchain file.

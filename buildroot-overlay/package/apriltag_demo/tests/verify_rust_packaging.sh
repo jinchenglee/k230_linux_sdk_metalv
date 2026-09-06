@@ -119,6 +119,25 @@ test "$production_hash" != "$workload_hash"
 test "$production_hash" != "$profile_hash"
 test "$workload_hash" != "$profile_hash"
 
+# The rvv/scalar ISA variant must reach the digest. apriltag_demo.mk selects
+# the archive with build_rust_lib.sh --no-rvv off BR2_RISCV_ISA_RVV, but both
+# variants publish under the same archive name and the same stamp file
+# (.apriltag_rvv.source-hash). If the variant did not change the hash, flipping
+# the Linux configuration would leave a matching stamp and the hook would
+# silently keep an RVV archive on a scalar core -- which traps with SIGILL.
+for mode in production workload profile; do
+    rvv_hash="$($HASH_SCRIPT "$RVV" "$mode" rvv)"
+    scalar_hash="$($HASH_SCRIPT "$RVV" "$mode" scalar)"
+    test "$rvv_hash" != "$scalar_hash"
+    # An omitted variant keeps the historical (RVV) digest.
+    test "$($HASH_SCRIPT "$RVV" "$mode")" = "$rvv_hash"
+done
+# A variant that is neither rvv nor scalar must be rejected, not hashed.
+if "$HASH_SCRIPT" "$RVV" production bogus >/dev/null 2>&1; then
+    echo "rust_source_hash.sh accepted an unknown variant" >&2
+    exit 1
+fi
+
 printf '%s\n' '/* shared kernel ABI change */' >>"$RVV/include/apriltag_kernel_modes.h"
 test "$(hash_mode production)" != "$production_hash"
 test "$(hash_mode workload)" != "$workload_hash"
@@ -187,12 +206,26 @@ cmake-package =
 include $MK
 print-profile-hash:
 	@printf '%s\\n' '\$(APRILTAG_DEMO_RVV_PROFILE_SOURCE_HASH)'
+print-variant:
+	@printf '%s\\n' '\$(APRILTAG_DEMO_RVV_VARIANT)'
+print-rvv-args:
+	@printf '%s\\n' '\$(APRILTAG_DEMO_RVV_ARGS)'
 print-rust-id:
 	@printf '%s\\n' '\$(APRILTAG_DEMO_RVV_GIT_SHA)'
 print-sdk-id:
 	@printf '%s\\n' '\$(APRILTAG_DEMO_SDK_GIT_SHA)'
 EOF
-test "$(make -s -f "$TMP/hash.mk" print-profile-hash)" = "$profile_hash"
+test "$(make -s BR2_RISCV_ISA_RVV=y -f "$TMP/hash.mk" print-profile-hash)" = "$profile_hash"
+
+# BR2_RISCV_ISA_RVV drives both the variant token and the build_rust_lib.sh
+# argument, so a scalar Linux configuration cannot reuse a vector archive.
+test "$(make -s BR2_RISCV_ISA_RVV=y -f "$TMP/hash.mk" print-variant)" = rvv
+test "$(make -s BR2_RISCV_ISA_RVV=y -f "$TMP/hash.mk" print-rvv-args)" = ""
+test "$(make -s BR2_RISCV_ISA_RVV= -f "$TMP/hash.mk" print-variant)" = scalar
+test "$(make -s BR2_RISCV_ISA_RVV= -f "$TMP/hash.mk" print-rvv-args)" = "--no-rvv"
+test "$(make -s BR2_RISCV_ISA_RVV= -f "$TMP/hash.mk" print-profile-hash)" \
+    = "$($HASH_SCRIPT "$RVV" profile scalar)"
+test "$(make -s BR2_RISCV_ISA_RVV= -f "$TMP/hash.mk" print-profile-hash)" != "$profile_hash"
 
 # One Make invocation must snapshot each mode once at parse time. Mutating a
 # shared Rust input in the recipe must not change the hash passed to the helper.
@@ -245,7 +278,7 @@ $snapshot_pkg/run:
 	@\$(APRILTAG_DEMO_BUILD_RUST_LIB)
 EOF
 rm -f "$TMP/hash-calls" "$TMP/snapshot-build.log"
-make -s -f "$TMP/snapshot.mk" "$snapshot_pkg/run"
+make -s BR2_RISCV_ISA_RVV=y -f "$TMP/snapshot.mk" "$snapshot_pkg/run"
 test ! -e "$snapshot_pkg/lib/apriltag_grouping.h"
 for mode in production workload profile; do
     test "$(grep -c "^$mode$" "$TMP/hash-calls")" -eq 1
@@ -258,21 +291,21 @@ git -C "$RVV" config user.email fixture@example.com
 git -C "$RVV" add .
 git -C "$RVV" commit -qm fixture
 rvv_git_sha="$(git -C "$RVV" rev-parse --short=12 HEAD)"
-test "$(make -s -f "$TMP/hash.mk" print-rust-id)" = "$rvv_git_sha"
+test "$(make -s BR2_RISCV_ISA_RVV=y -f "$TMP/hash.mk" print-rust-id)" = "$rvv_git_sha"
 printf '%s\n' '# dirty identity probe' >>"$RVV/Cargo.lock"
 production_hash="$(hash_mode production)"
 workload_hash="$(hash_mode workload)"
 profile_hash="$(hash_mode profile)"
 combined_hash="$(printf '%s\n%s\n%s\n' "$production_hash" "$workload_hash" \
     "$profile_hash" | sha256sum | cut -d' ' -f1)"
-test "$(make -s -f "$TMP/hash.mk" print-rust-id)" = \
+test "$(make -s BR2_RISCV_ISA_RVV=y -f "$TMP/hash.mk" print-rust-id)" = \
     "$rvv_git_sha-dirty-${combined_hash:0:12}"
-rust_identity_before_profile="$(make -s -f "$TMP/hash.mk" print-rust-id)"
+rust_identity_before_profile="$(make -s BR2_RISCV_ISA_RVV=y -f "$TMP/hash.mk" print-rust-id)"
 printf '%s\n' '/* profile-only identity mutation */' >>"$RVV/include/apriltag_profile.h"
-rust_identity_after_profile="$(make -s -f "$TMP/hash.mk" print-rust-id)"
+rust_identity_after_profile="$(make -s BR2_RISCV_ISA_RVV=y -f "$TMP/hash.mk" print-rust-id)"
 test "$rust_identity_before_profile" != "$rust_identity_after_profile"
 printf '%s\n' 'pub fn untracked_identity_probe() {}' >"$RVV/src/untracked_identity.rs"
-test "$(make -s -f "$TMP/hash.mk" print-rust-id)" != "$rust_identity_after_profile"
+test "$(make -s BR2_RISCV_ISA_RVV=y -f "$TMP/hash.mk" print-rust-id)" != "$rust_identity_after_profile"
 production_hash="$(hash_mode production)"
 workload_hash="$(hash_mode workload)"
 profile_hash="$(hash_mode profile)"
@@ -285,26 +318,26 @@ git -C "$TMP/sdk" config user.email fixture@example.com
 git -C "$TMP/sdk" add .
 git -C "$TMP/sdk" commit -qm fixture
 sdk_git_sha="$(git -C "$TMP/sdk" rev-parse --short=12 HEAD)"
-test "$(make -s -f "$TMP/hash.mk" print-sdk-id)" = "$sdk_git_sha"
+test "$(make -s BR2_RISCV_ISA_RVV=y -f "$TMP/hash.mk" print-sdk-id)" = "$sdk_git_sha"
 printf '%s\n' dirty >>"$TMP/sdk/buildroot-overlay/package/apriltag_demo/identity.txt"
-sdk_tracked_dirty="$(make -s -f "$TMP/hash.mk" print-sdk-id)"
+sdk_tracked_dirty="$(make -s BR2_RISCV_ISA_RVV=y -f "$TMP/hash.mk" print-sdk-id)"
 test "$sdk_tracked_dirty" != "$sdk_git_sha"
 case "$sdk_tracked_dirty" in "$sdk_git_sha-dirty-"????????????) ;; *) exit 1 ;; esac
 printf '%s\n' first >"$TMP/sdk/buildroot-overlay/package/apriltag_demo/untracked.txt"
-sdk_untracked_first="$(make -s -f "$TMP/hash.mk" print-sdk-id)"
+sdk_untracked_first="$(make -s BR2_RISCV_ISA_RVV=y -f "$TMP/hash.mk" print-sdk-id)"
 printf '%s\n' second >"$TMP/sdk/buildroot-overlay/package/apriltag_demo/untracked.txt"
-sdk_untracked_second="$(make -s -f "$TMP/hash.mk" print-sdk-id)"
+sdk_untracked_second="$(make -s BR2_RISCV_ISA_RVV=y -f "$TMP/hash.mk" print-sdk-id)"
 test "$sdk_untracked_first" != "$sdk_untracked_second"
 printf '%s\n' '*.a' '.apriltag-rvv-package.lock' '.publish-backup.*' \
     >"$TMP/sdk/buildroot-overlay/package/apriltag_demo/.gitignore"
 git -C "$TMP/sdk" add buildroot-overlay/package/apriltag_demo/.gitignore
 git -C "$TMP/sdk" commit -qm 'ignore generated files'
-sdk_identity_before_ignored="$(make -s -f "$TMP/hash.mk" print-sdk-id)"
+sdk_identity_before_ignored="$(make -s BR2_RISCV_ISA_RVV=y -f "$TMP/hash.mk" print-sdk-id)"
 printf ignored >"$TMP/sdk/buildroot-overlay/package/apriltag_demo/generated.a"
 printf ignored >"$TMP/sdk/buildroot-overlay/package/apriltag_demo/.apriltag-rvv-package.lock"
 mkdir "$TMP/sdk/buildroot-overlay/package/apriltag_demo/.publish-backup.fixture"
 printf ignored >"$TMP/sdk/buildroot-overlay/package/apriltag_demo/.publish-backup.fixture/data"
-test "$(make -s -f "$TMP/hash.mk" print-sdk-id)" = "$sdk_identity_before_ignored"
+test "$(make -s BR2_RISCV_ISA_RVV=y -f "$TMP/hash.mk" print-sdk-id)" = "$sdk_identity_before_ignored"
 
 ignore_pkg="$TMP/ignore-sdk/buildroot-overlay/package/apriltag_demo"
 mkdir -p "$ignore_pkg/lib"
@@ -749,22 +782,22 @@ EOF
 rm "$COPIED/lib/apriltag_pending_profile.h"
 production_before="$(sha256sum "$COPIED/lib/libapriltag_rvv.a")"
 workload_before="$(sha256sum "$COPIED/lib/libapriltag_rvv_workload.a")"
-make -s -f "$TMP/hash.mk" "$COPIED/run-hook"
+make -s BR2_RISCV_ISA_RVV=y -f "$TMP/hash.mk" "$COPIED/run-hook"
 test "$(cat "$TMP/build.log")" = --profile-only
 test "$(sha256sum "$COPIED/lib/libapriltag_rvv.a")" = "$production_before"
 test "$(sha256sum "$COPIED/lib/libapriltag_rvv_workload.a")" = "$workload_before"
 cmp "$RVV/include/apriltag_pending_profile.h" \
     "$COPIED/lib/apriltag_pending_profile.h"
 test "$(cat "$COPIED/lib/.apriltag_rvv_profile.source-hash")" = "$profile_hash"
-make -s -f "$TMP/hash.mk" "$COPIED/run-hook"
+make -s BR2_RISCV_ISA_RVV=y -f "$TMP/hash.mk" "$COPIED/run-hook"
 test "$(wc -l <"$TMP/build.log")" -eq 1
-make -s -f "$TMP/hash.mk" "$COPIED/run-force-hook"
+make -s BR2_RISCV_ISA_RVV=y -f "$TMP/hash.mk" "$COPIED/run-force-hook"
 test "$(tail -n 1 "$TMP/build.log")" = production
 test "$(wc -l <"$TMP/build.log")" -eq 2
-make -s -f "$TMP/hash.mk" "$COPIED/run-force-workload-hook"
+make -s BR2_RISCV_ISA_RVV=y -f "$TMP/hash.mk" "$COPIED/run-force-workload-hook"
 test "$(tail -n 1 "$TMP/build.log")" = --workload-only
 test "$(wc -l <"$TMP/build.log")" -eq 3
-make -s -f "$TMP/hash.mk" "$COPIED/run-force-profile-hook"
+make -s BR2_RISCV_ISA_RVV=y -f "$TMP/hash.mk" "$COPIED/run-force-profile-hook"
 test "$(tail -n 1 "$TMP/build.log")" = --profile-only
 test "$(wc -l <"$TMP/build.log")" -eq 4
 

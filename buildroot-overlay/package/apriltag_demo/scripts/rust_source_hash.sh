@@ -1,14 +1,22 @@
 #!/bin/bash
 set -euo pipefail
 
-RVV_DIR="${1:?usage: rust_source_hash.sh APRILTAG_RVV_DIR production|workload|profile}"
-MODE="${2:?usage: rust_source_hash.sh APRILTAG_RVV_DIR production|workload|profile}"
+USAGE="usage: rust_source_hash.sh APRILTAG_RVV_DIR production|workload|profile [rvv|scalar]"
+RVV_DIR="${1:?$USAGE}"
+MODE="${2:?$USAGE}"
+# The ISA variant selects a different archive from the same sources (see
+# build-capi.sh --no-rvv), published under the same name and the same stamp
+# file. It must therefore be part of the digest, or switching
+# BR2_RISCV_ISA_RVV would leave a matching stamp and reuse the wrong archive.
+VARIANT="${3:-rvv}"
 case "$MODE" in production|workload|profile) ;; *) exit 2 ;; esac
+case "$VARIANT" in rvv|scalar) ;; *) exit 2 ;; esac
 
 RVV_DIR="$(cd "$RVV_DIR" && pwd -P)"
 PARENT="$(cd "$RVV_DIR/.." && pwd)"
 {
     printf 'mode\0%s\0' "$MODE"
+    printf 'variant\0%s\0' "$VARIANT"
     for root in "$RVV_DIR" "$PARENT/async-rvv"; do
         [ -d "$root" ] || continue
         while IFS= read -r -d '' file; do

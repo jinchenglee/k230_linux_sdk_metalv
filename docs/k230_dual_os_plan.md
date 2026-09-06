@@ -29,6 +29,12 @@ This plan complements two existing documents:
 The reproducible scalar nncase experiment is documented in
 `docs/notes/rvv-free-nncase-v2.11.0.md`.
 
+`docs/notes/small-core-rvv-pollution.md` records why `tinytag_detect` still
+SIGILLs on the small core as of 2026-09-05: three independent RVV sources
+(`libapriltag_rvv.a` plus its bundled rust-std, the distributed libnncase
+archive, and -- already fixed -- the application's own C++ flags). It corrects
+the RVV attribution given in commit `32d7492` and blocks the Phase 7 gate.
+
 ## Decisions and rationale
 
 ### Primary topology
