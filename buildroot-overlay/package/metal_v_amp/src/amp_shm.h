@@ -70,6 +70,45 @@ struct amp_shm_response {
 	struct amp_shm_timing timing;
 } __attribute__((aligned(64)));
 
+/* Cache maintenance on the big core uses physical-address dcache.cpa/dcache.ipa,
+ * which act on whole 64-byte lines regardless of where a region begins or ends.
+ * Any region sharing a cache line with a differently-owned region can therefore
+ * be destroyed by its neighbour's clean or invalidate -- silently, and in an
+ * unrelated transaction. Unaligned regions are consequently not supported:
+ * every offset and every length is a multiple of AMP_SHM_CACHE_LINE, and that
+ * is asserted here rather than checked at runtime.
+ */
+#define AMP_SHM_IS_LINE_ALIGNED(x) (((x) % AMP_SHM_CACHE_LINE) == 0)
+
+_Static_assert(AMP_SHM_IS_LINE_ALIGNED(AMP_SHM_HEADER_OFFSET),
+	       "header offset must be cache-line aligned");
+_Static_assert(AMP_SHM_IS_LINE_ALIGNED(AMP_SHM_REQUEST_OFFSET),
+	       "request offset must be cache-line aligned");
+_Static_assert(AMP_SHM_IS_LINE_ALIGNED(AMP_SHM_REQ_PUB_OFFSET),
+	       "request publish offset must be cache-line aligned");
+_Static_assert(AMP_SHM_IS_LINE_ALIGNED(AMP_SHM_RESPONSE_OFFSET),
+	       "response offset must be cache-line aligned");
+_Static_assert(AMP_SHM_IS_LINE_ALIGNED(AMP_SHM_RESP_PUB_OFFSET),
+	       "response publish offset must be cache-line aligned");
+_Static_assert(AMP_SHM_IS_LINE_ALIGNED(AMP_SHM_REQUEST_DATA),
+	       "request payload offset must be cache-line aligned");
+_Static_assert(AMP_SHM_IS_LINE_ALIGNED(AMP_SHM_RESPONSE_DATA),
+	       "response payload offset must be cache-line aligned");
+_Static_assert(AMP_SHM_IS_LINE_ALIGNED(AMP_SHM_MAX_PAYLOAD),
+	       "max payload must be a whole number of cache lines");
+
+/* The payload windows must not overlap each other, the control block, or the
+ * end of the mapping. */
+_Static_assert(AMP_SHM_RESP_PUB_OFFSET + AMP_SHM_CACHE_LINE <=
+	       AMP_SHM_REQUEST_DATA,
+	       "control block overlaps the request payload window");
+_Static_assert(AMP_SHM_REQUEST_DATA + AMP_SHM_MAX_PAYLOAD <=
+	       AMP_SHM_RESPONSE_DATA,
+	       "request payload window overlaps the response payload window");
+_Static_assert(AMP_SHM_RESPONSE_DATA + AMP_SHM_MAX_PAYLOAD <=
+	       AMP_SHM_MAP_SIZE,
+	       "response payload window runs past the end of the mapping");
+
 _Static_assert(sizeof(struct amp_shm_header) == AMP_SHM_CACHE_LINE,
 	       "AMP header must occupy one cache line");
 _Static_assert(sizeof(struct amp_shm_request) == AMP_SHM_CACHE_LINE,

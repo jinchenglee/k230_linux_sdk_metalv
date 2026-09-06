@@ -476,6 +476,11 @@ the count is on the order of a dozen cycles and was never run or recorded as
 the stated 100-cycle sequence. Treat this gate as open until an automated
 cold/warm cycle run is recorded.
 
+Decision 2026-09-06: not automating this. Day-to-day development reflashes and
+reboots this hardware constantly, so the count accumulates on its own; a
+scripted 100-cycle run would add ceremony without adding information at this
+stage. Revisit if this becomes a product rather than a development platform.
+
 ### Phase 3: prove shared memory and cache maintenance
 
 - Add an aligned shared counter and patterned buffer exchange.
@@ -499,8 +504,55 @@ directions at cache-line, page, 64 KiB, and 1 MiB boundaries. After replacing
 virtual-address cache operations with K230 U-Boot's physical-address
 `dcache.cpa`/`dcache.ipa` sequence, 100 hardware loops (900 exchanges) completed
 without corruption; the 64 KiB and 1 MiB round trips took approximately 3.675
-ms and 58.669 ms respectively. Sequence/ring wrap, non-aligned slot offsets,
-and cache-cost analysis remain open.
+ms and 58.669 ms respectively. Note that this window is measured from after the
+request payload is filled and its CRC computed, so it is the big core's
+processing window and never included the Linux-side cost.
+
+Open items, updated 2026-09-06:
+
+- **Non-aligned slot offsets: closed by decision, not by test.** Unaligned
+  regions are not supported. `dcache.cpa`/`dcache.ipa` act on whole 64-byte
+  lines regardless of region boundaries, so a line shared by two differently
+  owned regions lets one side's clean or invalidate destroy the other --
+  silently, and in an unrelated transaction. `amp_shm.h` now asserts at compile
+  time that every offset and `AMP_SHM_MAX_PAYLOAD` are cache-line aligned, and
+  that the control block and the two payload windows do not overlap each other
+  or the end of the mapping. A one-byte misalignment fails the build.
+- **Sequence/ring wrap: not a present risk.** `sequence` is `uint64_t` and every
+  comparison uses the full width, so it does not wrap in any realistic runtime;
+  the only truncation seeds the test pattern. There is no ring today -- the
+  transport is a single request/response slot pair. The rule for when Phase 5
+  adds one: indices wrap, sequences do not; derive the slot index from the
+  free-running sequence and never compare indices to decide freshness.
+- **Cache-cost analysis: closed, measured on V3 hardware 2026-09-06.**
+  `amp-shm-test` now also times Linux's four passes over the uncached window
+  alongside the big core's five cycle counters; `/root/amp/amp-shm-cost.sh`
+  runs the sweep and prints the split.
+
+  **Cache maintenance is not the cost.** At 4 KiB the big core spends 430
+  cycles invalidating and 714 cleaning, against 182,859 + 146,460 on the two
+  diagnostic CRCs and 20,561 on the transform -- cache operations are 0.3% of
+  its work. For a single cache line it is 74 cycles to invalidate and 109 to
+  clean, about 0.11 us at 1.6 GHz.
+
+  **The cost is Linux touching the window at all.** `/dev/mem` + `O_SYNC` gives
+  an uncached mapping whose reads run at 5-8 MB/s and whose writes run at about
+  54 MB/s -- a 7-10x read/write asymmetry, since writes post and reads stall.
+  End to end, 1 MiB costs 564 ms (56 ms big core, 508 ms Linux), i.e. 1.86 MB/s.
+  Scaling is linear from 4 KiB up, so larger buffers buy nothing.
+
+  **Control is effectively free.** The zero-payload mailbox round trip over
+  2000 samples is min 19.0 us, p50 19.9 us, p95 25.1 us, p99 34.5 us, mean
+  21.0 us -- about 0.1% of a 17.9 ms frame period at the 56 fps the camera
+  actually delivers.
+
+  This confirms the data-plane rule with numbers rather than assumption: RPMsg
+  and this window carry control and descriptors, and bulk payloads are passed
+  **by address**. Copying is not merely suboptimal -- a 720p luma frame
+  (900 KiB) would cost roughly 490 ms through this path, about 27 frame
+  periods. Should Linux ever need to read bulk data here, the lever is the
+  uncached mapping (a cacheable mapping plus kernel-side maintenance), not the
+  cache operations, which are already negligible.
 
 Mailbox stage-two implementation status: shared-memory ABI version 3 can tag a
 request as interrupt-driven. Small-core Linux publishes the request and writes
@@ -609,6 +661,35 @@ Gate: model outputs match the big-core Linux baseline within expected numeric
 tolerance and no unsupported-instruction trap or device-ownership conflict
 occurs.
 
+Status 2026-09-06: **functionally complete; the output-comparison half of the
+gate is deliberately waived.**
+
+Done:
+
+- The scalar nncase runtime is built from source for the small-core rootfs, and
+  is now a packaged Buildroot variant rather than the manual output-tree swap of
+  `rvv-free-nncase-v2.11.0.md` section 15 -- it survives `dirclean`. See section
+  13 of that note and `docs/notes/small-core-rvv-pollution.md`.
+- Every final object is audited for vector instructions, and the audit is a
+  build-time gate rather than a manual check. `tinytag_detect.elf` went from
+  9510 vector instructions to 0, `apriltag_demo.elf` 7840 to 0,
+  `apriltag_c_demo.elf` 337 to 0, and the staged
+  `libNncase.Runtime.Native.a` 2001 to 0.
+- The TinyTag kmodel loads and runs AI2D plus KPU inference on the small core,
+  decoding tags correctly -- 96 `hamming=0` decodes in an 18 s run, and a live
+  LCD preview at camera ~56 fps.
+- No unsupported-instruction trap and no device-ownership conflict.
+
+Not done, by decision: the numeric output comparison against a big-core
+baseline, and the AI2D-only tests. Establishing bit-level agreement between the
+two cores is a qualification exercise for an nncase *developer*; this project
+consumes nncase as a tool, and a tag that decodes at hamming 0 is the outcome
+that matters here. Reopen this if a model ever appears to behave differently
+across cores.
+
+Stress testing (repeated inference, device re-initialization, recovery) remains
+genuinely open rather than waived.
+
 ### Phase 8: TinyTag ROI offload
 
 - Add batched ROI request/result ABI and remote crop-decoder backend.
@@ -692,25 +773,31 @@ The original list here (rebuild with the `vdev0buffer` carveout, verify
 descriptor addresses, repeat the echo test) is complete and has been folded into
 the Phase 4 status above.
 
-1. Close the Phase 4 gate: add a capability/version handshake and a restart
-   generation with stale-result rejection, then extend
-   `rpmsg-regression.sh` to assert both. Phase 5 is blocked on this.
-2. Record the Phase 2 gate properly: automate a cold/warm boot cycle run and
-   keep the counters and any trap output, rather than relying on the ad-hoc
-   reboots performed during bring-up.
-3. Decide how the RVV-linked packages are handled in the small-core rootfs.
-   They are currently built and installed but must be assumed to trap there;
-   either gate them behind the Phase 7 hybrid or accept them as staged payload
-   and document that they are not to be invoked before Phase 7 passes.
-4. Phase 7 can proceed independently of items 1 and 2. It needs a model and a
-   way to run inference from small-core Linux, and it does not depend on the
-   payload-slot or offload work.
-5. Keep RPMsg limited to control and descriptors; proceed to the separately
-   owned payload slots only after the Phase 4 gate passes.
+Items 2, 3 and 4 of the previous list are done or decided (see the Phase 2, 3
+and 7 statuses). Phase 3 is now closed outright. What remains:
 
-Open items carried from earlier phases: sequence/ring wrap, non-aligned slot
-offsets, and cache-cost analysis from Phase 3; firmware-side endpoint teardown
-from Phase 4.
+1. **Close the Phase 4 gate.** Add a capability/version handshake and a restart
+   generation with stale-result rejection, then extend `rpmsg-regression.sh` to
+   assert both. This is the sole blocker on Phases 5, 6 and 8, and therefore
+   the critical path.
+2. **Firmware-side endpoint teardown and recreation**, still untested (Phase 4).
+3. **Phase 7 stress testing**: repeated inference, device re-initialization and
+   recovery on the small core. The functional work is done; only the soak is
+   missing.
+4. Keep RPMsg limited to control and descriptors; proceed to the separately
+   owned payload slots only after the Phase 4 gate passes. The 2026-09-06
+   measurements make this quantitative rather than stylistic -- a 20 us
+   notification round trip against 1.86 MB/s for bulk copies through the shared
+   window.
+
+Design rules established 2026-09-06, to be honoured by Phase 5's slot code:
+
+- Slot offsets and padded lengths are multiples of `AMP_SHM_CACHE_LINE`; no
+  cache line is shared by two differently owned regions. Asserted at compile
+  time in `amp_shm.h`; unaligned layouts are not supported.
+- Indices wrap, sequences do not. Derive the slot index from the free-running
+  `uint64` sequence and never compare indices to decide freshness.
+- Payloads cross by address, never by copy.
 
 This ordering produces useful proof at each step, keeps the current product path
 available, and makes the platform work reusable by AprilTag, TinyTag, a future

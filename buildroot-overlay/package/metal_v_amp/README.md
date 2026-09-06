@@ -39,7 +39,8 @@ output/k230_canmv_small_core_defconfig/build/metal_v_amp/amp-shm-test
 output/k230_canmv_small_core_defconfig/build/metal_v_amp/rpmsg-echo-test
 ```
 
-The full root filesystem installs all four under `/root/amp/`.
+The full root filesystem installs these under `/root/amp/`, including
+`amp-shm-cost.sh` (see "Exchange cost breakdown").
 
 The package also installs two opt-in replacements for `/etc/init.d/rcS`:
 `/root/amp/rcS.profile` timestamps every startup service, while
@@ -112,6 +113,44 @@ invalidation, request CRC, payload transform, response CRC, and response cache
 cleaning. Deploy `metal-v-k230.bin` and `amp-shm-test` as a matched pair whenever
 the ABI changes. These stage timings establish where mailbox and rpmsg-lite
 work should focus before the XOR operation is replaced by ROI processing.
+
+## Exchange cost breakdown
+
+`amp-shm-test` reports, for every exchange, both sides of the cost: the big
+core's five cycle counters (invalidate, request CRC, transform, response CRC,
+clean) and Linux's four passes over the shared window (fill, request CRC,
+verify, response CRC). The Linux figures matter because `/dev/mem` + `O_SYNC`
+maps the region **uncached**, so those passes can dominate an exchange while
+being entirely absent from the big core's own timing.
+
+For a formatted sweep across all nine sizes, run:
+
+```sh
+cd /root/amp
+./amp-shm-cost.sh              # poll and mailbox modes, one loop each
+./amp-shm-cost.sh --mailbox 5  # one mode, five loops -- steadier numbers
+```
+
+It prints one row per payload size:
+
+```
+     bytes   big_core (ms)    linux (ms)    total (ms)   per-pass MB/s (uncached)
+```
+
+where `big_core` is the firmware's processing window, `linux` is the uncached
+work on this side, and `total` is what an exchange of that size really costs.
+Per-pass MB/s is printed for payloads of 4 KiB and up, below which timer
+granularity dominates.
+
+Read it to decide what may cross this transport. If the Linux column dominates,
+the cost is the uncached mapping rather than cache maintenance. Either way the
+conclusion for bulk data is the same: RPMsg and this window carry control and
+descriptors, and large payloads are passed **by address** rather than copied.
+
+Note that `amp-shm-test`'s own `round_trip`/`big_core_window` figure starts
+*after* the request payload is filled and its CRC computed, so it never
+included the Linux-side cost -- which is precisely why that cost is now
+measured and reported separately.
 
 ## Mailbox notification test
 

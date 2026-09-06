@@ -74,10 +74,20 @@ static int run_exchange(volatile uint8_t *mapping, uint64_t sequence,
 	uint32_t seed = (uint32_t)sequence ^ UINT32_C(0x6d657461);
 	uint32_t request_crc, response_crc, i;
 	uint64_t started, elapsed;
+	/* Linux-side passes over the shared window. /dev/mem + O_SYNC maps it
+	 * uncached (see docs/notes/k230_amp_cache_maintenance.md), so these are
+	 * not incidental: they can dominate the exchange and they are invisible
+	 * in `elapsed`, which only spans the big core's processing window. */
+	uint64_t fill_ns, request_crc_ns, verify_ns = 0, response_crc_ns = 0;
+	uint64_t stage;
 
+	stage = monotonic_ns();
 	for (i = 0; i < length; ++i)
 		request_data[i] = pattern_byte(seed, i);
+	fill_ns = monotonic_ns() - stage;
+	stage = monotonic_ns();
 	request_crc = amp_crc32((const uint8_t *)(uintptr_t)request_data, length);
+	request_crc_ns = monotonic_ns() - stage;
 	request->command = AMP_SHM_COMMAND_XOR;
 	request->length = length;
 	request->crc32 = request_crc;
@@ -162,6 +172,7 @@ static int run_exchange(volatile uint8_t *mapping, uint64_t sequence,
 		return -1;
 	}
 
+	stage = monotonic_ns();
 	for (i = 0; i < length; ++i) {
 		uint8_t expected = pattern_byte(seed, i) ^ AMP_SHM_XOR_VALUE;
 
@@ -173,8 +184,11 @@ static int run_exchange(volatile uint8_t *mapping, uint64_t sequence,
 			return -1;
 		}
 	}
+	verify_ns = monotonic_ns() - stage;
+	stage = monotonic_ns();
 	response_crc = amp_crc32((const uint8_t *)(uintptr_t)response_data,
 				 length);
+	response_crc_ns = monotonic_ns() - stage;
 	if (response_crc != response->response_crc32) {
 		fprintf(stderr,
 			"response CRC mismatch: expected=%08" PRIx32
@@ -183,18 +197,41 @@ static int run_exchange(volatile uint8_t *mapping, uint64_t sequence,
 		return -1;
 	}
 
-	if (verbose)
+	if (verbose) {
+		uint64_t linux_ns = fill_ns + request_crc_ns + verify_ns +
+			response_crc_ns;
+
 		printf("PASS seq=%" PRIu64 " bytes=%" PRIu32
-		       " round_trip=%.3f ms"
+		       " big_core_window=%.3f ms linux_side=%.3f ms"
+		       " exchange=%.3f ms"
 		       " big_cycles{invalidate=%" PRIu64 ",request_crc=%" PRIu64
 		       ",transform=%" PRIu64 ",response_crc=%" PRIu64
-		       ",clean=%" PRIu64 "}\n",
+		       ",clean=%" PRIu64 "}"
+		       " linux_ns{fill=%" PRIu64 ",request_crc=%" PRIu64
+		       ",verify=%" PRIu64 ",response_crc=%" PRIu64 "}",
 		       sequence, length, elapsed / 1000000.0,
+		       linux_ns / 1000000.0, (elapsed + linux_ns) / 1000000.0,
 		       response->timing.request_invalidate_cycles,
 		       response->timing.request_crc_cycles,
 		       response->timing.transform_cycles,
 		       response->timing.response_crc_cycles,
-		       response->timing.response_clean_cycles);
+		       response->timing.response_clean_cycles,
+		       fill_ns, request_crc_ns, verify_ns, response_crc_ns);
+		/* Per-pass MB/s over the uncached window is the number that
+		 * decides whether a payload may cross this transport at all.
+		 * Only meaningful once the size dwarfs timer granularity. */
+		if (length >= 4096) {
+			double mb = (double)length / (1024.0 * 1024.0);
+
+			printf(" MBps{fill=%.1f,request_crc=%.1f,verify=%.1f,"
+			       "response_crc=%.1f}",
+			       fill_ns ? mb / (fill_ns / 1e9) : 0.0,
+			       request_crc_ns ? mb / (request_crc_ns / 1e9) : 0.0,
+			       verify_ns ? mb / (verify_ns / 1e9) : 0.0,
+			       response_crc_ns ? mb / (response_crc_ns / 1e9) : 0.0);
+		}
+		printf("\n");
+	}
 	return 0;
 }
 
