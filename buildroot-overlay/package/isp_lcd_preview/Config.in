@@ -1,0 +1,19 @@
+config BR2_PACKAGE_ISP_LCD_PREVIEW
+    bool "isp_lcd_preview (universal camera preview)"
+    depends on BR2_TOOLCHAIN_HAS_THREADS
+    select BR2_PACKAGE_DISPLAY
+    select BR2_PACKAGE_VVCAM
+    help
+      Standalone live camera preview for the K230 that works on any
+      display/camera config and on either core (scalar or RVV).
+
+      Auto-detects the display connector at runtime:
+        - HDMI / landscape DSI: passthrough rectangle, no rotation.
+        - Portrait DSI LCD (e.g. 480x800): landscape capture buffer sized
+          from the panel, 90-degree rotation, explicit portrait destination.
+      This replicates the confirmed-working portrait geometry from the
+      apriltag/tinytag apps instead of the generic v4l2-drm CLI, which cannot
+      decouple the portrait destination from the source buffer.
+
+      It is a preview utility only: it does not touch the ISP daemon,
+      tuning files, or any application code.

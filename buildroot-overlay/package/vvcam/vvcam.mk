@@ -38,8 +38,10 @@ ifeq ($(BR2_RISCV_ISA_RVV),y)
 VVCAM_ISP_MEDIA_SERVER = isp_media_server
 VVCAM_DEBIAN_ISP_MEDIA_SERVER = isp_media_server_debian
 else
-VVCAM_ISP_MEDIA_SERVER = isp_media_server_scalar
-VVCAM_DEBIAN_ISP_MEDIA_SERVER = isp_media_server_scalar
+# Scalarized from the current RVV daemon; regeneration and verification are
+# documented in docs/notes/isp-media-server-scalar-port-solution.md.
+VVCAM_ISP_MEDIA_SERVER = isp_media_server_scalar_v2
+VVCAM_DEBIAN_ISP_MEDIA_SERVER = isp_media_server_scalar_v2
 endif
 
 VVCAM_CONF_OPTS += -DVVCAM_ISP_MEDIA_SERVER=$(VVCAM_ISP_MEDIA_SERVER)
