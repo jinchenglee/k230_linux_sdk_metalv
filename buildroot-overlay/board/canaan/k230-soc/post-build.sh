@@ -114,7 +114,16 @@ select_small_core_boot_profile()
 	local CONF=$(basename "${BASE_DIR}")
 	local fast_rcs="${rootfs_dir}/root/amp/rcS.fast"
 
-	[ "${CONF}" = "k230_canmv_small_core_defconfig" ] || return 0
+	# Every small-core configuration wants this, not just the first one that
+	# needed it. The previous exact-name test silently skipped
+	# k230_canmv_v3_small_core_defconfig, which therefore shipped the full
+	# synchronous rcS and paid the whole 24.35 s startup sequence measured in
+	# docs/notes/k230_small_core_boot_time.md, against 5.32 s with this
+	# profile. Match the family instead.
+	case "${CONF}" in
+	*small_core_defconfig) ;;
+	*) return 0 ;;
+	esac
 	if [ ! -f "${fast_rcs}" ]; then
 		echo "missing small-core fast boot profile: ${fast_rcs}" >&2
 		return 1

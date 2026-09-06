@@ -27,9 +27,15 @@ for i in /etc/init.d/S??*; do
 	[ ! -f "$i" ] && continue
 
 	case "${i##*/}" in
-		S30dbus|S40bluetoothd|S40k230_canmv_small_core_defconfig|\
+		S30dbus|S40bluetoothd|S40*_defconfig|\
 		S41adb_mtp|S48sntp|S49ntp|S50crond|S50telnet)
 			# Installed but intentionally omitted from the boot critical path.
+			#
+			# S40*_defconfig is the Wi-Fi/auto-run script that post-build.sh
+			# generates as S40${CONF}, so its name differs per configuration.
+			# Matching one literal name meant only the V1.1 small-core config
+			# skipped it; k230_canmv_v3_small_core_defconfig still loaded its
+			# five Wi-Fi/Bluetooth modules on the critical path.
 			continue
 			;;
 		S40network)
