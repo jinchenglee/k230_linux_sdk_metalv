@@ -172,7 +172,7 @@ and refuses any vendor input whose hash differs from the pinned version.
   explicit 480x800 destination, 90-degree rotation, event-driven display
   updates capped at 30 fps. It rejects HDMI and is staged in `/tmp/`.
   This is a separate test tool, not a change to either tag application.
-- **1080p30 regression PASS (2026-09-20)**: `isp_scalar_capture 1080 600 /tmp/isp-scalar-1080.pgm`
+- **1080p30 regression PASS (2026-09-05)**: `isp_scalar_capture 1080 600 /tmp/isp-scalar-1080.pgm`
   → physical 1920x1080@30 selected; NV12 stride 1920; 600 frames at 28.25 fps
   (measurement includes a per-frame luma print); luma mean stable at ~108;
   exit 0. Full luma + saved PGM. Driver sequence counter constant (as in 720p),

@@ -62,6 +62,7 @@ With 256 descriptors per direction, Linux allocates 512 such buffers, or
 256 KiB total. That is small beside the 48 MiB AMP reservation and preserves
 the conventional Linux/RPMsg-Lite layout. If profiling later shows that the
 queue is unnecessarily deep, reduce the descriptor count on both sides; keep
+the 512-byte wire-buffer size for Linux compatibility.
 
 ## Big-core service
 

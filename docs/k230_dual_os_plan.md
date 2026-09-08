@@ -29,11 +29,13 @@ This plan complements two existing documents:
 The reproducible scalar nncase experiment is documented in
 `docs/notes/rvv-free-nncase-v2.11.0.md`.
 
-`docs/notes/small-core-rvv-pollution.md` records why `tinytag_detect` still
-SIGILLs on the small core as of 2026-09-05: three independent RVV sources
-(`libapriltag_rvv.a` plus its bundled rust-std, the distributed libnncase
-archive, and -- already fixed -- the application's own C++ flags). It corrects
-the RVV attribution given in commit `32d7492` and blocks the Phase 7 gate.
+`docs/notes/small-core-rvv-pollution.md` records the investigation and
+resolution of the small-core `SIGILL`: three independent RVV sources were
+identified (`libapriltag_rvv.a` plus its bundled rust-std, the distributed
+libnncase archive, and the application's own C++ flags). All three are now
+selected or rebuilt according to the Linux ISA configuration and guarded by
+build-time vector-instruction audits. See the Phase 7 status for the resulting
+hardware validation.
 
 ## Decisions and rationale
 
@@ -428,16 +430,14 @@ Status: met. Small-core Linux boots to a shell reliably on CanMV-K230 and on
 CanMV-K230 V3, and the big core is held for the firmware rather than left
 offline by accident.
 
-The RVV audit part of this phase no longer holds for the V3 rootfs. To match
-the application intent of this plan, `k230_canmv_v3_small_core_defconfig`
-enables `apriltag_demo` and `tinytag_detect`, and their dependency chain reaches
-`libnncase`. The distributed nncase archives advertise
-`rv64i..._v1p0_..._zve64d1p0_zvl128b1p0`, and `tinytag_detect` additionally
-links `libapriltag_rvv.a`. Those objects build for the small core but must be
-expected to take an illegal-instruction trap there until the scalar hybrid of
-Phase 7 replaces them. They are present as the eventual target workload, not as
-something already validated: nothing in that chain should be treated as
-runnable on the small core before the Phase 7 gate passes.
+The V3 rootfs initially failed the RVV audit after enabling `apriltag_demo` and
+`tinytag_detect`: their dependency chain reached the distributed RVV nncase
+archive, and TinyTag also linked an RVV `libapriltag_rvv.a`. Phase 7 resolved
+those sources with ISA-dependent builds, a packaged scalar nncase runtime, and
+mandatory final-binary audits. The resulting applications have run without
+unsupported-instruction traps on V3 hardware. On 2026-09-08 the same updates
+were also reported working on the original `k230_canmv_small_core_defconfig`,
+confirming that the scalar path is not V3-specific.
 
 ### Phase 1b: second board (CanMV-K230 V3)
 
