@@ -642,6 +642,50 @@ Gate status 2026-09-15: **met; Phase 5 is unblocked.**
 Gate: no leaked slots, overwrite, stale completion, or camera starvation under
 queue saturation and peer restart.
 
+Status 2026-09-15: **shared-slot transport and high-latency camera-producer
+baseline validated.** The versioned protocol now advertises payload slots and
+defines four fixed 1 MiB buffers at `0x1d600000`. RPMsg callbacks validate and
+enqueue descriptors; the main loop performs padded-range cache invalidation and
+actual-range CRC before returning ownership. Same-slot reuse is rejected, work
+is bounded to four slots, and endpoint restart drops queued ownership state and
+advances the generation. `rpmsg-slot-test` exercises boundary sizes, a
+1280x720 Y8 frame, invalid descriptors, four-slot pressure, premature reuse,
+and restart recovery while reporting descriptor RTT and separate invalidate/CRC
+cycles. The existing regression now checks slot accounting and leaks. See
+`docs/notes/k230_amp_payload_slots.md`.
+
+The rebuilt firmware and userspace passed a matched first-traffic post-boot
+run: 26/26 checks, 18,516 RPMsg buffers fetched/consumed/callback-delivered,
+zero failed sends, two successful endpoint restarts, 15/15 accepted slots
+completed, zero CRC mismatch, no leaked busy slot, a drained queue, and a
+four-slot high-water mark. The restart reached an already-drained slot queue
+(`dropped_restart=0`) but generation advance, stale rejection, and a fresh
+post-restart slot transaction passed.
+
+Standalone timing showed 1280x720 Y8 descriptor RTT of 26.863 ms, comprising
+0.036 ms of cache invalidation, 26.708 ms of scalar diagnostic CRC, and about
+0.119 ms of remaining control/userspace overhead. The equivalent 1 MiB result
+was 30.556 ms. Four-slot pressure plus a safely serialized fifth submission
+took 133.874 ms. Thus the temporary CRC service sustains about 37.4 720p jobs/s,
+below the 60 fps camera rate; the camera producer must requeue immediately and
+use latest-wins/drop-on-no-slot behavior rather than back-pressure capture.
+
+The live-camera producer then ran for 10 seconds with 281 buffers dequeued,
+169 latest frames handed to the producer, 169 VI buffers requeued, and all
+169 submitted slots completed. It reported zero capture/submit errors, zero
+outstanding ownership, and no no-slot drops. Completion latency was 58.793 ms
+p50 and 61.593 ms p95. Its one-copy baseline deliberately performs the
+uncached shared-slot write and expected CRC while holding the VI buffer, so
+maximum VI hold was 71.894 ms. That high latency is accepted as a functionality
+baseline, not as the final camera architecture.
+
+The low-latency follow-up will test VI DMA directly into a rotating shared
+capture pool with latest-complete publication and explicit exclusion of the
+one buffer remotely owned by the big core. A cached staging copy is explicitly
+not being added to the baseline because it would introduce a second full-frame
+copy. Direct capture requires NV12-sized shared buffers and driver support for
+queuing the reserved memory, so it remains a distinct experiment.
+
 ### Phase 6: AprilTag offload
 
 - Move the RVV full-frame detector into the big-core service.
@@ -779,9 +823,10 @@ the Phase 4 status above.
 Items 2, 3 and 4 of the previous list are done or decided (see the Phase 2, 3
 and 7 statuses). Phase 3 is now closed outright. What remains:
 
-1. Start **Phase 5 shared payload slots** with host state-machine tests, then
-   target CRC/pattern tests under queue saturation and peer restart. Phase 4 is
-   closed by the 2026-09-15 matched post-boot run (20/20 checks).
+1. Preserve the sealed **Phase 5 shared payload-slot/camera baseline**, then
+   prototype zero-copy VI DMA into a rotating shared capture pool. Publish the
+   latest complete frame, exclude the remotely owned buffer from VI reuse, and
+   measure capture-to-completion latency and drop behavior.
 2. **Phase 7 stress testing** remains independently open: repeated inference,
    device re-initialization and recovery on the small core. The functional work
    is done; only the soak is missing.

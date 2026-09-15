@@ -12,6 +12,7 @@
 # Exit status is 0 only if every check passes.
 
 TEST=${RPMSG_TEST:-/root/amp/rpmsg-echo-test}
+SLOT_TEST=${RPMSG_SLOT_TEST:-/root/amp/rpmsg-slot-test}
 DEV=${RPMSG_DEV:-/dev/rpmsg0}
 pass=0
 fail=0
@@ -67,6 +68,15 @@ echo "== protocol lifecycle"
 check "version/capability handshake and stale rejection" echo_run --protocol --timeout-ms 1000
 check "firmware endpoint restart and generation advance" echo_run --restart --timeout-ms 1000
 
+echo "== shared payload slots"
+if [ "$mode" = full ]; then
+	slot_loops=5
+else
+	slot_loops=1
+fi
+check "slot CRC, ownership, pressure, and restart recovery" \
+	"$SLOT_TEST" --loops "$slot_loops" --timeout-ms 5000
+
 echo "== correctness"
 if [ "$mode" = quick ]; then
 	loops=200
@@ -96,17 +106,33 @@ fetch=$(stat_of fetch_rx)
 txf=$(stat_of tx_failed)
 restarts=$(stat_of endpoint_restarts)
 restart_failures=$(stat_of restart_failures)
+slot_submitted=$(stat_of slot_submitted)
+slot_completed=$(stat_of slot_completed)
+slot_rejected=$(stat_of slot_rejected)
+slot_crc_mismatch=$(stat_of slot_crc_mismatch)
+slot_dropped_restart=$(stat_of slot_dropped_restart)
+slot_busy_mask=$(stat_of slot_busy_mask)
+slot_queue_depth=$(stat_of slot_queue_depth)
+slot_queue_high_water=$(stat_of slot_queue_high_water)
 # rvq_avail_idx and rvq_consumed are 16-bit vring indices and wrap at 65536;
 # fetch_rx is a free-running counter. Compare modulo the vring index width.
 fetch_wrapped=$((fetch % 65536))
 echo "        rvq_avail=$avail rvq_consumed=$consumed fetch_rx=$fetch (mod 65536 = $fetch_wrapped) rx_cb=$rxcb tx_failed=$txf"
 echo "        endpoint_restarts=$restarts restart_failures=$restart_failures"
+echo "        slots submitted=$slot_submitted completed=$slot_completed rejected=$slot_rejected dropped_restart=$slot_dropped_restart"
+echo "        slots crc_mismatch=$slot_crc_mismatch busy_mask=$slot_busy_mask depth=$slot_queue_depth high_water=$slot_queue_high_water"
 check "ring fully drained (rvq_consumed == rvq_avail_idx)" test "$consumed" = "$avail"
 check "no dropped fetches (fetch_rx == rvq_consumed mod 2^16)" test "$fetch_wrapped" = "$consumed"
 check "every fetch delivered (rx_callbacks == fetch_rx)" test "$rxcb" = "$fetch"
 check "no failed sends" test "$txf" = 0
 check "endpoint restart recorded" test "$restarts" -ge 1
 check "no endpoint restart failures" test "$restart_failures" = 0
+check "no payload CRC mismatch" test "$slot_crc_mismatch" = 0
+check "no leaked busy slot" test "$slot_busy_mask" = 0
+check "slot queue fully drained" test "$slot_queue_depth" = 0
+slot_accounted=$((slot_completed + slot_dropped_restart + slot_queue_depth))
+check "every accepted slot accounted" test "$slot_submitted" = "$slot_accounted"
+check "slot pressure reached all four slots" test "$slot_queue_high_water" -ge 4
 
 echo
 echo "passed=$pass failed=$fail"

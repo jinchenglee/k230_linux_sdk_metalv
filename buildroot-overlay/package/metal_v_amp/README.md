@@ -37,6 +37,7 @@ output/k230_canmv_small_core_defconfig/build/metal_v_amp/metal-v-k230.bin
 output/k230_canmv_small_core_defconfig/build/metal_v_amp/metal-v-k230.elf
 output/k230_canmv_small_core_defconfig/build/metal_v_amp/amp-shm-test
 output/k230_canmv_small_core_defconfig/build/metal_v_amp/rpmsg-echo-test
+output/k230_canmv_small_core_defconfig/build/metal_v_amp/rpmsg-slot-test
 ```
 
 The full root filesystem installs these under `/root/amp/`, including
@@ -219,6 +220,54 @@ requires the generation to advance, rejects the old generation, and verifies
 the recreated endpoint with the new generation. Both checks are included in
 `rpmsg-regression.sh`. Firmware and test client must be deployed as a matched
 pair.
+
+### Shared payload slots
+
+Phase 5 adds a four-slot payload pool at physical `0x1d600000`. Each slot is
+1 MiB, enough for a 1280x720 Y8 frame. Linux fills an available slot and sends
+an 88-byte `SLOT_SUBMIT` descriptor over RPMsg; the big core invalidates the
+descriptor's cache-line-padded extent, CRC-checks the actual data extent, and
+returns an 80-byte `SLOT_COMPLETE`. No image bytes pass through RPMsg.
+
+Ownership is explicit: Linux owns a free slot, submission transfers it to the
+big core, and receipt of completion returns it to Linux. A second submission
+for an owned slot is rejected. Endpoint restart discards queued work, clears
+the ownership mask, advances the protocol generation, and rejects requests
+from the old generation.
+
+Run the standalone correctness and timing gate:
+
+```sh
+/root/amp/rpmsg-slot-test --loops 1 --timeout-ms 5000
+```
+
+It covers 64 B, 4 KiB, 64 KiB, 1280x720 Y8, and 1 MiB payloads; invalid
+descriptors; all-four-slot pressure; same-slot reuse; and restart recovery.
+The full RPMsg regression invokes it automatically and verifies that the
+firmware queue is drained, every accepted slot is accounted for, no ownership
+bit leaked, and no CRC mismatch occurred. See
+`docs/notes/k230_amp_payload_slots.md` for the ABI and validation procedure.
+
+The same client has a live camera-producer gate:
+
+```sh
+/root/amp/rpmsg-slot-test --camera-seconds 10 --timeout-ms 5000
+```
+
+It captures the CSI luma stream, copies only into a currently free AMP slot,
+requeues the VI buffer, and only then publishes the RPMsg descriptor. If all
+four slots are remote-owned, it requeues immediately and records a no-slot
+drop rather than back-pressuring capture. The final report includes produced,
+delivered, requeued, submitted, completed and dropped counts; maximum VI-buffer
+hold time; and remote-completion latency percentiles.
+
+This is intentionally a one-copy functionality baseline: the producer copies
+the Y plane directly from the held VI buffer into the uncached AMP slot while
+calculating its expected CRC, then requeues the VI buffer before sending the
+descriptor. A matched 10-second run requeued and completed all 169 delivered
+frames with no errors or leaked ownership, but measured a 71.894 ms maximum VI
+hold. The planned low-latency experiment is VI DMA into a rotating shared
+capture pool; a second cached staging copy is deliberately not introduced here.
 
 ## Current assumptions
 

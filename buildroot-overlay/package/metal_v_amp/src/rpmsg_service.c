@@ -7,6 +7,7 @@
 #include "rpmsg_ns.h"
 #include "rpmsg_platform.h"
 #include "rpmsg_protocol.h"
+#include "rpmsg_slot_state.h"
 #include "amp_shm.h"
 #include "rpmsg_service.h"
 #include "uart3.h"
@@ -62,9 +63,34 @@ static unsigned long rejected_generation;
 static unsigned long endpoint_restarts;
 static unsigned long endpoint_restart_failures;
 static uint32_t endpoint_restart_pending;
+static unsigned long slot_submitted;
+static unsigned long slot_completed;
+static unsigned long slot_rejected;
+static unsigned long slot_crc_mismatch;
+static unsigned long slot_dropped_restart;
+static uint32_t slot_queue_head;
+static uint32_t slot_queue_tail;
+static struct k230_slot_ownership slot_ownership;
+
+struct k230_slot_job {
+    struct k230_rpmsg_slot_submit request;
+    struct k230_rpmsg_slot_complete response;
+    uint32_t src;
+    uint32_t processed;
+};
+
+static struct k230_slot_job slot_queue[K230_PAYLOAD_SLOT_COUNT];
 
 static int32_t echo_rx(void *payload, uint32_t payload_len, uint32_t src,
                        void *priv);
+
+static inline uint64_t read_cycle(void)
+{
+    uint64_t value;
+
+    __asm__ volatile ("rdcycle %0" : "=r"(value));
+    return value;
+}
 
 /*
  * The vring contents are only meaningful once Linux has attached and set
@@ -191,6 +217,98 @@ static int32_t send_protocol_error(
     return RL_RELEASE;
 }
 
+static int32_t enqueue_slot_request(void *payload, uint32_t payload_len,
+                                    uint32_t src,
+                                    const struct k230_rpmsg_protocol_header *header)
+{
+    struct k230_rpmsg_slot_submit request;
+    struct k230_slot_job *job;
+    uint16_t status;
+
+    if (header->generation != protocol_generation) {
+        ++rejected_generation;
+        ++slot_rejected;
+        return send_protocol_error(src, header,
+                                   K230_RPMSG_STATUS_STALE_GENERATION);
+    }
+    if (payload_len != sizeof(request)) {
+        ++slot_rejected;
+        return send_protocol_error(src, header,
+                                   K230_RPMSG_STATUS_BAD_SIZE);
+    }
+    memcpy(&request, payload, sizeof(request));
+    status = k230_rpmsg_validate_slot(&request);
+    if (status != K230_RPMSG_STATUS_OK) {
+        ++slot_rejected;
+        return send_protocol_error(src, header, status);
+    }
+    status = k230_slot_claim(&slot_ownership, request.slot_id);
+    if (status != K230_RPMSG_STATUS_OK) {
+        ++slot_rejected;
+        return send_protocol_error(src, header, status);
+    }
+
+    job = &slot_queue[slot_queue_tail];
+    memset(job, 0, sizeof(*job));
+    memcpy(&job->request, &request, sizeof(request));
+    job->src = src;
+    slot_queue_tail = (slot_queue_tail + 1U) % K230_PAYLOAD_SLOT_COUNT;
+    ++slot_submitted;
+    return RL_RELEASE;
+}
+
+static void reset_slot_queue(void)
+{
+    slot_dropped_restart += k230_slot_reset(&slot_ownership);
+    slot_queue_head = 0;
+    slot_queue_tail = 0;
+}
+
+static void process_slot_queue(void)
+{
+    struct k230_slot_job *job;
+    const uint8_t *payload;
+    uint64_t started;
+    uint16_t status;
+
+    if (!slot_ownership.depth || !echo_endpoint)
+        return;
+    job = &slot_queue[slot_queue_head];
+    if (!job->processed) {
+        payload = (const uint8_t *)(uintptr_t)
+            (K230_PAYLOAD_POOL_BASE + job->request.offset);
+        protocol_reply_header(&job->response.header, &job->request.header,
+                              K230_RPMSG_MSG_SLOT_COMPLETE,
+                              K230_RPMSG_STATUS_OK,
+                              sizeof(job->response));
+        job->response.slot_id = job->request.slot_id;
+        job->response.flags = job->request.flags;
+        job->response.offset = job->request.offset;
+        job->response.data_length = job->request.data_length;
+
+        started = read_cycle();
+        cache_invalidate_range(payload, job->request.padded_length);
+        amp_acquire_fence();
+        job->response.invalidate_cycles = read_cycle() - started;
+        started = read_cycle();
+        job->response.observed_crc =
+            amp_crc32(payload, job->request.data_length);
+        job->response.crc_cycles = read_cycle() - started;
+        status = job->response.observed_crc == job->request.expected_crc ?
+            K230_RPMSG_STATUS_OK : K230_RPMSG_STATUS_CRC_MISMATCH;
+        job->response.header.status = status;
+        if (status == K230_RPMSG_STATUS_CRC_MISMATCH)
+            ++slot_crc_mismatch;
+        job->processed = 1;
+    }
+    if (send_message(job->src, &job->response,
+                     sizeof(job->response)) != RL_SUCCESS)
+        return;
+    (void)k230_slot_release(&slot_ownership, job->request.slot_id);
+    slot_queue_head = (slot_queue_head + 1U) % K230_PAYLOAD_SLOT_COUNT;
+    ++slot_completed;
+}
+
 static int32_t protocol_rx(void *payload, uint32_t payload_len, uint32_t src)
 {
     uint8_t reply_buffer[RL_BUFFER_PAYLOAD_SIZE]
@@ -266,6 +384,9 @@ static int32_t protocol_rx(void *payload, uint32_t payload_len, uint32_t src)
             endpoint_restart_pending = 1;
         return RL_RELEASE;
 
+    case K230_RPMSG_MSG_SLOT_SUBMIT:
+        return enqueue_slot_request(payload, payload_len, src, &request);
+
     default:
         return send_protocol_error(src, &request,
                                    K230_RPMSG_STATUS_BAD_TYPE);
@@ -292,6 +413,7 @@ static void restart_endpoint_if_requested(void)
     if (!endpoint_restart_pending)
         return;
     endpoint_restart_pending = 0;
+    reset_slot_queue();
     if (!echo_endpoint ||
         rpmsg_lite_destroy_ept(rpmsg_instance, echo_endpoint) != RL_SUCCESS) {
         ++endpoint_restart_failures;
@@ -372,6 +494,7 @@ void rpmsg_service_poll(uint32_t mailbox_pending)
             announced = 1;
     }
     restart_endpoint_if_requested();
+    process_slot_queue();
 }
 
 void rpmsg_service_publish_stats(void)
@@ -397,6 +520,14 @@ void rpmsg_service_publish_stats(void)
     stats->endpoint_restarts = (uint32_t)endpoint_restarts;
     stats->endpoint_restart_failures =
         (uint32_t)endpoint_restart_failures;
+    stats->slot_submitted = (uint32_t)slot_submitted;
+    stats->slot_completed = (uint32_t)slot_completed;
+    stats->slot_rejected = (uint32_t)slot_rejected;
+    stats->slot_crc_mismatch = (uint32_t)slot_crc_mismatch;
+    stats->slot_dropped_restart = (uint32_t)slot_dropped_restart;
+    stats->slot_busy_mask = slot_ownership.busy_mask;
+    stats->slot_queue_depth = slot_ownership.depth;
+    stats->slot_queue_high_water = slot_ownership.high_water;
     stats->rx_callbacks = (uint32_t)rx_messages;
     stats->tx_sent = (uint32_t)tx_messages;
     stats->tx_failed = (uint32_t)tx_failures;

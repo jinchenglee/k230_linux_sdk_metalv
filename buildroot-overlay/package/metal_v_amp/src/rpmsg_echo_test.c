@@ -83,7 +83,7 @@ static int run_burst(const char *device, unsigned long loops,
 
 #define AMP_SHM_PHYS_BASE 0x1d000000UL
 #define STATS_OFFSET      0x0200U
-#define STATS_MAGIC       0x52535431U
+#define STATS_MAGIC       0x52535432U
 
 /*
  * The big-core UART drops characters under sustained output, so the firmware
@@ -97,7 +97,9 @@ static int show_stats(void)
         "tvq_avail_idx", "tvq_consumed", "rsc_status", "driver_ok", "announced",
         "generation_lo", "generation_hi", "hellos", "protocol_msgs",
         "rejected_ver", "rejected_caps", "rejected_gen", "endpoint_restarts",
-        "restart_failures"
+        "restart_failures", "slot_submitted", "slot_completed",
+        "slot_rejected", "slot_crc_mismatch", "slot_dropped_restart",
+        "slot_busy_mask", "slot_queue_depth", "slot_queue_high_water"
     };
     volatile uint32_t *stats;
     void *map;

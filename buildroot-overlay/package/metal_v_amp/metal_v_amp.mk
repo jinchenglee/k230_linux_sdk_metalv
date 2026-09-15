@@ -7,10 +7,12 @@
 METAL_V_AMP_SITE = $(realpath $(TOPDIR))/package/metal_v_amp/src
 METAL_V_AMP_SITE_METHOD = local
 METAL_V_AMP_INSTALL_IMAGES = YES
+METAL_V_AMP_DEPENDENCIES = vvcam libmmz
 
 define METAL_V_AMP_BUILD_CMDS
 	$(TARGET_MAKE_ENV) $(MAKE) -C $(@D) CROSS_COMPILE="$(TARGET_CROSS)" \
-		LINUX_CC="$(TARGET_CC)" LINUX_CFLAGS="$(TARGET_CFLAGS)" \
+		LINUX_CC="$(TARGET_CC)" \
+		LINUX_CFLAGS="$(TARGET_CFLAGS) -I$(STAGING_DIR)/usr/include/libdrm" \
 		RPMSG_LITE_DIR="$(realpath $(TOPDIR)/../../third_party/rpmsg-lite)"
 endef
 
@@ -23,6 +25,8 @@ define METAL_V_AMP_INSTALL_TARGET_CMDS
 		$(TARGET_DIR)/root/amp/amp-shm-test
 	$(INSTALL) -D -m 0755 $(@D)/rpmsg-echo-test \
 		$(TARGET_DIR)/root/amp/rpmsg-echo-test
+	$(INSTALL) -D -m 0755 $(@D)/rpmsg-slot-test \
+		$(TARGET_DIR)/root/amp/rpmsg-slot-test
 	$(INSTALL) -D -m 0755 $(@D)/rpmsg-regression.sh \
 		$(TARGET_DIR)/root/amp/rpmsg-regression.sh
 	$(INSTALL) -D -m 0755 $(@D)/amp-shm-cost.sh \

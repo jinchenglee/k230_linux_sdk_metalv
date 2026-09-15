@@ -11,7 +11,7 @@
  * The big-core UART drops characters under sustained output, so counters are
  * published here and read from Linux via /dev/mem instead. */
 #define K230_RPMSG_STATS_OFFSET  UINT32_C(0x0200)
-#define K230_RPMSG_STATS_MAGIC   UINT32_C(0x52535431)
+#define K230_RPMSG_STATS_MAGIC   UINT32_C(0x52535432) /* "RST2" */
 
 struct k230_rpmsg_stats {
     uint32_t magic;
@@ -37,6 +37,14 @@ struct k230_rpmsg_stats {
     uint32_t rejected_generation;
     uint32_t endpoint_restarts;
     uint32_t endpoint_restart_failures;
+    uint32_t slot_submitted;
+    uint32_t slot_completed;
+    uint32_t slot_rejected;
+    uint32_t slot_crc_mismatch;
+    uint32_t slot_dropped_restart;
+    uint32_t slot_busy_mask;
+    uint32_t slot_queue_depth;
+    uint32_t slot_queue_high_water;
 };
 
 #define K230_RPMSG_BUFFER_BASE   UINT64_C(0x1d500000)
