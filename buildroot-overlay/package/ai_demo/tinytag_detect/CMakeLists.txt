@@ -5,9 +5,9 @@ if(CMAKE_TOOLCHAIN_FILE MATCHES "buildroot/toolchainfile.cmake")
     set(src main.cc tinytag_det.cc tag_crop_decoder.cc video_hw_codec.cc)
     include(../common/ai_demo_cml_common)
 
-    # ai_demo_cml_common's link line doesn't know about apriltag (no other
-    # ai_demo package needs it); add it here for the CV crop-decode stage.
-    # apriltag headers/lib are found via the cross toolchain's --sysroot
+    # ai_demo_cml_common's link line doesn't know about the tag decoders;
+    # add their minimal detector libraries here for the CV crop-decode stage.
+    # Their headers/libraries are found via the cross toolchain's --sysroot
     # default search paths (same as ai_demo_cml_common's own opencv/display
     # libs), so no extra include_directories/link_directories needed.
     #
@@ -23,7 +23,21 @@ if(CMAKE_TOOLCHAIN_FILE MATCHES "buildroot/toolchainfile.cmake")
     # the sysroot as opencv_videoio's own transitive dependencies, but
     # opencv_videoio doesn't re-export their symbols to our own direct API
     # calls, so they need to be linked explicitly here too.
-    target_link_libraries(${bin} PRIVATE apriltag opencv_videoio avcodec avformat avutil swscale k230_osd)
+    target_link_libraries(${bin} PRIVATE
+        -Wl,--start-group
+        apriltag
+        aruco2
+        aruco_nano_dictionary
+        opencv_videoio
+        opencv_imgproc
+        opencv_core
+        avcodec
+        avformat
+        avutil
+        swscale
+        k230_osd
+        -Wl,--end-group
+    )
 
     # apriltag-rvv: the same RVV-accelerated AprilTag detector
     # apriltag_demo.elf's --rvv mode uses, offered here as an alternative
@@ -51,7 +65,7 @@ if(CMAKE_TOOLCHAIN_FILE MATCHES "buildroot/toolchainfile.cmake")
         -Wl,--end-group
     )
 
-    # tinytag-v11_k230-v4c.int8.kmodel is the K230-safe build: the
+    # tinytag-v11_k230-v4c.int8.kmodel is the stock K230-safe build: the
     # previous tinytag-v4c-context.* kmodels (removed from utils/ here) hit
     # a known nncase-Simulator-vs-real-KPU execution mismatch on this
     # hardware. On real hardware this wasn't just wrong detections: it
@@ -63,11 +77,19 @@ if(CMAKE_TOOLCHAIN_FILE MATCHES "buildroot/toolchainfile.cmake")
     # safe on real K230 hardware and is a drop-in replacement -- no
     # app-code changes were needed, just this kmodel swap. Do not swap in
     # a different/older kmodel here without first confirming on real
-    # hardware that it doesn't reproduce this corruption.
-    install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/utils/tinytag-v11_k230-v4c.int8.kmodel
+    # hardware that it doesn't reproduce this corruption. The optional
+    # tinytag-v40c-unfrozen-moderate30ep.int8.kmodel was compiled through
+    # tools/tinytag_kmodel's default K230-safe dilation rewrite and passed
+    # host fidelity plus real-K230 ProfileOps/cleanup testing on 2026-09-15.
+    # Stock remains the run.sh and boot-service default.
+    install(FILES
+            ${CMAKE_CURRENT_SOURCE_DIR}/utils/tinytag-v11_k230-v4c.int8.kmodel
+            ${CMAKE_CURRENT_SOURCE_DIR}/utils/tinytag-v40c-unfrozen-moderate30ep.int8.kmodel
             DESTINATION /root/app/${PROJECT_NAME}/)
-    # PROGRAMS (not FILES) so the launcher lands executable on a fresh flash.
-    install(PROGRAMS ${CMAKE_CURRENT_SOURCE_DIR}/utils/run.sh
+    # PROGRAMS (not FILES) so the launchers land executable on a fresh flash.
+    install(PROGRAMS
+            ${CMAKE_CURRENT_SOURCE_DIR}/utils/run.sh
+            ${CMAKE_CURRENT_SOURCE_DIR}/utils/run_v40c.sh
             DESTINATION /root/app/${PROJECT_NAME}/)
 else()
     message(FATAL_ERROR

@@ -22,10 +22,8 @@ struct TagDetection
 // to a *traditional* CV tag decoder -- nothing neural past this point.
 //
 // TinyTagDet only ever talks to this interface, not to a specific detector
-// implementation, on purpose: the plain AprilTag C library below is a
-// correct-but-unoptimized default. A future backend (e.g. apriltag-rvv, or
-// other optimized RVV post-processing kernels) can be dropped in without
-// touching the neural proposal/decode_proposals code at all.
+// implementation, on purpose. AprilTag C, apriltag-rvv, ArUco Nano, and
+// ArUco2 all plug in without changing neural proposal/decode_proposals code.
 class TagCropDecoder
 {
 public:
@@ -39,7 +37,7 @@ public:
     virtual std::vector<TagDetection> detect(const cv::Mat &crop) = 0;
 };
 
-// Default backend: the standard AprilRobotics apriltag C library already
+// Reference backend: the standard AprilRobotics apriltag C library already
 // built into this SDK (buildroot-overlay/package/apriltag) -- the same
 // library used by buildroot-overlay/package/apriltag_demo, used here
 // unmodified via its public API (not the workload-instrumented ABI that
@@ -109,13 +107,12 @@ private:
     int mode_;
 };
 
-// Picks a crop-decode backend based on the TINYTAG_CV_DETECTOR environment
-// variable: unset/"rvv" -> AprilTagRVVDecoder (production default),
-// "c" -> AprilTagCDecoder (reference fallback). All call sites (live camera,
-// video-file,
-// image mode) should construct their decoder through this instead of
-// naming a concrete class directly, so they can't drift out of sync with
-// each other.
+// Picks a crop-decode backend based on TINYTAG_CV_DETECTOR: unset,
+// "aruco-nano", or "nano" -> ArUco Nano (production default), "aruco2" ->
+// ArUco2, "rvv" -> AprilTagRVVDecoder, and "c" -> AprilTagCDecoder.
+// TINYTAG_ARUCO_MODE selects strict (default) or tolerant bit acceptance for
+// the ArUco backends. All live, video-file, and image call sites use this
+// factory so they cannot drift out of sync.
 std::shared_ptr<TagCropDecoder> make_crop_decoder();
 
 #endif

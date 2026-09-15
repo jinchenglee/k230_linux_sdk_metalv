@@ -1,0 +1,7 @@
+nncase==2.11.0
+nncase-kpu==2.11.0
+numpy==1.26.4
+onnx==1.16.2
+onnxruntime==1.19.2
+opencv-python-headless==4.10.0.84
+

@@ -2,9 +2,9 @@
 
 Two-stage AprilTag detector for K230: a small neural network (`TinyTagDet`,
 architecture `context_k230` -- see `experimental/README.md`) proposes ROIs
-on a downscaled frame, then a traditional CV AprilTag decoder
-(`AprilTagCDecoder`, the standard AprilRobotics C library) reads each
-proposal's ID from the full-resolution image. Ships as `tinytag_detect.elf`.
+on a downscaled frame, then a selectable traditional CV decoder reads each
+proposal's AprilTag 36h11 ID from the full-resolution image. ArUco Nano is the
+production default. Ships as `tinytag_detect.elf`.
 
 This file tracks the *current* architecture/state. For the investigation
 history behind why it looks like this (the K230 KPU dilated-conv bug and
@@ -16,6 +16,21 @@ below), see `experimental/README.md` -- that's the log; this is the map.
 ```
 tinytag_detect.elf <kmodel> <input> <heatmap_thres> <max_proposals> <roi_expand> <profile_mode> [roi_iou_thres] [--debug]
 ```
+
+Two KPU INT8 models are installed:
+
+- `run.sh` uses the proven stock `tinytag-v11_k230-v4c.int8.kmodel` and
+  remains the default used by the boot/button service.
+- `run_v40c.sh` uses the optional
+  `tinytag-v40c-unfrozen-moderate30ep.int8.kmodel`.
+- Both live launchers use threshold 0.35, an 8-proposal cap, ROI expansion 1.5,
+  and the default ArUco Nano strict decoder. Use direct commands with identical
+  explicit arguments for controlled model comparisons.
+
+The v40c model was compiled with the automatic K230 dilated-depthwise
+workaround documented in `tools/tinytag_kmodel/README.md`. That directory is
+also the reproducible path for compiling and validating future models; source
+`.pt` and `.onnx` models remain external to this repository.
 
 `<input>` is one of:
 - `"None"`: live CSI camera, on-screen overlay, `q`+enter to quit.
@@ -95,11 +110,10 @@ notes in `docs/commits/tinytag-crop-threshold-commit.txt`.
                      [4] post_process(): per proposal
                                    |
                      crop = full_res_gray(roi)   ZERO-COPY view
-                     (no .clone() -- AprilTagCDecoder::detect()
-                      reads crop.step as a real stride, see below)
+                     (no .clone(); decoder reads crop.step as stride)
                                    |
                      TagCropDecoder::detect(crop)
-                     [apriltag-rvv by default, quad_decimate=1.0;
+                     [ArUco Nano strict by default, native resolution;
                       dominant real-deployment CPU cost]
                                    |
                                    v
@@ -219,11 +233,16 @@ upscaling crop *pixels* before decode, an idea raised alongside the
 
 ## CV detector backend: swappable, `TINYTAG_CV_DETECTOR`
 
-Two crop-decode backends, both `TagCropDecoder` implementations, both
-zero-copy (accept a plain `cv::Mat` ROI view, no clone -- see above), both
-default to no quad-search decimation (factor 1.0):
+Four crop-decode backends implement `TagCropDecoder` and accept a zero-copy
+grayscale `cv::Mat` ROI view. All use the AprilTag 36h11 dictionary at native
+ROI resolution:
 
-- **`AprilTagRVVDecoder`** (unset or `TINYTAG_CV_DETECTOR=rvv`, default):
+- **ArUco Nano** (unset or `TINYTAG_CV_DETECTOR=aruco-nano`, with `nano`
+  accepted as an alias; default): the minimal header-only detector plus the
+  standalone OpenCV dictionary translation unit already used by `aruco_demo`.
+- **ArUco2** (`TINYTAG_CV_DETECTOR=aruco2`): the current detector-only ArUco2
+  library already used by `aruco_demo`.
+- **`AprilTagRVVDecoder`** (`TINYTAG_CV_DETECTOR=rvv`):
   the apriltag-rvv Rust crate (`apriltag_demo/lib/libapriltag_rvv.a`), the same
   RVV-accelerated detector `apriltag_demo.elf --rvv` uses. Selected via
   `make_crop_decoder()`, used consistently by every call site (live
@@ -233,8 +252,30 @@ default to no quad-search decimation (factor 1.0):
   demo defaults for the other controls: minimum blob 25, exact codewords,
   edge refinement off, and decode sharpening off.
 
-**Historical measurement (before RVV became the default and before the C
-backend settings were aligned), 499-frame real footage (`bos_logs_video/log181_main_bot_left.mp4`,
+The ArUco backends use `TINYTAG_ARUCO_MODE=strict|tolerant`; unset means
+`strict`. Strict requires exact payload and border bits. Tolerant enables each
+implementation's maximum dictionary correction and border-error allowance and
+is intended for experimentation. Both use the existing ArUco live default
+minimum contour side of 10 pixels. ArUco does not expose AprilTag decision
+margin or corrected-bit count, so those result fields are unavailable.
+
+Examples:
+
+```sh
+TINYTAG_CV_DETECTOR=aruco-nano TINYTAG_ARUCO_MODE=strict ./run_v40c.sh
+TINYTAG_CV_DETECTOR=aruco2 TINYTAG_ARUCO_MODE=tolerant ./run_v40c.sh
+TINYTAG_CV_DETECTOR=rvv ./run.sh
+```
+
+On the K230 small core, a 65-frame `220-225.mp4` smoke test using v40c,
+threshold 0.35, proposal cap 8, ROI expansion 1.5, and strict mode completed
+cleanly for both ArUco backends. Each produced 190 decoded detections with
+identical per-frame counts. Mean steady-state crop-decode time was 18.60 ms
+for ArUco2 and 7.19 ms for ArUco Nano. Nano is therefore the edge-deployment
+default; ArUco2 remains available as an explicit backend option.
+
+**Historical RVV-vs-C measurement (before the C backend settings were
+aligned), 499-frame real footage (`bos_logs_video/log181_main_bot_left.mp4`,
 2228 total ROIs), per-ROI, split by outcome** -- a naive aggregate
 comparison is confounded here: a detector that gives up on more ROIs does
 *less work on average* for reasons unrelated to raw per-op speed (a miss

@@ -82,11 +82,12 @@ void print_usage(const char *name)
          << "                  and whole-frame wall time) for confirmed detections\n"
          << "\n"
          << "Environment:\n"
-         << "  TINYTAG_CV_DETECTOR   CV crop-decode backend: unset/\"rvv\" (default) uses\n"
-         << "                        apriltag-rvv; \"c\" uses the reference AprilTag C\n"
-         << "                        library. Both use factor 1; C otherwise matches the\n"
-         << "                        demo defaults (blob 25, exact codes, no edge refine or\n"
-         << "                        sharpening).\n"
+         << "  TINYTAG_CV_DETECTOR   CV crop-decode backend: aruco-nano (default; alias\n"
+         << "                        nano), aruco2, rvv, or c. All use native\n"
+         << "                        ROI resolution and the AprilTag 36h11 dictionary.\n"
+         << "  TINYTAG_ARUCO_MODE    ArUco acceptance: strict (default, exact payload and\n"
+         << "                        border bits) or tolerant (maximum correction and\n"
+         << "                        border-error allowance). Ignored by rvv and c.\n"
          << "  TINYTAG_VIDEO_CODEC   Video-file mode output encode: unset/\"hw\" (default) uses\n"
          << "                        the hardware h264_v4l2m2m encoder; \"sw\" forces\n"
          << "                        fully-software encode.\n"
@@ -276,7 +277,7 @@ void ai_proc(char *argv[], int video_device)
             SENSOR_HEIGHT, csi_width, csi_height, csi_stride);
 
     int profile_mode = atoi(argv[6]);
-    auto decoder = make_crop_decoder(); // Default AprilTagRVVDecoder; TINYTAG_CV_DETECTOR=c selects AprilTagCDecoder
+    auto decoder = make_crop_decoder(); // ArUco Nano default; environment selects alternatives
     // Profile timing is opt-in. A confirmed detection is represented by the
     // result vector, not by timing output, so production does not need to
     // construct or stream per-stage diagnostics.
@@ -664,7 +665,7 @@ int run_video_file(const char *kmodel_path, const char *video_path, float heatma
         return -1;
     }
 
-    auto decoder = make_crop_decoder(); // Default AprilTagRVVDecoder; TINYTAG_CV_DETECTOR=c selects AprilTagCDecoder
+    auto decoder = make_crop_decoder(); // ArUco Nano default; environment selects alternatives
     TinyTagDet det(kmodel_path, heatmap_thres, max_proposals, roi_expand, roi_iou_thres, decoder,
                    debug_mode);
 
@@ -882,7 +883,7 @@ int main(int argc, char *argv[])
                                roi_iou_thres, profile_mode);
     }
 
-    auto decoder = make_crop_decoder(); // Default AprilTagRVVDecoder; TINYTAG_CV_DETECTOR=c selects AprilTagCDecoder
+    auto decoder = make_crop_decoder(); // ArUco Nano default; environment selects alternatives
     TinyTagDet det(kmodel_path, heatmap_thres, max_proposals, roi_expand, roi_iou_thres, decoder,
                    profile_mode);
 

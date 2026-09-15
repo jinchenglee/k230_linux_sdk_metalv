@@ -1,5 +1,5 @@
 // Standalone ground-truth-quality probe: runs a TagCropDecoder backend
-// (TINYTAG_CV_DETECTOR's "c"/"rvv" choice, reused directly -- see
+// (TINYTAG_CV_DETECTOR choice, reused directly -- see
 // tag_crop_decoder.h) on the FULL frame (not a neural-proposed ROI crop),
 // optionally upscaled first, to see whether a stronger full-frame detector
 // config recovers more real tags than the plain reference-C-at-1x baseline
@@ -21,7 +21,7 @@ int main(int argc, char **argv)
 {
     if (argc < 4)
     {
-        std::cerr << "usage: full_frame_detect <video> <backend c|rvv> <scale e.g. 1.0|2.0> [max_frames] [out_json]" << std::endl;
+        std::cerr << "usage: full_frame_detect <video> <backend aruco2|aruco-nano|rvv|c> <scale e.g. 1.0|2.0> [max_frames] [out_json]" << std::endl;
         return 1;
     }
     const char *video_path = argv[1];
