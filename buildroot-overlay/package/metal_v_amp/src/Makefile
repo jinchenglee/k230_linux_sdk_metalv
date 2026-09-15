@@ -35,8 +35,10 @@ $(BIN): $(ELF)
 $(LINUX_TEST): amp_shm_test.c amp_shm.h mailbox.h
 	$(LINUX_CC) $(LINUX_CFLAGS) -o $@ amp_shm_test.c
 
-$(RPMSG_TEST): rpmsg_echo_test.c
+$(RPMSG_TEST): rpmsg_echo_test.c rpmsg_protocol.h
 	$(LINUX_CC) $(LINUX_CFLAGS) -o $@ rpmsg_echo_test.c
+
+rpmsg_service.o: rpmsg_service.c rpmsg_service.h rpmsg_protocol.h
 
 %.o: %.c
 	$(CC) $(CFLAGS) -c -o $@ $<

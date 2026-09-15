@@ -196,6 +196,30 @@ frames and ROIs in separately managed shared memory and send descriptors over
 RPMsg. See `docs/notes/k230_amp_rpmsg_lite.md` for the memory map, build and
 flash requirements, validation procedure, and troubleshooting.
 
+### Versioned service protocol
+
+The raw echo behavior remains available for transport sweeps and queue-pressure
+tests. Messages beginning with the `K2AM` magic instead use the versioned
+control header in `src/rpmsg_protocol.h`. A HELLO exchanges the protocol
+version, required capability bits, and the current nonzero firmware generation.
+Every subsequent service request and response carries that generation; stale
+requests are rejected rather than executed.
+
+Run the protocol gate independently:
+
+```sh
+/root/amp/rpmsg-echo-test --protocol
+/root/amp/rpmsg-echo-test --restart
+```
+
+The first command verifies a successful handshake, version and capability
+mismatch rejection, stale-generation rejection, and a correct-generation typed
+echo. The second requests deferred firmware-side endpoint teardown/recreation,
+requires the generation to advance, rejects the old generation, and verifies
+the recreated endpoint with the new generation. Both checks are included in
+`rpmsg-regression.sh`. Firmware and test client must be deployed as a matched
+pair.
+
 ## Current assumptions
 
 The first payload relies on SPL/U-Boot having enabled the UART3 clock and board

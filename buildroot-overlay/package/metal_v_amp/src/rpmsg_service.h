@@ -25,7 +25,18 @@ struct k230_rpmsg_stats {
     uint32_t rvq_consumed;   /* vq_available_idx this core has consumed */
     uint32_t tvq_avail_idx;
     uint32_t tvq_consumed;
-    uint32_t reserved[5];
+    uint32_t rsc_status;
+    uint32_t driver_ok;
+    uint32_t announced;
+    uint32_t generation_lo;
+    uint32_t generation_hi;
+    uint32_t hellos;
+    uint32_t protocol_messages;
+    uint32_t rejected_version;
+    uint32_t rejected_capabilities;
+    uint32_t rejected_generation;
+    uint32_t endpoint_restarts;
+    uint32_t endpoint_restart_failures;
 };
 
 #define K230_RPMSG_BUFFER_BASE   UINT64_C(0x1d500000)

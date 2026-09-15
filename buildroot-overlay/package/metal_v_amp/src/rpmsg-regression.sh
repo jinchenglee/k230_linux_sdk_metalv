@@ -53,6 +53,7 @@ check "firmware stats block published" sh -c "\"$TEST\" --stats | grep -q '^magi
 check "virtio driver_ok" sh -c "test \"\$($TEST --stats | awk '\$1==\"driver_ok\"{print \$2}')\" = 1"
 check "name service announced" sh -c "test \"\$($TEST --stats | awk '\$1==\"announced\"{print \$2}')\" = 1"
 check "no kernel BUG/warning" sh -c "! dmesg | grep -qiE 'BUG: sleeping|call trace|kernel BUG'"
+check "protocol generation published" sh -c "test \"\$($TEST --stats | awk '\$1==\"generation_lo\"{print \$2}')\" -gt 0"
 
 if [ "$mode" = postboot ]; then
 	# Regression guard: the first pass over the 256-entry descriptor table used
@@ -61,6 +62,10 @@ if [ "$mode" = postboot ]; then
 	check "first 1000 ping-pong lossless" echo_run --loops 1000 --timeout-ms 300
 	check "first 300 burst lossless" echo_run --burst --loops 300 --size 496 --timeout-ms 500
 fi
+
+echo "== protocol lifecycle"
+check "version/capability handshake and stale rejection" echo_run --protocol --timeout-ms 1000
+check "firmware endpoint restart and generation advance" echo_run --restart --timeout-ms 1000
 
 echo "== correctness"
 if [ "$mode" = quick ]; then
@@ -89,14 +94,19 @@ consumed=$(stat_of rvq_consumed)
 rxcb=$(stat_of rx_callbacks)
 fetch=$(stat_of fetch_rx)
 txf=$(stat_of tx_failed)
+restarts=$(stat_of endpoint_restarts)
+restart_failures=$(stat_of restart_failures)
 # rvq_avail_idx and rvq_consumed are 16-bit vring indices and wrap at 65536;
 # fetch_rx is a free-running counter. Compare modulo the vring index width.
 fetch_wrapped=$((fetch % 65536))
 echo "        rvq_avail=$avail rvq_consumed=$consumed fetch_rx=$fetch (mod 65536 = $fetch_wrapped) rx_cb=$rxcb tx_failed=$txf"
+echo "        endpoint_restarts=$restarts restart_failures=$restart_failures"
 check "ring fully drained (rvq_consumed == rvq_avail_idx)" test "$consumed" = "$avail"
 check "no dropped fetches (fetch_rx == rvq_consumed mod 2^16)" test "$fetch_wrapped" = "$consumed"
 check "every fetch delivered (rx_callbacks == fetch_rx)" test "$rxcb" = "$fetch"
 check "no failed sends" test "$txf" = 0
+check "endpoint restart recorded" test "$restarts" -ge 1
+check "no endpoint restart failures" test "$restart_failures" = 0
 
 echo
 echo "passed=$pass failed=$fail"

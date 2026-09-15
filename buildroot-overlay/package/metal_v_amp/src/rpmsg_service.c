@@ -1,10 +1,12 @@
 #include <stdint.h>
+#include <string.h>
 
 #include "cache.h"
 #include "rpmsg_config.h"
 #include "rpmsg_lite.h"
 #include "rpmsg_ns.h"
 #include "rpmsg_platform.h"
+#include "rpmsg_protocol.h"
 #include "amp_shm.h"
 #include "rpmsg_service.h"
 #include "uart3.h"
@@ -51,6 +53,18 @@ static unsigned long tx_messages;
 static unsigned long tx_failures;
 static uint32_t announced;
 static uint32_t driver_ok;
+static uint64_t protocol_generation;
+static unsigned long protocol_hellos;
+static unsigned long protocol_messages;
+static unsigned long rejected_version;
+static unsigned long rejected_capabilities;
+static unsigned long rejected_generation;
+static unsigned long endpoint_restarts;
+static unsigned long endpoint_restart_failures;
+static uint32_t endpoint_restart_pending;
+
+static int32_t echo_rx(void *payload, uint32_t payload_len, uint32_t src,
+                       void *priv);
 
 /*
  * The vring contents are only meaningful once Linux has attached and set
@@ -117,20 +131,182 @@ static void resource_table_init(void)
     cache_clean_range((const void *)table, sizeof(initial));
 }
 
-static int32_t echo_rx(void *payload, uint32_t payload_len, uint32_t src,
-                       void *priv)
+static void protocol_advance_generation(void)
 {
-    int32_t ret;
+    volatile struct k230_rpmsg_stats *stats =
+        (volatile struct k230_rpmsg_stats *)(uintptr_t)
+        (AMP_SHM_PHYS_BASE + K230_RPMSG_STATS_OFFSET);
 
-    (void)priv;
-    ++rx_messages;
-    ret = rpmsg_lite_send(rpmsg_instance, echo_endpoint, src, payload,
-                          payload_len, RL_DONT_BLOCK);
+    if (!protocol_generation) {
+        cache_invalidate_range((const void *)stats, sizeof(*stats));
+        if (stats->magic == K230_RPMSG_STATS_MAGIC)
+            protocol_generation =
+                ((uint64_t)stats->generation_hi << 32) |
+                stats->generation_lo;
+    }
+    ++protocol_generation;
+    if (!protocol_generation)
+        protocol_generation = 1;
+}
+
+static int32_t send_message(uint32_t dst, void *payload,
+                            uint32_t payload_len)
+{
+    int32_t ret = rpmsg_lite_send(rpmsg_instance, echo_endpoint, dst, payload,
+                                  payload_len, RL_DONT_BLOCK);
+
     if (ret == RL_SUCCESS)
         ++tx_messages;
     else
         ++tx_failures;
+    return ret;
+}
+
+static void protocol_reply_header(struct k230_rpmsg_protocol_header *reply,
+                                  const struct k230_rpmsg_protocol_header *request,
+                                  uint16_t type, uint16_t status,
+                                  uint32_t message_size)
+{
+    memset(reply, 0, sizeof(*reply));
+    reply->magic = K230_RPMSG_PROTOCOL_MAGIC;
+    reply->version = K230_RPMSG_PROTOCOL_VERSION;
+    reply->header_size = K230_RPMSG_PROTOCOL_HEADER_SIZE;
+    reply->type = type;
+    reply->status = status;
+    reply->message_size = message_size;
+    reply->generation = protocol_generation;
+    reply->sequence = request ? request->sequence : 0;
+    reply->capabilities = K230_RPMSG_CAPABILITIES;
+}
+
+static int32_t send_protocol_error(
+    uint32_t dst, const struct k230_rpmsg_protocol_header *request,
+    uint16_t status)
+{
+    struct k230_rpmsg_protocol_header reply;
+
+    protocol_reply_header(&reply, request, K230_RPMSG_MSG_ERROR, status,
+                          sizeof(reply));
+    (void)send_message(dst, &reply, sizeof(reply));
     return RL_RELEASE;
+}
+
+static int32_t protocol_rx(void *payload, uint32_t payload_len, uint32_t src)
+{
+    uint8_t reply_buffer[RL_BUFFER_PAYLOAD_SIZE]
+        __attribute__((aligned(sizeof(uint64_t))));
+    struct k230_rpmsg_protocol_header request;
+    struct k230_rpmsg_protocol_header reply;
+    uint32_t reply_len;
+
+    ++protocol_messages;
+    if (payload_len < sizeof(request))
+        return send_protocol_error(src, 0, K230_RPMSG_STATUS_BAD_HEADER);
+
+    memcpy(&request, payload, sizeof(request));
+    if (request.version != K230_RPMSG_PROTOCOL_VERSION) {
+        ++rejected_version;
+        return send_protocol_error(src, &request,
+                                   K230_RPMSG_STATUS_BAD_VERSION);
+    }
+    if (request.header_size != sizeof(request))
+        return send_protocol_error(src, &request,
+                                   K230_RPMSG_STATUS_BAD_HEADER);
+    if (request.message_size != payload_len ||
+        request.message_size > RL_BUFFER_PAYLOAD_SIZE)
+        return send_protocol_error(src, &request,
+                                   K230_RPMSG_STATUS_BAD_SIZE);
+
+    switch (request.type) {
+    case K230_RPMSG_MSG_HELLO:
+        ++protocol_hellos;
+        if (request.capabilities & ~K230_RPMSG_CAPABILITIES) {
+            ++rejected_capabilities;
+            return send_protocol_error(
+                src, &request,
+                K230_RPMSG_STATUS_UNSUPPORTED_CAPABILITY);
+        }
+        if (payload_len != sizeof(request))
+            return send_protocol_error(src, &request,
+                                       K230_RPMSG_STATUS_BAD_SIZE);
+        protocol_reply_header(&reply, &request,
+                              K230_RPMSG_MSG_HELLO_REPLY,
+                              K230_RPMSG_STATUS_OK, sizeof(reply));
+        (void)send_message(src, &reply, sizeof(reply));
+        return RL_RELEASE;
+
+    case K230_RPMSG_MSG_ECHO:
+        if (request.generation != protocol_generation) {
+            ++rejected_generation;
+            return send_protocol_error(src, &request,
+                                       K230_RPMSG_STATUS_STALE_GENERATION);
+        }
+        reply_len = payload_len;
+        memcpy(reply_buffer, payload, payload_len);
+        protocol_reply_header(&reply, &request,
+                              K230_RPMSG_MSG_ECHO_REPLY,
+                              K230_RPMSG_STATUS_OK, reply_len);
+        memcpy(reply_buffer, &reply, sizeof(reply));
+        (void)send_message(src, reply_buffer, reply_len);
+        return RL_RELEASE;
+
+    case K230_RPMSG_MSG_RESTART_ENDPOINT:
+        if (request.generation != protocol_generation) {
+            ++rejected_generation;
+            return send_protocol_error(src, &request,
+                                       K230_RPMSG_STATUS_STALE_GENERATION);
+        }
+        if (payload_len != sizeof(request))
+            return send_protocol_error(src, &request,
+                                       K230_RPMSG_STATUS_BAD_SIZE);
+        protocol_reply_header(&reply, &request,
+                              K230_RPMSG_MSG_RESTART_ENDPOINT_REPLY,
+                              K230_RPMSG_STATUS_OK, sizeof(reply));
+        if (send_message(src, &reply, sizeof(reply)) == RL_SUCCESS)
+            endpoint_restart_pending = 1;
+        return RL_RELEASE;
+
+    default:
+        return send_protocol_error(src, &request,
+                                   K230_RPMSG_STATUS_BAD_TYPE);
+    }
+}
+
+static int32_t echo_rx(void *payload, uint32_t payload_len, uint32_t src,
+                       void *priv)
+{
+    uint32_t magic = 0;
+
+    (void)priv;
+    ++rx_messages;
+    if (payload_len >= sizeof(magic))
+        memcpy(&magic, payload, sizeof(magic));
+    if (magic == K230_RPMSG_PROTOCOL_MAGIC)
+        return protocol_rx(payload, payload_len, src);
+    (void)send_message(src, payload, payload_len);
+    return RL_RELEASE;
+}
+
+static void restart_endpoint_if_requested(void)
+{
+    if (!endpoint_restart_pending)
+        return;
+    endpoint_restart_pending = 0;
+    if (!echo_endpoint ||
+        rpmsg_lite_destroy_ept(rpmsg_instance, echo_endpoint) != RL_SUCCESS) {
+        ++endpoint_restart_failures;
+        return;
+    }
+    echo_endpoint = 0;
+    echo_endpoint = rpmsg_lite_create_ept(
+        rpmsg_instance, K230_RPMSG_ENDPOINT, echo_rx, 0,
+        &echo_endpoint_context);
+    if (!echo_endpoint) {
+        ++endpoint_restart_failures;
+        return;
+    }
+    protocol_advance_generation();
+    ++endpoint_restarts;
 }
 
 /*
@@ -152,6 +328,7 @@ static void used_ring_allow_notify(struct virtqueue *vq)
 
 int rpmsg_service_init(void)
 {
+    protocol_advance_generation();
     resource_table_init();
     rpmsg_instance = rpmsg_lite_remote_init(
         (void *)(uintptr_t)K230_RPMSG_SHMEM_BASE,
@@ -194,6 +371,7 @@ void rpmsg_service_poll(uint32_t mailbox_pending)
                               "rpmsg-raw", RL_NS_CREATE) == RL_SUCCESS)
             announced = 1;
     }
+    restart_endpoint_if_requested();
 }
 
 void rpmsg_service_publish_stats(void)
@@ -206,9 +384,19 @@ void rpmsg_service_publish_stats(void)
 
     stats->magic = K230_RPMSG_STATS_MAGIC;
     stats->link_up = (uint32_t)rpmsg_service_link_up();
-    stats->reserved[0] = rpmsg_service_rsc_status();
-    stats->reserved[1] = driver_ok;
-    stats->reserved[2] = announced;
+    stats->rsc_status = rpmsg_service_rsc_status();
+    stats->driver_ok = driver_ok;
+    stats->announced = announced;
+    stats->generation_lo = (uint32_t)protocol_generation;
+    stats->generation_hi = (uint32_t)(protocol_generation >> 32);
+    stats->hellos = (uint32_t)protocol_hellos;
+    stats->protocol_messages = (uint32_t)protocol_messages;
+    stats->rejected_version = (uint32_t)rejected_version;
+    stats->rejected_capabilities = (uint32_t)rejected_capabilities;
+    stats->rejected_generation = (uint32_t)rejected_generation;
+    stats->endpoint_restarts = (uint32_t)endpoint_restarts;
+    stats->endpoint_restart_failures =
+        (uint32_t)endpoint_restart_failures;
     stats->rx_callbacks = (uint32_t)rx_messages;
     stats->tx_sent = (uint32_t)tx_messages;
     stats->tx_failed = (uint32_t)tx_failures;

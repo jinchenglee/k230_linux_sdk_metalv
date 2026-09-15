@@ -75,10 +75,49 @@ platform port provides:
 - RISC-V memory barriers; and
 - physical-address cache clean/invalidate operations.
 
-Endpoint 30 is an echo service. Once Linux initializes the link, the firmware
-announces it as `rpmsg-raw`, allowing the stock Linux character driver to
-create `/dev/rpmsg0`. The UART3 status display reports
-`RPMsg link/rx/tx`.
+Endpoint 30 retains its raw echo service for transport diagnostics. Once Linux
+initializes the link, the firmware announces it as `rpmsg-raw`, allowing the
+stock Linux character driver to create `/dev/rpmsg0`. The UART3 status display
+reports `RPMsg link/rx/tx`.
+
+## Versioned service protocol
+
+A payload beginning with magic `K2AM` is interpreted as the fixed-width
+protocol in `buildroot-overlay/package/metal_v_amp/src/rpmsg_protocol.h`.
+Protocol version 1 has a 40-byte header containing message size and type,
+status, request sequence, firmware generation, and capability bits. The
+currently advertised capabilities are typed echo, generation enforcement, and
+firmware endpoint restart.
+
+HELLO is the only request that does not require the current generation. It
+returns the supported capabilities and a nonzero generation. ECHO and
+RESTART_ENDPOINT are rejected with `STALE_GENERATION` unless their generation
+matches. An accepted endpoint restart sends its acknowledgement first, then the
+main loop destroys and recreates endpoint 30 and advances the generation.
+Recreation is deliberately deferred until after virtqueue callback dispatch;
+RPMsg-Lite endpoint-list mutation never occurs inside the receive callback.
+
+The generation is retained in the firmware-owned statistics block and advanced
+on both firmware initialization and endpoint recreation. It is an opaque
+session identifier, not a reboot count. Raw non-magic echo messages remain
+supported so the existing 1..496-byte transport and queue-full tests do not
+depend on the service protocol.
+
+Source-level implementation and hardware acceptance were completed on
+2026-09-15. With the matched firmware and client, the first RPMsg traffic after
+reboot was:
+
+```sh
+/root/amp/rpmsg-regression.sh --post-boot
+```
+
+All 20 checks passed. That includes the historical first-traffic regression,
+handshake and negative protocol cases, stale-generation rejection, firmware
+endpoint recreation with generation advance, the 1..496-byte sweep, queue
+pressure at 64/1024/4096 messages, and final ring accounting. The run ended
+with 18,494 receive buffers fetched, consumed and delivered to callbacks,
+`tx_failed=0`, one endpoint restart, and zero restart failures. This closes the
+Phase 4 gate.
 
 ## Build
 

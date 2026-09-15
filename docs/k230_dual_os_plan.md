@@ -606,7 +606,7 @@ the link was then perfect indefinitely. The accessor is now implemented
 directly, and the scan and the name-service announce are gated on DRIVER_OK so
 that neither acts on uninitialized carveout memory before Linux attaches.
 
-Gate status: partially met.
+Gate status 2026-09-15: **met; Phase 5 is unblocked.**
 
 - Bidirectional messaging: met. 100,000-message soak at 496 B and at 1 B, a
   1..496 B sweep, zero loss and zero mismatch, with firmware accounting
@@ -616,18 +616,21 @@ Gate status: partially met.
   silent drops, correct back pressure, and `tx_failed == 0`.
 - Transport statistics: met. The firmware publishes a counter block in the AMP
   shm page, readable from Linux with `rpmsg-echo-test --stats`.
-- Endpoint restart: partially met. Repeatedly opening and closing
-  `/dev/rpmsg0` is exercised by every regression run; firmware-side endpoint
-  teardown and recreation is not tested.
-- Capability/version handshake: **not implemented**.
-- Restart generation and stale-generation rejection: **not implemented**. A
-  `generation` field exists only in the Phase 3 shared-memory ABI
-  (`amp_shm.h`), not in the RPMsg path. Note that a small-core `reboot` also
-  resets the big core, so the two sides cannot desync through that particular
-  path; the field is still required for firmware-only restart and for the
-  Phase 5 recovery protocol.
-
-Phase 5 remains blocked on the last two items.
+- Endpoint restart: met. A typed request is acknowledged before the main loop
+  destroys and recreates endpoint 30; endpoint-list mutation is deferred until
+  after callback dispatch. Hardware reported one restart and zero failures.
+- Capability/version handshake: met. HELLO exchanges protocol version 1,
+  required/supported capability bits, and the current firmware generation.
+  Version and unsupported-capability errors have explicit status replies.
+- Restart generation and stale-generation rejection: met. The generation
+  advances at firmware initialization and firmware-side endpoint recreation.
+  Typed service requests require the current generation, every response carries
+  it, and the Linux test rejects mismatched responses.
+- Matched post-boot regression: 20/20 checks passed as the first RPMsg traffic
+  after reboot. The historical cold-start tests, protocol negative cases,
+  endpoint restart, 1..496-byte sweep, 64/1024/4096-message pressure tests and
+  final accounting all passed. The final counters were 18,494 fetched,
+  consumed, and callback-delivered messages, with zero failed sends.
 
 ### Phase 5: shared payload slots
 
@@ -776,19 +779,15 @@ the Phase 4 status above.
 Items 2, 3 and 4 of the previous list are done or decided (see the Phase 2, 3
 and 7 statuses). Phase 3 is now closed outright. What remains:
 
-1. **Close the Phase 4 gate.** Add a capability/version handshake and a restart
-   generation with stale-result rejection, then extend `rpmsg-regression.sh` to
-   assert both. This is the sole blocker on Phases 5, 6 and 8, and therefore
-   the critical path.
-2. **Firmware-side endpoint teardown and recreation**, still untested (Phase 4).
-3. **Phase 7 stress testing**: repeated inference, device re-initialization and
-   recovery on the small core. The functional work is done; only the soak is
-   missing.
-4. Keep RPMsg limited to control and descriptors; proceed to the separately
-   owned payload slots only after the Phase 4 gate passes. The 2026-09-06
-   measurements make this quantitative rather than stylistic -- a 20 us
-   notification round trip against 1.86 MB/s for bulk copies through the shared
-   window.
+1. Start **Phase 5 shared payload slots** with host state-machine tests, then
+   target CRC/pattern tests under queue saturation and peer restart. Phase 4 is
+   closed by the 2026-09-15 matched post-boot run (20/20 checks).
+2. **Phase 7 stress testing** remains independently open: repeated inference,
+   device re-initialization and recovery on the small core. The functional work
+   is done; only the soak is missing.
+3. Keep RPMsg limited to control and descriptors. The 2026-09-06 measurements
+   make this quantitative rather than stylistic -- a 20 us notification round
+   trip against 1.86 MB/s for bulk copies through the shared window.
 
 Design rules established 2026-09-06, to be honoured by Phase 5's slot code:
 

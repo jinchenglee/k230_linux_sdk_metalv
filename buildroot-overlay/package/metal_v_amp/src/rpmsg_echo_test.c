@@ -1,5 +1,7 @@
 #include <errno.h>
 #include <stdint.h>
+
+#include "rpmsg_protocol.h"
 #include <sys/mman.h>
 #include <fcntl.h>
 #include <poll.h>
@@ -92,7 +94,10 @@ static int show_stats(void)
     static const char *names[] = {
         "magic", "link_up", "rx_callbacks", "tx_sent", "tx_failed",
         "fetch_rx", "fetch_tx", "rvq_avail_idx", "rvq_consumed",
-        "tvq_avail_idx", "tvq_consumed", "rsc_status", "driver_ok", "announced"
+        "tvq_avail_idx", "tvq_consumed", "rsc_status", "driver_ok", "announced",
+        "generation_lo", "generation_hi", "hellos", "protocol_msgs",
+        "rejected_ver", "rejected_caps", "rejected_gen", "endpoint_restarts",
+        "restart_failures"
     };
     volatile uint32_t *stats;
     void *map;
@@ -124,11 +129,281 @@ static int show_stats(void)
     return 0;
 }
 
+static void protocol_request_init(struct k230_rpmsg_protocol_header *request,
+                                  uint16_t version, uint16_t type,
+                                  uint64_t generation, uint64_t sequence,
+                                  uint64_t capabilities, uint32_t message_size)
+{
+    memset(request, 0, sizeof(*request));
+    request->magic = K230_RPMSG_PROTOCOL_MAGIC;
+    request->version = version;
+    request->header_size = K230_RPMSG_PROTOCOL_HEADER_SIZE;
+    request->type = type;
+    request->message_size = message_size;
+    request->generation = generation;
+    request->sequence = sequence;
+    request->capabilities = capabilities;
+}
+
+static int protocol_exchange(int fd, const void *request, size_t request_len,
+                             unsigned char *reply, size_t *reply_len,
+                             int timeout_ms)
+{
+    struct pollfd pfd = { .fd = fd, .events = POLLIN };
+    ssize_t written;
+    ssize_t received;
+    int ready;
+
+    written = write(fd, request, request_len);
+    if (written != (ssize_t)request_len) {
+        fprintf(stderr, "protocol write failed: %s\n",
+                written < 0 ? strerror(errno) : "short write");
+        return 1;
+    }
+    do {
+        ready = poll(&pfd, 1, timeout_ms);
+    } while (ready < 0 && errno == EINTR);
+    if (ready <= 0) {
+        fprintf(stderr, "protocol reply %s\n",
+                ready == 0 ? "timed out" : strerror(errno));
+        return 1;
+    }
+    received = read(fd, reply, RPMSG_MAX_PAYLOAD);
+    if (received < 0) {
+        fprintf(stderr, "protocol read failed: %s\n", strerror(errno));
+        return 1;
+    }
+    *reply_len = (size_t)received;
+    return 0;
+}
+
+static int protocol_reply_check(
+    const unsigned char *reply_data, size_t reply_len, uint64_t sequence,
+    uint16_t expected_type, uint16_t expected_status,
+    struct k230_rpmsg_protocol_header *reply)
+{
+    if (reply_len < sizeof(*reply)) {
+        fprintf(stderr, "protocol reply is too short: %zu\n", reply_len);
+        return 1;
+    }
+    memcpy(reply, reply_data, sizeof(*reply));
+    if (reply->magic != K230_RPMSG_PROTOCOL_MAGIC ||
+        reply->version != K230_RPMSG_PROTOCOL_VERSION ||
+        reply->header_size != sizeof(*reply) ||
+        reply->message_size != reply_len ||
+        reply->sequence != sequence ||
+        reply->type != expected_type ||
+        reply->status != expected_status) {
+        fprintf(stderr,
+                "bad protocol reply: magic=%08x version=%u header=%u "
+                "type=%u status=%u size=%u/%zu sequence=%llu/%llu\n",
+                reply->magic, reply->version, reply->header_size,
+                reply->type, reply->status, reply->message_size, reply_len,
+                (unsigned long long)reply->sequence,
+                (unsigned long long)sequence);
+        return 1;
+    }
+    return 0;
+}
+
+static int protocol_handshake(int fd, int timeout_ms, uint64_t sequence,
+                              uint64_t *generation)
+{
+    struct k230_rpmsg_protocol_header request;
+    struct k230_rpmsg_protocol_header reply;
+    unsigned char reply_data[RPMSG_MAX_PAYLOAD];
+    size_t reply_len;
+
+    protocol_request_init(&request, K230_RPMSG_PROTOCOL_VERSION,
+                          K230_RPMSG_MSG_HELLO, 0, sequence,
+                          K230_RPMSG_REQUIRED_CAPABILITIES, sizeof(request));
+    if (protocol_exchange(fd, &request, sizeof(request), reply_data,
+                          &reply_len, timeout_ms) ||
+        protocol_reply_check(reply_data, reply_len, sequence,
+                             K230_RPMSG_MSG_HELLO_REPLY,
+                             K230_RPMSG_STATUS_OK, &reply))
+        return 1;
+    if (!reply.generation ||
+        (reply.capabilities & K230_RPMSG_REQUIRED_CAPABILITIES) !=
+            K230_RPMSG_REQUIRED_CAPABILITIES) {
+        fprintf(stderr, "handshake lacks generation or required capabilities\n");
+        return 1;
+    }
+    *generation = reply.generation;
+    return 0;
+}
+
+static int run_protocol_test(const char *device, int timeout_ms)
+{
+    static const char body[] = "phase4-generation";
+    struct k230_rpmsg_protocol_header request;
+    struct k230_rpmsg_protocol_header reply;
+    unsigned char request_data[RPMSG_MAX_PAYLOAD];
+    unsigned char reply_data[RPMSG_MAX_PAYLOAD];
+    uint64_t generation = 0;
+    size_t message_len;
+    size_t reply_len;
+    int fd = open(device, O_RDWR | O_CLOEXEC);
+    int failed = 0;
+
+    if (fd < 0) {
+        perror(device);
+        return 1;
+    }
+    if (protocol_handshake(fd, timeout_ms, 1, &generation)) {
+        failed = 1;
+        goto out;
+    }
+
+    protocol_request_init(&request, K230_RPMSG_PROTOCOL_VERSION + 1,
+                          K230_RPMSG_MSG_HELLO, 0, 2,
+                          K230_RPMSG_REQUIRED_CAPABILITIES, sizeof(request));
+    failed |= protocol_exchange(fd, &request, sizeof(request), reply_data,
+                                &reply_len, timeout_ms);
+    if (!failed)
+        failed |= protocol_reply_check(
+            reply_data, reply_len, 2, K230_RPMSG_MSG_ERROR,
+            K230_RPMSG_STATUS_BAD_VERSION, &reply);
+
+    protocol_request_init(&request, K230_RPMSG_PROTOCOL_VERSION,
+                          K230_RPMSG_MSG_HELLO, 0, 3,
+                          UINT64_C(1) << 63, sizeof(request));
+    if (!failed)
+        failed |= protocol_exchange(fd, &request, sizeof(request), reply_data,
+                                    &reply_len, timeout_ms);
+    if (!failed)
+        failed |= protocol_reply_check(
+            reply_data, reply_len, 3, K230_RPMSG_MSG_ERROR,
+            K230_RPMSG_STATUS_UNSUPPORTED_CAPABILITY, &reply);
+
+    protocol_request_init(&request, K230_RPMSG_PROTOCOL_VERSION,
+                          K230_RPMSG_MSG_ECHO, generation ^ UINT64_C(1), 4,
+                          0, sizeof(request));
+    if (!failed)
+        failed |= protocol_exchange(fd, &request, sizeof(request), reply_data,
+                                    &reply_len, timeout_ms);
+    if (!failed)
+        failed |= protocol_reply_check(
+            reply_data, reply_len, 4, K230_RPMSG_MSG_ERROR,
+            K230_RPMSG_STATUS_STALE_GENERATION, &reply);
+    if (!failed && reply.generation != generation) {
+        fprintf(stderr, "stale-generation reply did not advertise current generation\n");
+        failed = 1;
+    }
+
+    message_len = sizeof(request) + sizeof(body);
+    protocol_request_init(&request, K230_RPMSG_PROTOCOL_VERSION,
+                          K230_RPMSG_MSG_ECHO, generation, 5, 0, message_len);
+    memcpy(request_data, &request, sizeof(request));
+    memcpy(request_data + sizeof(request), body, sizeof(body));
+    if (!failed)
+        failed |= protocol_exchange(fd, request_data, message_len, reply_data,
+                                    &reply_len, timeout_ms);
+    if (!failed)
+        failed |= protocol_reply_check(
+            reply_data, reply_len, 5, K230_RPMSG_MSG_ECHO_REPLY,
+            K230_RPMSG_STATUS_OK, &reply);
+    if (!failed &&
+        (reply.generation != generation ||
+         reply_len != message_len ||
+         memcmp(reply_data + sizeof(reply), body, sizeof(body)))) {
+        fprintf(stderr, "protocol echo body mismatch\n");
+        failed = 1;
+    }
+
+out:
+    close(fd);
+    printf("%s protocol handshake/version/capability/generation checks"
+           " generation=%llu\n",
+           failed ? "FAIL" : "PASS", (unsigned long long)generation);
+    return failed;
+}
+
+static int run_endpoint_restart_test(const char *device, int timeout_ms)
+{
+    struct k230_rpmsg_protocol_header request;
+    struct k230_rpmsg_protocol_header reply;
+    unsigned char reply_data[RPMSG_MAX_PAYLOAD];
+    uint64_t old_generation = 0;
+    uint64_t new_generation = 0;
+    size_t reply_len;
+    int fd = open(device, O_RDWR | O_CLOEXEC);
+    int failed = 0;
+
+    if (fd < 0) {
+        perror(device);
+        return 1;
+    }
+    if (protocol_handshake(fd, timeout_ms, 10, &old_generation)) {
+        failed = 1;
+        goto out;
+    }
+
+    protocol_request_init(&request, K230_RPMSG_PROTOCOL_VERSION,
+                          K230_RPMSG_MSG_RESTART_ENDPOINT, old_generation, 11,
+                          0, sizeof(request));
+    failed |= protocol_exchange(fd, &request, sizeof(request), reply_data,
+                                &reply_len, timeout_ms);
+    if (!failed)
+        failed |= protocol_reply_check(
+            reply_data, reply_len, 11,
+            K230_RPMSG_MSG_RESTART_ENDPOINT_REPLY,
+            K230_RPMSG_STATUS_OK, &reply);
+    if (!failed && reply.generation != old_generation) {
+        fprintf(stderr, "endpoint restart acknowledgement generation mismatch\n");
+        failed = 1;
+    }
+    if (!failed)
+        failed |= protocol_handshake(fd, timeout_ms, 12, &new_generation);
+    if (!failed && new_generation == old_generation) {
+        fprintf(stderr, "endpoint restart did not advance generation\n");
+        failed = 1;
+    }
+
+    protocol_request_init(&request, K230_RPMSG_PROTOCOL_VERSION,
+                          K230_RPMSG_MSG_ECHO, old_generation, 13,
+                          0, sizeof(request));
+    if (!failed)
+        failed |= protocol_exchange(fd, &request, sizeof(request), reply_data,
+                                    &reply_len, timeout_ms);
+    if (!failed)
+        failed |= protocol_reply_check(
+            reply_data, reply_len, 13, K230_RPMSG_MSG_ERROR,
+            K230_RPMSG_STATUS_STALE_GENERATION, &reply);
+    if (!failed && reply.generation != new_generation) {
+        fprintf(stderr, "post-restart stale reply generation mismatch\n");
+        failed = 1;
+    }
+
+    protocol_request_init(&request, K230_RPMSG_PROTOCOL_VERSION,
+                          K230_RPMSG_MSG_ECHO, new_generation, 14,
+                          0, sizeof(request));
+    if (!failed)
+        failed |= protocol_exchange(fd, &request, sizeof(request), reply_data,
+                                    &reply_len, timeout_ms);
+    if (!failed)
+        failed |= protocol_reply_check(
+            reply_data, reply_len, 14, K230_RPMSG_MSG_ECHO_REPLY,
+            K230_RPMSG_STATUS_OK, &reply);
+    if (!failed && reply.generation != new_generation) {
+        fprintf(stderr, "post-restart echo generation mismatch\n");
+        failed = 1;
+    }
+
+out:
+    close(fd);
+    printf("%s endpoint restart old-generation=%llu new-generation=%llu\n",
+           failed ? "FAIL" : "PASS",
+           (unsigned long long)old_generation,
+           (unsigned long long)new_generation);
+    return failed;
+}
+
 static void usage(const char *name)
 {
     fprintf(stderr,
             "usage: %s [device] [--loops N] [--size N] [--timeout-ms N] "
-            "[--sweep] [--burst]\n", name);
+            "[--sweep|--burst|--protocol|--restart]\n", name);
 }
 
 static int run_test(const char *device, unsigned long loops,
@@ -208,8 +483,11 @@ static int run_test(const char *device, unsigned long loops,
             last_loss = (long)i;
             /* A late reply to an earlier loop would desync every following
              * iteration; drop anything already queued before continuing. */
-            while (poll(&pfd, 1, 0) > 0)
-                read(fd, reply, size);
+            while (poll(&pfd, 1, 0) > 0) {
+                ssize_t discarded = read(fd, reply, size);
+                if (discarded <= 0)
+                    break;
+            }
             continue;
         }
         samples[completed++] = elapsed_ms(&start, &end);
@@ -249,7 +527,7 @@ int main(int argc, char **argv)
     static const unsigned long sweep_sizes[] = { 1, 16, 64, 128, 256, 496 };
     const char *device = "/dev/rpmsg0";
     unsigned long loops = 1, size = 21, timeout = 1000;
-    int sweep = 0, burst = 0;
+    int sweep = 0, burst = 0, protocol = 0, restart = 0;
     int i;
 
     for (i = 1; i < argc; ++i) {
@@ -257,6 +535,10 @@ int main(int argc, char **argv)
             sweep = 1;
         } else if (!strcmp(argv[i], "--burst")) {
             burst = 1;
+        } else if (!strcmp(argv[i], "--protocol")) {
+            protocol = 1;
+        } else if (!strcmp(argv[i], "--restart")) {
+            restart = 1;
         } else if (!strcmp(argv[i], "--stats")) {
             return show_stats();
         } else if (!strcmp(argv[i], "--loops") || !strcmp(argv[i], "--size") ||
@@ -283,6 +565,14 @@ int main(int argc, char **argv)
         fprintf(stderr, "size must be 1..%u bytes\n", RPMSG_MAX_PAYLOAD);
         return 2;
     }
+    if (sweep + burst + protocol + restart > 1) {
+        usage(argv[0]);
+        return 2;
+    }
+    if (protocol)
+        return run_protocol_test(device, (int)timeout);
+    if (restart)
+        return run_endpoint_restart_test(device, (int)timeout);
     if (burst)
         return run_burst(device, loops, size, (int)timeout);
     if (sweep) {
