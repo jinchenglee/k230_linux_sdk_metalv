@@ -16,9 +16,11 @@
 #define K230_RPMSG_CAP_GENERATION       (UINT64_C(1) << 1)
 #define K230_RPMSG_CAP_ENDPOINT_RESTART (UINT64_C(1) << 2)
 #define K230_RPMSG_CAP_PAYLOAD_SLOTS    (UINT64_C(1) << 3)
+#define K230_RPMSG_CAP_CAMERA_BUFFERS   (UINT64_C(1) << 4)
 #define K230_RPMSG_CAPABILITIES \
 	(K230_RPMSG_CAP_ECHO | K230_RPMSG_CAP_GENERATION | \
-	 K230_RPMSG_CAP_ENDPOINT_RESTART | K230_RPMSG_CAP_PAYLOAD_SLOTS)
+	 K230_RPMSG_CAP_ENDPOINT_RESTART | K230_RPMSG_CAP_PAYLOAD_SLOTS | \
+	 K230_RPMSG_CAP_CAMERA_BUFFERS)
 #define K230_RPMSG_REQUIRED_CAPABILITIES \
 	(K230_RPMSG_CAP_ECHO | K230_RPMSG_CAP_GENERATION)
 
@@ -32,6 +34,10 @@ enum k230_rpmsg_message_type {
 	K230_RPMSG_MSG_ERROR = 7,
 	K230_RPMSG_MSG_SLOT_SUBMIT = 8,
 	K230_RPMSG_MSG_SLOT_COMPLETE = 9,
+	K230_RPMSG_MSG_CAMERA_REGISTER = 10,
+	K230_RPMSG_MSG_CAMERA_REGISTER_REPLY = 11,
+	K230_RPMSG_MSG_CAMERA_SUBMIT = 12,
+	K230_RPMSG_MSG_CAMERA_COMPLETE = 13,
 };
 
 enum k230_rpmsg_status {
@@ -49,6 +55,8 @@ enum k230_rpmsg_status {
 	K230_RPMSG_STATUS_QUEUE_FULL = 11,
 	K230_RPMSG_STATUS_CRC_MISMATCH = 12,
 	K230_RPMSG_STATUS_BAD_FORMAT = 13,
+	K230_RPMSG_STATUS_NOT_REGISTERED = 14,
+	K230_RPMSG_STATUS_ALREADY_REGISTERED = 15,
 };
 
 struct k230_rpmsg_protocol_header {
@@ -158,5 +166,102 @@ _Static_assert((K230_PAYLOAD_SLOT_SIZE % K230_PAYLOAD_CACHE_LINE) == 0,
 _Static_assert(K230_PAYLOAD_POOL_BASE + K230_PAYLOAD_POOL_SIZE <=
 	       K230_AMP_RESERVED_END,
 	       "payload pool exceeds the reserved AMP region");
+
+/*
+ * Quick zero-copy camera prototype. Registration is generation-scoped and
+ * deliberately accepts only these six canonical buffers. CAMERA_SUBMIT names
+ * an already-registered ID; it never carries an arbitrary physical address.
+ */
+#define K230_CAMERA_POOL_BASE        UINT64_C(0x1da00000)
+#define K230_CAMERA_BUFFER_SIZE      UINT64_C(0x00200000)
+#define K230_CAMERA_BUFFER_COUNT     UINT32_C(6)
+#define K230_CAMERA_POOL_SIZE \
+	(K230_CAMERA_BUFFER_SIZE * K230_CAMERA_BUFFER_COUNT)
+
+struct k230_rpmsg_camera_register {
+	struct k230_rpmsg_protocol_header header;
+	uint32_t buffer_id;
+	uint32_t flags;
+	uint64_t physical;
+	uint64_t capacity;
+};
+
+struct k230_rpmsg_camera_submit {
+	struct k230_rpmsg_protocol_header header;
+	uint32_t buffer_id;
+	uint32_t flags;
+	uint32_t data_length;
+	uint32_t padded_length;
+	uint32_t format;
+	uint32_t width;
+	uint32_t height;
+	uint32_t stride;
+};
+
+struct k230_rpmsg_camera_complete {
+	struct k230_rpmsg_protocol_header header;
+	uint32_t buffer_id;
+	uint32_t flags;
+	uint32_t data_length;
+	uint32_t observed_crc;
+	uint64_t invalidate_cycles;
+	uint64_t crc_cycles;
+};
+
+static inline uint16_t
+k230_rpmsg_validate_camera_registration(
+	const struct k230_rpmsg_camera_register *request)
+{
+	uint64_t expected;
+
+	if (request->buffer_id >= K230_CAMERA_BUFFER_COUNT)
+		return K230_RPMSG_STATUS_INVALID_SLOT;
+	expected = K230_CAMERA_POOL_BASE +
+		   (uint64_t)request->buffer_id * K230_CAMERA_BUFFER_SIZE;
+	if (request->flags || request->physical != expected ||
+	    request->capacity != K230_CAMERA_BUFFER_SIZE)
+		return K230_RPMSG_STATUS_INVALID_RANGE;
+	return K230_RPMSG_STATUS_OK;
+}
+
+static inline uint16_t
+k230_rpmsg_validate_camera_submit(
+	const struct k230_rpmsg_camera_submit *request)
+{
+	uint64_t image_bytes;
+
+	if (request->buffer_id >= K230_CAMERA_BUFFER_COUNT)
+		return K230_RPMSG_STATUS_INVALID_SLOT;
+	if (request->flags || !request->data_length ||
+	    request->data_length > request->padded_length ||
+	    request->padded_length > K230_CAMERA_BUFFER_SIZE ||
+	    (request->padded_length % K230_PAYLOAD_CACHE_LINE) != 0)
+		return K230_RPMSG_STATUS_INVALID_RANGE;
+	if (request->format != K230_PAYLOAD_FORMAT_Y8 ||
+	    !request->width || !request->height ||
+	    request->stride < request->width)
+		return K230_RPMSG_STATUS_BAD_FORMAT;
+	image_bytes = (uint64_t)request->stride * request->height;
+	if (image_bytes != request->data_length)
+		return K230_RPMSG_STATUS_BAD_FORMAT;
+	return K230_RPMSG_STATUS_OK;
+}
+
+#define K230_RPMSG_CAMERA_REGISTER_SIZE UINT32_C(64)
+#define K230_RPMSG_CAMERA_SUBMIT_SIZE   UINT32_C(72)
+#define K230_RPMSG_CAMERA_COMPLETE_SIZE UINT32_C(72)
+
+_Static_assert(sizeof(struct k230_rpmsg_camera_register) ==
+	       K230_RPMSG_CAMERA_REGISTER_SIZE,
+	       "K230 RPMsg camera-register layout changed");
+_Static_assert(sizeof(struct k230_rpmsg_camera_submit) ==
+	       K230_RPMSG_CAMERA_SUBMIT_SIZE,
+	       "K230 RPMsg camera-submit layout changed");
+_Static_assert(sizeof(struct k230_rpmsg_camera_complete) ==
+	       K230_RPMSG_CAMERA_COMPLETE_SIZE,
+	       "K230 RPMsg camera-complete layout changed");
+_Static_assert(K230_CAMERA_POOL_BASE + K230_CAMERA_POOL_SIZE <=
+	       K230_AMP_RESERVED_END,
+	       "camera pool exceeds the reserved AMP region");
 
 #endif

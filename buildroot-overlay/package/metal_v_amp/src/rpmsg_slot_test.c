@@ -243,6 +243,8 @@ static int run_self_test(void)
 {
     static const uint8_t crc_fixture[] = "123456789";
     struct k230_rpmsg_slot_submit request;
+    struct k230_rpmsg_camera_register camera_register = { 0 };
+    struct k230_rpmsg_camera_submit camera_submit = { 0 };
     struct k230_slot_ownership ownership = { 0 };
     unsigned slot;
     int failed = 0;
@@ -250,6 +252,10 @@ static int run_self_test(void)
     failed |= sizeof(request) != K230_RPMSG_SLOT_SUBMIT_SIZE;
     failed |= sizeof(struct k230_rpmsg_slot_complete) !=
               K230_RPMSG_SLOT_COMPLETE_SIZE;
+    failed |= sizeof(camera_register) != K230_RPMSG_CAMERA_REGISTER_SIZE;
+    failed |= sizeof(camera_submit) != K230_RPMSG_CAMERA_SUBMIT_SIZE;
+    failed |= sizeof(struct k230_rpmsg_camera_complete) !=
+              K230_RPMSG_CAMERA_COMPLETE_SIZE;
     failed |= padded_length(1) != 64 || padded_length(64) != 64 ||
               padded_length(65) != 128;
     failed |= crc32(crc_fixture, sizeof(crc_fixture) - 1) !=
@@ -270,6 +276,29 @@ static int run_self_test(void)
     failed |= k230_rpmsg_validate_slot(&request) !=
               K230_RPMSG_STATUS_BAD_FORMAT;
 
+    camera_register.buffer_id = K230_CAMERA_BUFFER_COUNT - 1U;
+    camera_register.physical = K230_CAMERA_POOL_BASE +
+        (K230_CAMERA_BUFFER_COUNT - 1U) * K230_CAMERA_BUFFER_SIZE;
+    camera_register.capacity = K230_CAMERA_BUFFER_SIZE;
+    failed |= k230_rpmsg_validate_camera_registration(&camera_register) !=
+              K230_RPMSG_STATUS_OK;
+    ++camera_register.physical;
+    failed |= k230_rpmsg_validate_camera_registration(&camera_register) !=
+              K230_RPMSG_STATUS_INVALID_RANGE;
+
+    camera_submit.buffer_id = K230_CAMERA_BUFFER_COUNT - 1U;
+    camera_submit.data_length = 1280U * 720U;
+    camera_submit.padded_length = padded_length(camera_submit.data_length);
+    camera_submit.format = K230_PAYLOAD_FORMAT_Y8;
+    camera_submit.width = 1280;
+    camera_submit.height = 720;
+    camera_submit.stride = 1280;
+    failed |= k230_rpmsg_validate_camera_submit(&camera_submit) !=
+              K230_RPMSG_STATUS_OK;
+    camera_submit.padded_length++;
+    failed |= k230_rpmsg_validate_camera_submit(&camera_submit) !=
+              K230_RPMSG_STATUS_INVALID_RANGE;
+
     for (slot = 0; slot < K230_PAYLOAD_SLOT_COUNT; ++slot)
         failed |= k230_slot_claim(&ownership, slot) !=
                   K230_RPMSG_STATUS_OK;
@@ -286,7 +315,7 @@ static int run_self_test(void)
               ownership.depth || ownership.busy_mask ||
               ownership.high_water != K230_PAYLOAD_SLOT_COUNT;
 
-    printf("%s payload-slot host ABI/CRC/descriptor/ownership checks\n",
+    printf("%s payload-slot/camera host ABI/CRC/descriptor/ownership checks\n",
            failed ? "FAIL" : "PASS");
     return failed;
 }

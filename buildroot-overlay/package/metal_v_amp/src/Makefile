@@ -7,6 +7,8 @@ BIN := metal-v-k230.bin
 LINUX_TEST := amp-shm-test
 RPMSG_TEST := rpmsg-echo-test
 RPMSG_SLOT_TEST := rpmsg-slot-test
+V4L2_DMA_PROBE := v4l2-dma-probe
+RPMSG_ZERO_COPY_CAMERA := rpmsg-zero-copy-camera
 RPMSG_LITE_DIR ?= ../../../../third_party/rpmsg-lite
 RPMSG_INC := -I. -I$(RPMSG_LITE_DIR)/lib/include \
 	-I$(RPMSG_LITE_DIR)/lib/include/environment/bm
@@ -27,7 +29,8 @@ LDFLAGS := -nostdlib -static -Wl,--build-id=none,--gc-sections,-Map=$(ELF).map \
 	-T k230.ld
 
 .PHONY: all check clean
-all: $(BIN) $(LINUX_TEST) $(RPMSG_TEST) $(RPMSG_SLOT_TEST)
+all: $(BIN) $(LINUX_TEST) $(RPMSG_TEST) $(RPMSG_SLOT_TEST) $(V4L2_DMA_PROBE) \
+	$(RPMSG_ZERO_COPY_CAMERA)
 
 $(ELF): $(OBJS) k230.ld
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(OBJS)
@@ -44,6 +47,12 @@ $(RPMSG_TEST): rpmsg_echo_test.c rpmsg_protocol.h
 $(RPMSG_SLOT_TEST): rpmsg_slot_test.c rpmsg_protocol.h rpmsg_slot_state.h
 	$(LINUX_CC) $(LINUX_CFLAGS) -DK230_SLOT_CAMERA -o $@ \
 		rpmsg_slot_test.c -lv4l2-drm -lmmz
+
+$(V4L2_DMA_PROBE): v4l2_dma_probe.c
+	$(LINUX_CC) $(LINUX_CFLAGS) -o $@ v4l2_dma_probe.c
+
+$(RPMSG_ZERO_COPY_CAMERA): rpmsg_zero_copy_camera.c rpmsg_protocol.h
+	$(LINUX_CC) $(LINUX_CFLAGS) -o $@ rpmsg_zero_copy_camera.c
 
 $(HOST_SLOT_TEST): rpmsg_slot_test.c rpmsg_protocol.h rpmsg_slot_state.h
 	$(HOST_CC) -O2 -Wall -Wextra -Werror -o $@ rpmsg_slot_test.c
@@ -79,4 +88,5 @@ rpmsg_env_bm.o: $(RPMSG_LITE_DIR)/lib/rpmsg_lite/porting/environment/rpmsg_env_b
 
 clean:
 	$(RM) $(OBJS) $(ELF) $(ELF).map $(BIN) $(LINUX_TEST) \
-		$(RPMSG_TEST) $(RPMSG_SLOT_TEST) $(HOST_SLOT_TEST)
+		$(RPMSG_TEST) $(RPMSG_SLOT_TEST) $(V4L2_DMA_PROBE) \
+		$(RPMSG_ZERO_COPY_CAMERA) $(HOST_SLOT_TEST)

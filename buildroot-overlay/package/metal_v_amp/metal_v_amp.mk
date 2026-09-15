@@ -7,7 +7,7 @@
 METAL_V_AMP_SITE = $(realpath $(TOPDIR))/package/metal_v_amp/src
 METAL_V_AMP_SITE_METHOD = local
 METAL_V_AMP_INSTALL_IMAGES = YES
-METAL_V_AMP_DEPENDENCIES = vvcam libmmz
+METAL_V_AMP_DEPENDENCIES = vvcam libmmz k230_amp_camera_pool
 
 define METAL_V_AMP_BUILD_CMDS
 	$(TARGET_MAKE_ENV) $(MAKE) -C $(@D) CROSS_COMPILE="$(TARGET_CROSS)" \
@@ -27,6 +27,12 @@ define METAL_V_AMP_INSTALL_TARGET_CMDS
 		$(TARGET_DIR)/root/amp/rpmsg-echo-test
 	$(INSTALL) -D -m 0755 $(@D)/rpmsg-slot-test \
 		$(TARGET_DIR)/root/amp/rpmsg-slot-test
+	$(INSTALL) -D -m 0755 $(@D)/v4l2-dma-probe \
+		$(TARGET_DIR)/root/amp/v4l2-dma-probe
+	$(INSTALL) -D -m 0755 $(@D)/rpmsg-zero-copy-camera \
+		$(TARGET_DIR)/root/amp/rpmsg-zero-copy-camera
+	$(INSTALL) -D -m 0755 $(@D)/run-zero-copy-camera.sh \
+		$(TARGET_DIR)/root/amp/run-zero-copy-camera.sh
 	$(INSTALL) -D -m 0755 $(@D)/rpmsg-regression.sh \
 		$(TARGET_DIR)/root/amp/rpmsg-regression.sh
 	$(INSTALL) -D -m 0755 $(@D)/amp-shm-cost.sh \

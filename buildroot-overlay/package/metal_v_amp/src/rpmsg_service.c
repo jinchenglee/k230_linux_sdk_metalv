@@ -71,6 +71,16 @@ static unsigned long slot_dropped_restart;
 static uint32_t slot_queue_head;
 static uint32_t slot_queue_tail;
 static struct k230_slot_ownership slot_ownership;
+static uint32_t camera_registered_mask;
+static uint32_t camera_busy_mask;
+static uint32_t camera_queue_head;
+static uint32_t camera_queue_tail;
+static uint32_t camera_queue_depth;
+static uint32_t camera_queue_high_water;
+static unsigned long camera_submitted;
+static unsigned long camera_completed;
+static unsigned long camera_rejected;
+static unsigned long camera_dropped_restart;
 
 struct k230_slot_job {
     struct k230_rpmsg_slot_submit request;
@@ -80,6 +90,15 @@ struct k230_slot_job {
 };
 
 static struct k230_slot_job slot_queue[K230_PAYLOAD_SLOT_COUNT];
+
+struct k230_camera_job {
+    struct k230_rpmsg_camera_submit request;
+    struct k230_rpmsg_camera_complete response;
+    uint32_t src;
+    uint32_t processed;
+};
+
+static struct k230_camera_job camera_queue[K230_CAMERA_BUFFER_COUNT];
 
 static int32_t echo_rx(void *payload, uint32_t payload_len, uint32_t src,
                        void *priv);
@@ -264,6 +283,109 @@ static void reset_slot_queue(void)
     slot_queue_tail = 0;
 }
 
+static void reset_camera_queue(void)
+{
+    camera_dropped_restart += camera_queue_depth;
+    camera_registered_mask = 0;
+    camera_busy_mask = 0;
+    camera_queue_head = 0;
+    camera_queue_tail = 0;
+    camera_queue_depth = 0;
+}
+
+static int32_t register_camera_buffer(
+    void *payload, uint32_t payload_len, uint32_t src,
+    const struct k230_rpmsg_protocol_header *header)
+{
+    struct k230_rpmsg_camera_register request;
+    struct k230_rpmsg_camera_register reply;
+    uint32_t bit;
+    uint16_t status;
+
+    if (header->generation != protocol_generation) {
+        ++rejected_generation;
+        ++camera_rejected;
+        return send_protocol_error(src, header,
+                                   K230_RPMSG_STATUS_STALE_GENERATION);
+    }
+    if (payload_len != sizeof(request)) {
+        ++camera_rejected;
+        return send_protocol_error(src, header, K230_RPMSG_STATUS_BAD_SIZE);
+    }
+    memcpy(&request, payload, sizeof(request));
+    status = k230_rpmsg_validate_camera_registration(&request);
+    if (status != K230_RPMSG_STATUS_OK) {
+        ++camera_rejected;
+        return send_protocol_error(src, header, status);
+    }
+    bit = UINT32_C(1) << request.buffer_id;
+    /* Registration is idempotent for this fixed canonical table. This lets a
+     * new Linux process attach within the same protocol generation without
+     * requiring an otherwise-unnecessary endpoint restart. */
+    camera_registered_mask |= bit;
+    reply = request;
+    protocol_reply_header(&reply.header, header,
+                          K230_RPMSG_MSG_CAMERA_REGISTER_REPLY,
+                          K230_RPMSG_STATUS_OK, sizeof(reply));
+    (void)send_message(src, &reply, sizeof(reply));
+    return RL_RELEASE;
+}
+
+static int32_t enqueue_camera_request(
+    void *payload, uint32_t payload_len, uint32_t src,
+    const struct k230_rpmsg_protocol_header *header)
+{
+    struct k230_rpmsg_camera_submit request;
+    struct k230_camera_job *job;
+    uint32_t bit;
+    uint16_t status;
+
+    if (header->generation != protocol_generation) {
+        ++rejected_generation;
+        ++camera_rejected;
+        return send_protocol_error(src, header,
+                                   K230_RPMSG_STATUS_STALE_GENERATION);
+    }
+    if (payload_len != sizeof(request)) {
+        ++camera_rejected;
+        return send_protocol_error(src, header, K230_RPMSG_STATUS_BAD_SIZE);
+    }
+    memcpy(&request, payload, sizeof(request));
+    status = k230_rpmsg_validate_camera_submit(&request);
+    if (status != K230_RPMSG_STATUS_OK) {
+        ++camera_rejected;
+        return send_protocol_error(src, header, status);
+    }
+    bit = UINT32_C(1) << request.buffer_id;
+    if (!(camera_registered_mask & bit)) {
+        ++camera_rejected;
+        return send_protocol_error(src, header,
+                                   K230_RPMSG_STATUS_NOT_REGISTERED);
+    }
+    if (camera_busy_mask & bit) {
+        ++camera_rejected;
+        return send_protocol_error(src, header,
+                                   K230_RPMSG_STATUS_SLOT_BUSY);
+    }
+    if (camera_queue_depth >= K230_CAMERA_BUFFER_COUNT) {
+        ++camera_rejected;
+        return send_protocol_error(src, header,
+                                   K230_RPMSG_STATUS_QUEUE_FULL);
+    }
+    camera_busy_mask |= bit;
+    job = &camera_queue[camera_queue_tail];
+    memset(job, 0, sizeof(*job));
+    job->request = request;
+    job->src = src;
+    camera_queue_tail =
+        (camera_queue_tail + 1U) % K230_CAMERA_BUFFER_COUNT;
+    ++camera_queue_depth;
+    if (camera_queue_depth > camera_queue_high_water)
+        camera_queue_high_water = camera_queue_depth;
+    ++camera_submitted;
+    return RL_RELEASE;
+}
+
 static void process_slot_queue(void)
 {
     struct k230_slot_job *job;
@@ -307,6 +429,47 @@ static void process_slot_queue(void)
     (void)k230_slot_release(&slot_ownership, job->request.slot_id);
     slot_queue_head = (slot_queue_head + 1U) % K230_PAYLOAD_SLOT_COUNT;
     ++slot_completed;
+}
+
+static void process_camera_queue(void)
+{
+    struct k230_camera_job *job;
+    const uint8_t *payload;
+    uint64_t started;
+
+    if (!camera_queue_depth || !echo_endpoint)
+        return;
+    job = &camera_queue[camera_queue_head];
+    if (!job->processed) {
+        payload = (const uint8_t *)(uintptr_t)
+            (K230_CAMERA_POOL_BASE +
+             (uint64_t)job->request.buffer_id * K230_CAMERA_BUFFER_SIZE);
+        protocol_reply_header(&job->response.header, &job->request.header,
+                              K230_RPMSG_MSG_CAMERA_COMPLETE,
+                              K230_RPMSG_STATUS_OK,
+                              sizeof(job->response));
+        job->response.buffer_id = job->request.buffer_id;
+        job->response.flags = job->request.flags;
+        job->response.data_length = job->request.data_length;
+
+        started = read_cycle();
+        cache_invalidate_range(payload, job->request.padded_length);
+        amp_acquire_fence();
+        job->response.invalidate_cycles = read_cycle() - started;
+        started = read_cycle();
+        job->response.observed_crc =
+            amp_crc32(payload, job->request.data_length);
+        job->response.crc_cycles = read_cycle() - started;
+        job->processed = 1;
+    }
+    if (send_message(job->src, &job->response,
+                     sizeof(job->response)) != RL_SUCCESS)
+        return;
+    camera_busy_mask &= ~(UINT32_C(1) << job->request.buffer_id);
+    camera_queue_head =
+        (camera_queue_head + 1U) % K230_CAMERA_BUFFER_COUNT;
+    --camera_queue_depth;
+    ++camera_completed;
 }
 
 static int32_t protocol_rx(void *payload, uint32_t payload_len, uint32_t src)
@@ -387,6 +550,12 @@ static int32_t protocol_rx(void *payload, uint32_t payload_len, uint32_t src)
     case K230_RPMSG_MSG_SLOT_SUBMIT:
         return enqueue_slot_request(payload, payload_len, src, &request);
 
+    case K230_RPMSG_MSG_CAMERA_REGISTER:
+        return register_camera_buffer(payload, payload_len, src, &request);
+
+    case K230_RPMSG_MSG_CAMERA_SUBMIT:
+        return enqueue_camera_request(payload, payload_len, src, &request);
+
     default:
         return send_protocol_error(src, &request,
                                    K230_RPMSG_STATUS_BAD_TYPE);
@@ -414,6 +583,7 @@ static void restart_endpoint_if_requested(void)
         return;
     endpoint_restart_pending = 0;
     reset_slot_queue();
+    reset_camera_queue();
     if (!echo_endpoint ||
         rpmsg_lite_destroy_ept(rpmsg_instance, echo_endpoint) != RL_SUCCESS) {
         ++endpoint_restart_failures;
@@ -495,6 +665,7 @@ void rpmsg_service_poll(uint32_t mailbox_pending)
     }
     restart_endpoint_if_requested();
     process_slot_queue();
+    process_camera_queue();
 }
 
 void rpmsg_service_publish_stats(void)
@@ -528,6 +699,14 @@ void rpmsg_service_publish_stats(void)
     stats->slot_busy_mask = slot_ownership.busy_mask;
     stats->slot_queue_depth = slot_ownership.depth;
     stats->slot_queue_high_water = slot_ownership.high_water;
+    stats->camera_registered_mask = camera_registered_mask;
+    stats->camera_busy_mask = camera_busy_mask;
+    stats->camera_submitted = (uint32_t)camera_submitted;
+    stats->camera_completed = (uint32_t)camera_completed;
+    stats->camera_rejected = (uint32_t)camera_rejected;
+    stats->camera_dropped_restart = (uint32_t)camera_dropped_restart;
+    stats->camera_queue_depth = camera_queue_depth;
+    stats->camera_queue_high_water = camera_queue_high_water;
     stats->rx_callbacks = (uint32_t)rx_messages;
     stats->tx_sent = (uint32_t)tx_messages;
     stats->tx_failed = (uint32_t)tx_failures;

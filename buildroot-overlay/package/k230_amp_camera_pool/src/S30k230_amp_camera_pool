@@ -1,0 +1,30 @@
+#!/bin/sh
+
+case "$1" in
+	start)
+		printf 'Starting K230 AMP camera DMA-BUF pool: '
+		module="/lib/modules/$(uname -r)/updates/k230_amp_camera_pool.ko"
+		if [ -f "$module" ]; then
+			loader="insmod $module"
+		else
+			loader="modprobe k230_amp_camera_pool"
+		fi
+		if $loader; then
+			echo OK
+		else
+			echo FAIL
+			exit 1
+		fi
+		;;
+	stop)
+		rmmod k230_amp_camera_pool 2>/dev/null || true
+		;;
+	restart|reload)
+		"$0" stop
+		"$0" start
+		;;
+	*)
+		echo "Usage: $0 {start|stop|restart}"
+		exit 1
+		;;
+esac

@@ -45,6 +45,14 @@ struct k230_rpmsg_stats {
     uint32_t slot_busy_mask;
     uint32_t slot_queue_depth;
     uint32_t slot_queue_high_water;
+    uint32_t camera_registered_mask;
+    uint32_t camera_busy_mask;
+    uint32_t camera_submitted;
+    uint32_t camera_completed;
+    uint32_t camera_rejected;
+    uint32_t camera_dropped_restart;
+    uint32_t camera_queue_depth;
+    uint32_t camera_queue_high_water;
 };
 
 #define K230_RPMSG_BUFFER_BASE   UINT64_C(0x1d500000)

@@ -3,6 +3,7 @@ config BR2_PACKAGE_METAL_V_AMP
 	depends on BR2_riscv && BR2_RISCV_64
 	select BR2_PACKAGE_VVCAM
 	select BR2_PACKAGE_LIBMMZ
+	select BR2_PACKAGE_K230_AMP_CAMERA_POOL
 	help
 	  Build a freestanding RV64GCV diagnostic payload for the K230 big
 	  core. It starts at 0x1c000000 and provides a polling UART3 console
