@@ -1,0 +1,8 @@
+config BR2_PACKAGE_ARUCO2
+	bool "aruco2"
+	select BR2_PACKAGE_OPENCV4
+	select BR2_PACKAGE_OPENCV4_LIB_IMGPROC
+	help
+	  Current standalone ArUco2 fiducial marker detector library.
+
+	  https://github.com/rmsalinas/aruco2

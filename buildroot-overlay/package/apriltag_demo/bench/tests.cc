@@ -86,16 +86,29 @@ void test_parser()
     const auto defaults = parse({"bench"});
     CHECK(defaults.input == "fixture.jpg");
     CHECK(defaults.size.native);
-    CHECK(defaults.backends.size() == 3);
+    CHECK(defaults.backends.size() == 5);
     CHECK(defaults.factor == 2 && defaults.factor_value == 2.0);
     CHECK(!defaults.rvv_mask_explicit);
     CHECK(defaults.dump_dir.empty());
+    CHECK(defaults.detections_out.empty());
+    CHECK(defaults.aruco_error_correction_rate == 0);
+    CHECK(defaults.aruco_border_error_rate == 0);
 
     CHECK(parse({"bench", "--dump-dir", "output"}).dump_dir == "output");
     CHECK(parse({"bench", "--dump-dir", "first", "--no-dump"})
               .dump_dir.empty());
     CHECK(parse({"bench", "--no-dump", "--dump-dir", "last"}).dump_dir ==
           "last");
+    CHECK(parse({"bench", "--detections-out", "detections.json"})
+              .detections_out == "detections.json");
+    CHECK(parse({"bench", "--detections-out", "first.json",
+                 "--no-detections-out"}).detections_out.empty());
+    CHECK(parse({"bench", "--no-detections-out", "--detections-out",
+                 "last.json"}).detections_out == "last.json");
+    CHECK(parse({"bench", "--aruco-error-correction-rate", "0.6"})
+              .aruco_error_correction_rate == 0.6);
+    CHECK(parse({"bench", "--aruco-border-error-rate", "1"})
+              .aruco_border_error_rate == 1.0);
 
     CHECK(parse({"bench", "--input", "x.jpg"}).size.native);
     const auto sized = parse({"bench", "--input", "x.jpg", "--size",
@@ -107,7 +120,11 @@ void test_parser()
     CHECK(raw.format == InputFormat::Raw && raw.size.width == 640);
     CHECK(parse({"bench", "--backend", "rust-rvv"}).backends ==
           std::vector<BackendKind>{BackendKind::RustRvv});
-    CHECK(parse({"bench", "--backend", "all"}).backends.size() == 3);
+    CHECK(parse({"bench", "--backend", "aruco-nano"}).backends ==
+          std::vector<BackendKind>{BackendKind::ArucoNano});
+    CHECK(parse({"bench", "--backend", "aruco2"}).backends ==
+          std::vector<BackendKind>{BackendKind::Aruco2});
+    CHECK(parse({"bench", "--backend", "all"}).backends.size() == 5);
     const auto masked = parse({"bench", "--rvv-stages",
                                "gray-model,decimate,rle"});
     CHECK(masked.rvv_mask_explicit);
@@ -145,6 +162,11 @@ void test_parser()
     expect_parse_error({"bench", "--unknown"});
     expect_parse_error({"bench", "--input"});
     expect_parse_error({"bench", "--dump-dir"});
+    expect_parse_error({"bench", "--detections-out"});
+    expect_parse_error({"bench", "--aruco-error-correction-rate"});
+    expect_parse_error({"bench", "--aruco-error-correction-rate", "-0.1"});
+    expect_parse_error({"bench", "--aruco-error-correction-rate", "1.1"});
+    expect_parse_error({"bench", "--aruco-border-error-rate", "nan"});
     expect_parse_error({"bench", "extra"});
     expect_parse_error({"bench", "--format", "raw", "--size", "native"});
 }
@@ -283,9 +305,11 @@ class FakeBackend final : public Backend {
 public:
     explicit FakeBackend(BackendKind kind, bool unstable = false,
                            std::uint64_t checksum = 1234, int fail_call = 0,
-                           std::shared_ptr<FakeBackendState> state = {})
+                           std::shared_ptr<FakeBackendState> state = {}, bool breakdown = false,
+                           std::uint64_t scale_ns = 1000000U)
         : kind_(kind), unstable_(unstable), checksum_(checksum),
-          fail_call_(fail_call), state_(std::move(state)) {}
+          fail_call_(fail_call), state_(std::move(state)), breakdown_(breakdown),
+          scale_ns_(scale_ns) {}
     BackendKind kind() const override { return kind_; }
     const char* name() const override { return backend_name(kind_); }
     void set_capture_detections(bool capture) override
@@ -302,7 +326,9 @@ public:
             detections_[0].id = static_cast<std::uint64_t>(calls_);
             if (state_) ++state_->captured_calls;
         }
-        return {2, unstable_ ? static_cast<std::uint64_t>(calls_) : checksum_};
+        return {2, unstable_ ? static_cast<std::uint64_t>(calls_) : checksum_,
+                {breakdown_, breakdown_ ? scale_ns_ : 0U,
+                 breakdown_ ? 2000000U : 0U}};
     }
     const std::vector<Detection>& detections() const override
     {
@@ -316,6 +342,8 @@ private:
     int calls_ = 0;
     bool capture_ = false;
     std::shared_ptr<FakeBackendState> state_;
+    bool breakdown_;
+    std::uint64_t scale_ns_;
     std::vector<Detection> detections_;
 };
 
@@ -393,6 +421,45 @@ void test_visual_dumps()
 }
 #endif
 
+
+void test_detection_json()
+{
+    TemporaryDirectory temporary_directory;
+    const std::string path =
+        (temporary_directory.path() / "detections.json").string();
+    BenchmarkConfig config;
+    config.input = "frame-one.png";
+    config.factor = 0;
+    config.factor_value = 1.0;
+    PreparedImage image{160, 100, 160,
+                        std::vector<std::uint8_t>(16000, 80)};
+    const Detection detection = sample_detection();
+    write_detection_json(path, config, image, 0x1234,
+                         {{BackendKind::ArucoNano, {detection}},
+                          {BackendKind::Aruco2, {}}});
+    std::ifstream input(path, std::ios::binary);
+    const std::string json((std::istreambuf_iterator<char>(input)),
+                           std::istreambuf_iterator<char>());
+    CHECK(json.find("\"schema\": 1") != std::string::npos);
+    CHECK(json.find("\"path\": \"frame-one.png\"") != std::string::npos);
+    CHECK(json.find("\"hash\": \"0000000000001234\"") != std::string::npos);
+    CHECK(json.find("\"aruco_error_correction_rate\": 0") !=
+          std::string::npos);
+    CHECK(json.find("\"aruco_border_error_rate\": 0") !=
+          std::string::npos);
+    CHECK(json.find("\"key\": \"aruco-nano\"") != std::string::npos);
+    CHECK(json.find("\"id\": 7") != std::string::npos);
+    CHECK(json.find("\"center\": [10, 20]") != std::string::npos);
+    CHECK(json.find("\"key\": \"aruco2\", \"detections\": []") !=
+          std::string::npos);
+    bool threw = false;
+    try {
+        write_detection_json(temporary_directory.path().string(), config,
+                             image, 0x1234, {});
+    } catch (const std::runtime_error&) { threw = true; }
+    CHECK(threw);
+}
+
 void test_schedule_and_stability()
 {
     CHECK(batch_order(2, 0) == std::vector<std::size_t>({0, 1}));
@@ -410,12 +477,30 @@ void test_schedule_and_stability()
     stable.emplace_back(new FakeBackend(BackendKind::RustRvv, false, 1234, 0,
                                         capture_state));
     stable.emplace_back(new FakeBackend(BackendKind::CReference));
+    stable.emplace_back(new FakeBackend(BackendKind::ArucoNano, false, 1234,
+                                        0, {}, true));
     std::ostringstream output;
     CHECK(run_benchmark(config, std::move(stable), image, output) == 0);
     CHECK(capture_state->captured_calls == 1);
     CHECK(capture_state->capture_changes == std::vector<bool>({true, false}));
     CHECK(output.str().find("RESULT backend=rust-rvv") != std::string::npos);
     CHECK(output.str().find("RESULT backend=c-reference") != std::string::npos);
+    CHECK(output.str().find("RESULT backend=aruco-nano") != std::string::npos);
+    CHECK(output.str().find("ArUco runtime breakdown") != std::string::npos);
+    CHECK(output.str().find("input_scale_mean_ms=1.000") != std::string::npos);
+    CHECK(output.str().find("detector_mean_ms=2.000") != std::string::npos);
+
+    BenchmarkConfig factor_one = config;
+    factor_one.factor = 0;
+    factor_one.factor_value = 1.0;
+    std::vector<std::unique_ptr<Backend>> factor_one_backends;
+    factor_one_backends.emplace_back(new FakeBackend(
+        BackendKind::Aruco2, false, 1234, 0, {}, true, 0));
+    std::ostringstream factor_one_output;
+    CHECK(run_benchmark(factor_one, std::move(factor_one_backends), image,
+                        factor_one_output) == 0);
+    CHECK(factor_one_output.str().find("input_scale_mean_ms=0.000") !=
+          std::string::npos);
     CHECK(output.str().find(std::string("Build       : ") +
                             APRILTAG_BENCH_BUILD_ID) !=
           std::string::npos);
@@ -429,6 +514,8 @@ void test_schedule_and_stability()
     for (const char* field : {
              " total_ms=", " input_hash=", " width=1",
              " height=1", " bytes=1", " factor=2", " min_blob=25",
+             " aruco_error_correction_rate=0",
+             " aruco_border_error_rate=0",
              " warmup=1", " iterations=2", " batches=2"}) {
         CHECK(result.find(field) != std::string::npos);
     }
@@ -514,9 +601,14 @@ void test_persistent_backends()
     config.format = InputFormat::Jpeg;
     const PreparedImage image = load_image(config);
     for (const BackendKind kind : {BackendKind::RustScalar,
-                                   BackendKind::CReference}) {
-        std::unique_ptr<Backend> backend = kind == BackendKind::CReference
-            ? make_c_backend(config) : make_rust_backend(config, kind);
+                                   BackendKind::CReference,
+                                   BackendKind::ArucoNano,
+                                   BackendKind::Aruco2}) {
+        std::unique_ptr<Backend> backend;
+        if (kind == BackendKind::CReference) backend = make_c_backend(config);
+        else if (kind == BackendKind::ArucoNano) backend = make_aruco_nano_backend(config);
+        else if (kind == BackendKind::Aruco2) backend = make_aruco2_backend(config);
+        else backend = make_rust_backend(config, kind);
         backend->set_capture_detections(true);
         const DetectionResult first = backend->detect(image);
         const DetectionResult second = backend->detect(image);
@@ -528,6 +620,8 @@ void test_persistent_backends()
               second.checksum);
         CHECK(first.count == second.count);
         CHECK(first.checksum == second.checksum);
+        CHECK(first.timing.available == (kind == BackendKind::ArucoNano ||
+                                         kind == BackendKind::Aruco2));
     }
 }
 #endif
@@ -544,6 +638,7 @@ int main()
 #ifndef APRILTAG_BENCH_NO_OPENCV
     test_visual_dumps();
 #endif
+    test_detection_json();
     test_schedule_and_stability();
 #ifdef APRILTAG_BENCH_BACKEND_TESTS
     test_jpeg_preparation();

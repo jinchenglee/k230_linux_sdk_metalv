@@ -105,8 +105,12 @@ void write_visual_dumps(const std::string& directory,
             cv::drawMarker(overlay, center, {0, 255, 255}, cv::MARKER_CROSS,
                            9 * scale, thickness, cv::LINE_AA);
             std::ostringstream label;
-            label << "id " << detection.id << " m " << std::fixed
-                  << std::setprecision(1) << detection.margin;
+            label << "id " << detection.id << " m ";
+            if (std::isfinite(detection.margin)) {
+                label << std::fixed << std::setprecision(1) << detection.margin;
+            } else {
+                label << "n/a";
+            }
             cv::putText(overlay, label.str(), center + cv::Point(5, -5),
                         cv::FONT_HERSHEY_SIMPLEX, 0.45 * scale, {0, 255, 255},
                         thickness, cv::LINE_AA);

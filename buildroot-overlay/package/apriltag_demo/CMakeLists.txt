@@ -11,6 +11,7 @@ set(common_src
 )
 set(rvv_bin apriltag_demo.elf)
 set(c_bin apriltag_c_demo.elf)
+set(aruco_bin aruco_demo.elf)
 set(bench_bin k230_apriltag_bench)
 set(bench_test_bin apriltag_bench_tests)
 set(profile_bench_bin k230_apriltag_profile_bench)
@@ -29,12 +30,18 @@ add_executable(${c_bin}
     ${common_src}
     src/apriltag_c_adapter.cc
 )
+add_executable(${aruco_bin}
+    ${common_src}
+    src/aruco_live_adapter.cc
+)
 add_executable(${bench_bin}
     bench/main.cc
     bench/benchmark.cc
     bench/visual_dump.cc
     bench/rust_backend.cc
     bench/c_backend.cc
+    bench/aruco_nano_backend.cc
+    bench/aruco2_backend.cc
 )
 add_executable(${bench_test_bin}
     bench/tests.cc
@@ -42,6 +49,8 @@ add_executable(${bench_test_bin}
     bench/visual_dump.cc
     bench/rust_backend.cc
     bench/c_backend.cc
+    bench/aruco_nano_backend.cc
+    bench/aruco2_backend.cc
 )
 add_executable(${profile_bench_bin}
     bench/main.cc bench/benchmark.cc bench/visual_dump.cc
@@ -81,6 +90,7 @@ target_compile_definitions(${c_bin} PRIVATE
     APRILTAG_C_BACKEND
     APRILTAG_C_VERSION="3.4.5"
 )
+target_compile_definitions(${aruco_bin} PRIVATE ARUCO_LIVE_BACKEND)
 
 # These land after Buildroot's own BR2_TARGET_OPTIMIZATION and override it, so
 # applying them unconditionally gives a small-core (AMP) build the big core's
@@ -117,7 +127,7 @@ include_directories(
     ${CMAKE_CURRENT_SOURCE_DIR}/lib
 )
 
-foreach(bin IN ITEMS ${rvv_bin} ${c_bin} ${bench_bin} ${bench_test_bin}
+foreach(bin IN ITEMS ${rvv_bin} ${c_bin} ${aruco_bin} ${bench_bin} ${bench_test_bin}
                      ${profile_bench_bin} ${workload_bin} ${sequence_bin})
     target_link_directories(${bin} PRIVATE
         ${usr_root}/lib
@@ -137,6 +147,11 @@ set(APRILTAG_C_WORKLOAD_LIB ${usr_root}/lib/libapriltag_workload.a)
 file(SHA256 "${APRILTAG_RVV_LIB}" APRILTAG_RVV_LIB_SHA256)
 file(SHA256 "${APRILTAG_RVV_PROFILE_LIB}" APRILTAG_RVV_PROFILE_LIB_SHA256)
 file(SHA256 "${APRILTAG_C_LIB}" APRILTAG_C_LIB_SHA256)
+file(SHA256 "${usr_root}/include/aruco_nano/aruco_nano.h" ARUCO_NANO_HEADER_SHA256)
+file(SHA256 "${usr_root}/lib/libaruco_nano_dictionary.a" ARUCO_NANO_DICTIONARY_SHA256)
+string(SHA256 ARUCO_NANO_SHA256
+    "${ARUCO_NANO_HEADER_SHA256}${ARUCO_NANO_DICTIONARY_SHA256}")
+file(SHA256 "${usr_root}/lib/libaruco2.a" ARUCO2_LIB_SHA256)
 file(SHA256 "${CMAKE_CURRENT_SOURCE_DIR}/src/apriltag.h" APRILTAG_ABI_SHA256)
 file(SHA256 "${CMAKE_CURRENT_SOURCE_DIR}/lib/rust_apriltag_profile.h"
      APRILTAG_PROFILE_ABI_SHA256)
@@ -154,6 +169,8 @@ set(APRILTAG_BENCH_SOURCE_FILES
     "${CMAKE_CURRENT_SOURCE_DIR}/bench/visual_dump.cc"
     "${CMAKE_CURRENT_SOURCE_DIR}/bench/rust_backend.cc"
     "${CMAKE_CURRENT_SOURCE_DIR}/bench/c_backend.cc"
+    "${CMAKE_CURRENT_SOURCE_DIR}/bench/aruco_nano_backend.cc"
+    "${CMAKE_CURRENT_SOURCE_DIR}/bench/aruco2_backend.cc"
     "${CMAKE_CURRENT_SOURCE_DIR}/CMakeLists.txt")
 list(SORT APRILTAG_BENCH_SOURCE_FILES)
 set(APRILTAG_BENCH_SOURCE_CONTENTS "")
@@ -202,6 +219,8 @@ string(SHA256 APRILTAG_SEQUENCE_SOURCE_SHA256 "${APRILTAG_SEQUENCE_SOURCE_CONTEN
 string(SUBSTRING "${APRILTAG_RVV_LIB_SHA256}" 0 12 APRILTAG_RVV_LIB_HASH)
 string(SUBSTRING "${APRILTAG_RVV_PROFILE_LIB_SHA256}" 0 12 APRILTAG_RVV_PROFILE_LIB_HASH)
 string(SUBSTRING "${APRILTAG_C_LIB_SHA256}" 0 12 APRILTAG_C_LIB_HASH)
+string(SUBSTRING "${ARUCO_NANO_SHA256}" 0 12 ARUCO_NANO_HASH)
+string(SUBSTRING "${ARUCO2_LIB_SHA256}" 0 12 ARUCO2_LIB_HASH)
 string(SUBSTRING "${APRILTAG_ABI_SHA256}" 0 12 APRILTAG_ABI_HASH)
 string(SUBSTRING "${APRILTAG_PROFILE_ABI_SHA256}" 0 12 APRILTAG_PROFILE_ABI_HASH)
 string(SUBSTRING "${APRILTAG_PENDING_ABI_SHA256}" 0 12 APRILTAG_PENDING_ABI_HASH)
@@ -215,7 +234,7 @@ set(APRILTAG_COMPILER_ID "${CMAKE_CXX_COMPILER_ID}${CMAKE_CXX_COMPILER_VERSION}"
 string(REGEX REPLACE "[^A-Za-z0-9._-]" "-" APRILTAG_COMPILER_ID
     "${APRILTAG_COMPILER_ID}")
 set(APRILTAG_BENCH_BUILD_ID
-    "rvv-${APRILTAG_RVV_GIT_ID}_sdk-${APRILTAG_SDK_GIT_ID}_lib-${APRILTAG_RVV_LIB_HASH}_bench-${APRILTAG_BENCH_SOURCE_HASH}_clib-${APRILTAG_C_LIB_HASH}_abi-${APRILTAG_ABI_HASH}_kernelabi-${APRILTAG_KERNEL_ABI_HASH}_cc-${APRILTAG_COMPILER_ID}")
+    "rvv-${APRILTAG_RVV_GIT_ID}_sdk-${APRILTAG_SDK_GIT_ID}_lib-${APRILTAG_RVV_LIB_HASH}_bench-${APRILTAG_BENCH_SOURCE_HASH}_clib-${APRILTAG_C_LIB_HASH}_nano-${ARUCO_NANO_HASH}_aruco2-${ARUCO2_LIB_HASH}_abi-${APRILTAG_ABI_HASH}_kernelabi-${APRILTAG_KERNEL_ABI_HASH}_cc-${APRILTAG_COMPILER_ID}")
 string(REGEX REPLACE "[^A-Za-z0-9._-]" "-" APRILTAG_BENCH_BUILD_ID
     "${APRILTAG_BENCH_BUILD_ID}")
 message(STATUS "AprilTag benchmark build ID: ${APRILTAG_BENCH_BUILD_ID}")
@@ -279,12 +298,34 @@ target_link_libraries(${c_bin}
     -Wl,--end-group
 )
 
+target_link_libraries(${aruco_bin}
+    -Wl,--start-group
+    aruco2
+    aruco_nano_dictionary
+    k230_osd
+    opencv_videoio
+    opencv_imgcodecs
+    opencv_imgproc
+    opencv_core
+    v4l2-drm
+    drm
+    display
+    mmz
+    pthread
+    dl
+    m
+    rt
+    -Wl,--end-group
+)
+
 # The fixed-image benchmark deliberately excludes all camera, DRM, display, and
 # MMZ libraries so process-level perf counters cover detector work only.
 target_link_libraries(${bench_bin}
     -Wl,--start-group
     ${APRILTAG_RVV_LIB}
     ${APRILTAG_C_LIB}
+    aruco2
+    aruco_nano_dictionary
     opencv_imgcodecs
     opencv_imgproc
     opencv_core
@@ -298,6 +339,8 @@ target_link_libraries(${bench_test_bin}
     -Wl,--start-group
     ${APRILTAG_RVV_LIB}
     ${APRILTAG_C_LIB}
+    aruco2
+    aruco_nano_dictionary
     opencv_imgcodecs
     opencv_imgproc
     opencv_core
@@ -325,13 +368,14 @@ add_custom_target(apriltag_benchmark_build_verification ALL
         -DWORKLOAD=$<TARGET_FILE:${workload_bin}>
         -DDEMO=$<TARGET_FILE:${rvv_bin}>
         -DC_DEMO=$<TARGET_FILE:${c_bin}>
+        -DARUCO_DEMO=$<TARGET_FILE:${aruco_bin}>
         -DNM=${CMAKE_NM}
         -DSTRINGS=strings
         -DPRODUCTION_ID=${APRILTAG_BENCH_BUILD_ID}
         -DPROFILE_ID=${APRILTAG_PROFILE_BENCH_BUILD_ID}
         -DSEQUENCE_ID=${APRILTAG_SEQUENCE_BENCH_BUILD_ID}
         -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/verify_benchmark_build.cmake
-    DEPENDS ${rvv_bin} ${c_bin} ${bench_bin} ${profile_bench_bin} ${sequence_bin}
+    DEPENDS ${rvv_bin} ${c_bin} ${aruco_bin} ${bench_bin} ${profile_bench_bin} ${sequence_bin}
             ${workload_bin}
     VERBATIM)
 target_link_libraries(${workload_bin}
@@ -347,6 +391,8 @@ if(CMAKE_TOOLCHAIN_FILE MATCHES "buildroot/toolchainfile.cmake")
     install(DIRECTORY utils/ DESTINATION /root/app/apriltag_demo USE_SOURCE_PERMISSIONS)
     install(TARGETS ${c_bin} DESTINATION /root/app/apriltag_c_demo)
     install(DIRECTORY utils_c/ DESTINATION /root/app/apriltag_c_demo USE_SOURCE_PERMISSIONS)
+    install(TARGETS ${aruco_bin} DESTINATION /root/app/aruco_demo)
+    install(DIRECTORY utils_aruco/ DESTINATION /root/app/aruco_demo USE_SOURCE_PERMISSIONS)
     install(DIRECTORY utils_profile/ DESTINATION /root/app/apriltag_profile USE_SOURCE_PERMISSIONS)
     install(TARGETS ${bench_bin} ${profile_bench_bin} ${workload_bin} ${sequence_bin}
         DESTINATION /root/app/apriltag_bench)
@@ -354,6 +400,6 @@ if(CMAKE_TOOLCHAIN_FILE MATCHES "buildroot/toolchainfile.cmake")
     install(DIRECTORY utils_bench/ DESTINATION /root/app/apriltag_bench USE_SOURCE_PERMISSIONS)
 else()
     message(STATUS "Standalone build -> ./bin/")
-    install(TARGETS ${rvv_bin} ${c_bin} ${bench_bin} ${profile_bench_bin}
+    install(TARGETS ${rvv_bin} ${c_bin} ${aruco_bin} ${bench_bin} ${profile_bench_bin}
         ${workload_bin} ${sequence_bin} DESTINATION bin)
 endif()

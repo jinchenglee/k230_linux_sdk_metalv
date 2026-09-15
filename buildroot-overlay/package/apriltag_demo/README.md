@@ -1,10 +1,12 @@
 # K230 AprilTag comparison demos
 
-This package builds two applications around the same K230 camera, luma
+This package builds three applications around the same K230 camera, luma
 preprocessing, display, keyboard-control, and FPS-reporting code:
 
 - `apriltag_demo.elf`: the Rust `apriltag-rvv` detector
 - `apriltag_c_demo.elf`: the official AprilRobotics C detector, version 3.4.5
+- `aruco_demo.elf`: runtime-selectable ArUco Nano or ArUco2, with strict
+  and tolerant acceptance modes
 
 It also builds `k230_apriltag_bench`, a fixed-image detector benchmark that
 links no camera or display libraries. Its installed JPEG fixture is an unchanged
@@ -22,7 +24,7 @@ archive and license are verified by `package/apriltag/apriltag.hash`.
 ## Build
 
 ```sh
-make CONF=k230_canmv_defconfig apriltag_demo
+make CONF=k230_canmv_small_core_defconfig apriltag_demo
 ```
 
 The applications are installed in the target tree at:
@@ -30,14 +32,15 @@ The applications are installed in the target tree at:
 ```text
 /root/app/apriltag_demo/
 /root/app/apriltag_c_demo/
+/root/app/aruco_demo/
 /root/app/apriltag_profile/
 /root/app/apriltag_bench/
 ```
 
-The package containing both is:
+The package containing the applications is:
 
 ```text
-output/k230_canmv_defconfig/images/deb/k230-apriltag-demo.deb
+output/k230_canmv_small_core_defconfig/images/deb/k230-apriltag-demo.deb
 ```
 
 ## Comparable runs
@@ -56,10 +59,31 @@ cd /root/app/apriltag_c_demo
 ./apriltag_c_demo.elf --factor 2 --min-blob 25 \
     --csi-size 1280x720 --usb-video 3 --threads 1 \
     --bits-corrected 0 --decode-sharpening 0
+
+cd /root/app/aruco_demo
+./aruco_demo.elf --backend nano --mode strict --factor 1 \
+    --csi-size 1280x720 --usb-video 3
+./aruco_demo.elf --backend aruco2 --mode tolerant --factor 1 \
+    --csi-size 1280x720 --usb-video 3
 ```
 
-Both applications start on CSI. Press `u` for the configured USB camera, `c`
+All three applications start on CSI. Press `u` for the configured USB camera, `c`
 for CSI, `n` to cycle the identical luma denoise modes, and `q` to quit.
+
+The ArUco application defaults to Nano, strict mode, factor 1, and a 10-pixel
+minimum candidate side. `strict` and `tolerant` are project-defined convenience
+presets, not modes named by either upstream implementation. Strict sets payload
+correction and permitted border-error rates to 0. Tolerant sets both to 1, the
+maximally permissive setting exposed by these parameters. Tolerant is an
+experimental recall-oriented setting, not the recommended production default:
+it does more work and may accept false detections. Factors 1.5 and 2 explicitly
+resize the detector input with area interpolation and map returned coordinates
+back to the full camera frame.
+
+Each application directory contains a `run.sh` with its normal explicit
+defaults. Extra arguments are placed last and therefore override value-taking
+defaults. The C launcher also accepts `--upstream-defaults` to replace the
+comparison settings as a group.
 
 The Rust application retains reusable detector-owned CCL scratch by default.
 Pass `--local-ccl-scratch` to allocate fresh CCL scratch for each detection as
@@ -99,7 +123,27 @@ extension and one selected backend:
 ./k230_apriltag_bench --input fixture.data --format jpeg --size 1920x1080
 ./k230_apriltag_bench --input fixture.jpg --backend rust-rvv --size 1280x720
 ./k230_apriltag_bench --input fixture.jpg --backend c --size 1280x720
+./k230_apriltag_bench --input fixture.jpg --backend aruco-nano --size native
+./k230_apriltag_bench --input fixture.jpg --backend aruco2 --size native \
+    --aruco-error-correction-rate 1 --aruco-border-error-rate 1
 ```
+
+`--backend all` runs Rust RVV, AprilTag 3 C, Rust scalar, ArUco Nano, and
+ArUco2. On the vector-free small-core image, Rust RVV remains present and uses
+its existing scalar fallback. The two ArUco backends support factors 1, 1.5,
+and 2 by explicitly resizing their input; their `RESULT` records split that
+non-native scaling time from native detector and adapter time. Factor 1 reports
+zero scaling time. `--detections-out PATH` writes normalized IDs, centers, and
+corners as JSON after validation and outside measured calls. ArUco has no
+AprilTag decision-margin equivalent, so its JSON margin is `null` and its
+overlay shows `m n/a`.
+
+ArUco defaults to exact payload and border matching. The two rate options are
+independent floating-point values in `[0,1]`; setting both to 1 reproduces the
+live application tolerant mode. These are deliberately reported as operating
+points, not accuracy rankings: precision and recall require labeled ground
+truth. The experiment record and measured fixture/video observations are in
+`docs/superpowers/plans/2026-09-14-aruco-backends-benchmark.md`.
 
 Run the untimed workload comparison with the same input and detector options:
 
@@ -127,10 +171,8 @@ the reported numbers remain production API throughput comparisons but are not
 equivalent-output speedups.
 
 The wrapper writes visual validation artifacts to the timestamped result
-directory under `images/`: `input.png`, `rust-rvv-detections.png`,
-`rust-scalar-detections.png`, and `c-reference-detections.png`. Each selected
-backend image overlays its validation-call quadrilaterals, centers, IDs,
-decision margins, and detection count on the identical prepared grayscale
+directory under `images/`: `input.png` and one `<backend>-detections.png` for every selected backend. Each backend image overlays its validation-call
+quadrilaterals, centers, IDs, decision margins, and detection count on the identical prepared grayscale
 input. Empty results are labeled `No detections`. Image conversion, drawing,
 and PNG encoding happen after all validation calls and before warmup, outside
 detector timing. Direct runs enable this with `--dump-dir PATH`; `--no-dump`

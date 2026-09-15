@@ -1,6 +1,6 @@
 APRILTAG_DEMO_SITE = $(realpath $(TOPDIR))"/package/apriltag_demo"
 APRILTAG_DEMO_SITE_METHOD = local
-APRILTAG_DEMO_DEPENDENCIES += opencv4 display vvcam libmmz apriltag k230_osd binutils linux
+APRILTAG_DEMO_DEPENDENCIES += opencv4 aruco_nano aruco2 display vvcam libmmz apriltag k230_osd binutils linux
 APRILTAG_DEMO_RVV_DIR ?= $(realpath $(TOPDIR)/../../../apriltag-rvv)
 # Legacy production-only force control. Workload and profile have separate
 # controls so forcing production does not rebuild instrumented variants.
@@ -118,6 +118,7 @@ define APRILTAG_DEMO_BUILD_DEB
 	mkdir -p $(@D)/deb/root/app/
 	$(call COPYFILE,$(TARGET_DIR)/root/app/apriltag_demo,$(@D)/deb/root/app/)
 	$(call COPYFILE,$(TARGET_DIR)/root/app/apriltag_c_demo,$(@D)/deb/root/app/)
+	$(call COPYFILE,$(TARGET_DIR)/root/app/aruco_demo,$(@D)/deb/root/app/)
 	$(call COPYFILE,$(TARGET_DIR)/root/app/apriltag_profile,$(@D)/deb/root/app/)
 	$(call COPYFILE,$(TARGET_DIR)/root/app/apriltag_bench,$(@D)/deb/root/app/)
 	echo "Package: k230-apriltag-demo"                    >  $(@D)/deb/DEBIAN/control
@@ -126,7 +127,7 @@ define APRILTAG_DEMO_BUILD_DEB
 	echo "Priority: optional"                             >> $(@D)/deb/DEBIAN/control
 	echo "Architecture: riscv64"                          >> $(@D)/deb/DEBIAN/control
 	echo "Maintainer: K230 Dev <dev@example.com>"         >> $(@D)/deb/DEBIAN/control
-	echo "Description: AprilTag Rust/C demos and profiling tools for K230" >> $(@D)/deb/DEBIAN/control
+	echo "Description: AprilTag/ArUco live demos and profiling tools for K230" >> $(@D)/deb/DEBIAN/control
 	mkdir -p $(BINARIES_DIR)/deb
 	dpkg -b $(@D)/deb $(BINARIES_DIR)/deb/$(call LOWERCASE,k230-$(PKG)).deb
 endef
@@ -144,7 +145,9 @@ define APRILTAG_DEMO_AUDIT_VECTOR_FREE
 	bash $(APRILTAG_DEMO_PKGDIR)/scripts/audit_vector_free.sh \
 		$(TARGET_OBJDUMP) \
 		$(@D)/apriltag_demo.elf \
-		$(@D)/apriltag_c_demo.elf
+		$(@D)/apriltag_c_demo.elf \
+		$(@D)/aruco_demo.elf \
+		$(@D)/k230_apriltag_bench
 endef
 APRILTAG_DEMO_POST_INSTALL_TARGET_HOOKS += APRILTAG_DEMO_AUDIT_VECTOR_FREE
 endif

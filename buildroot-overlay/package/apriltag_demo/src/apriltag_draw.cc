@@ -1,6 +1,7 @@
 /* OSD overlay drawing for apriltag_demo — mirrors live_demo.rs overlays. */
 #include "apriltag_draw.h"
 #include <algorithm>
+#include <cmath>
 
 // ARGB (CV_8UC4) colors in OpenCV BGRA order.
 static const cv::Scalar kGreen (0,   255, 0,   255);
@@ -172,8 +173,13 @@ void draw_detections(cv::Mat& osd,
         int cx = (int)(d.center[0] * s);
         int cy = (int)(d.center[1] * s);
         char label[64];
-        snprintf(label, sizeof(label), "id=%llu m=%.1f",
-                 (unsigned long long)d.id, d.margin);
+        if (std::isfinite(d.margin)) {
+            snprintf(label, sizeof(label), "id=%llu m=%.1f",
+                     (unsigned long long)d.id, d.margin);
+        } else {
+            snprintf(label, sizeof(label), "id=%llu",
+                     (unsigned long long)d.id);
+        }
         cv::putText(osd, label, cv::Point(cx - 40, cy),
                     cv::FONT_HERSHEY_SIMPLEX, 0.55, kYellow, 2, cv::LINE_8, false);
     }
@@ -324,8 +330,13 @@ void draw_detections_lcd_90cw(cv::Mat& osd_portrait,
 
         cv::Point c = lcd_rotate_90cw_point(d.center[0] * sx, d.center[1] * sy, landscape_h);
         char label[64];
-        snprintf(label, sizeof(label), "id=%llu m=%.1f",
-                 (unsigned long long)d.id, d.margin);
+        if (std::isfinite(d.margin)) {
+            snprintf(label, sizeof(label), "id=%llu m=%.1f",
+                     (unsigned long long)d.id, d.margin);
+        } else {
+            snprintf(label, sizeof(label), "id=%llu",
+                     (unsigned long long)d.id);
+        }
 
         // Text glyph orientation is intentionally NOT corrected here, by
         // explicit product decision: cv::putText always draws glyphs

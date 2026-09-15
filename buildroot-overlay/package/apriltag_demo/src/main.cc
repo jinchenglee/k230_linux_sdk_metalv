@@ -30,16 +30,28 @@
 #ifdef APRILTAG_C_BACKEND
 #include "apriltag_c_adapter.h"
 #endif
+#ifdef ARUCO_LIVE_BACKEND
+#include "aruco_live_adapter.h"
+#endif
 
 using std::cerr;
 using std::cout;
 using std::endl;
 
 // ── Config (from argv) ──────────────────────────────────────────────────────
+#ifdef ARUCO_LIVE_BACKEND
+static int    g_factor_int   = 0;     // ArUco default: native resolution
+static double g_factor_value = 1.0;
+#else
 static int    g_factor_int   = 2;     // FFI: 0=1.0 1=1.5 2=2.0
 static double g_factor_value = 2.0;
+#endif
 static int    g_mode         = 0;     // FFI: 0=scalar 1=rvv
+#ifdef ARUCO_LIVE_BACKEND
+static uint32_t g_min_blob   = 10;    // native ArUco minimum contour side
+#else
 static uint32_t g_min_blob   = 25;
+#endif
 static bool g_debug_enabled  = false;
 static bool g_local_ccl_scratch = false;
 static std::atomic<int> g_debug_stage(0);
@@ -68,6 +80,10 @@ static int g_c_threads = 1;
 static int g_c_bits_corrected = 0;
 static int g_c_refine_edges = 0;
 static double g_c_decode_sharpening = 0.0;
+#endif
+#ifdef ARUCO_LIVE_BACKEND
+static int g_aruco_backend = ARUCO_LIVE_BACKEND_NANO;
+static bool g_aruco_tolerant = false;
 #endif
 
 #define MAX_DETS 64
@@ -118,7 +134,7 @@ static const char* denoise_mode_name(int mode)
 static void print_key_help()
 {
     cout << "keys: c=CSI u=USB n=denoise";
-#ifndef APRILTAG_C_BACKEND
+#if !defined(APRILTAG_C_BACKEND) && !defined(ARUCO_LIVE_BACKEND)
     if (g_debug_enabled) {
         cout << " 0=camera 1=gray 2=threshold 3=clusters"
                 " 4=quads 5=detections";
@@ -130,13 +146,27 @@ static void print_key_help()
 static void print_usage(const char* name)
 {
     cout << "Usage: " << name;
-#ifndef APRILTAG_C_BACKEND
+#ifdef ARUCO_LIVE_BACKEND
+    cout << " [--backend nano|aruco2] [--mode strict|tolerant]";
+#elif !defined(APRILTAG_C_BACKEND)
     cout << " [--rvv] [--local-ccl-scratch]";
 #endif
-    cout << " [--factor 1|1.5|2] [--min-blob N]"
-            " [--csi-size WxH] [--usb-video X] [--display-fps N]"
+    cout << " [--factor 1|1.5|2]";
+#ifdef ARUCO_LIVE_BACKEND
+    cout << " [--min-marker-size N]";
+#else
+    cout << " [--min-blob N]";
+#endif
+    cout << " [--csi-size WxH] [--usb-video X] [--display-fps N]"
             " [--no-display] [--debug]" << endl;
-#ifndef APRILTAG_C_BACKEND
+#ifdef ARUCO_LIVE_BACKEND
+    cout << "  --backend     select ArUco Nano or ArUco2 (default: nano)"
+         << endl;
+    cout << "  --mode        project preset: strict uses correction=0, border=0"
+            " (default)" << endl;
+    cout << "                tolerant uses maximum correction=1, border=1;"
+            " may cost time and accept false detections" << endl;
+#elif !defined(APRILTAG_C_BACKEND)
     cout << "  --rvv         use RVV kernels (default: scalar)" << endl;
     cout << "  --local-ccl-scratch  allocate CCL scratch per detection"
             " (default: reusable)" << endl;
@@ -150,9 +180,16 @@ static void print_usage(const char* name)
     cout << "  --upstream-defaults  use C defaults: blob=5, bits=2,"
             " refine on, sharpening=0.25" << endl;
 #endif
+#ifdef ARUCO_LIVE_BACKEND
+    cout << "  --factor      explicit input scaling 1.0/1.5/2.0"
+            " (default: 1.0)" << endl;
+    cout << "  --min-marker-size  minimum candidate side in detector-input"
+            " pixels (default: 10)" << endl;
+#else
     cout << "  --factor      decimation factor 1.0/1.5/2.0 (default: 2.0)"
          << endl;
     cout << "  --min-blob    minimum blob size (default: 25)" << endl;
+#endif
     cout << "  --csi-size    CSI detection stream size (default: "
          << SENSOR_WIDTH << "x" << SENSOR_HEIGHT << ")" << endl;
     cout << "  --usb-video   USB camera node number X for /dev/videoX" << endl;
@@ -162,17 +199,20 @@ static void print_usage(const char* name)
             " thread (production shape)." << endl;
     cout << "                Prints a per-second [headless] line with detect"
             " fps and tag counts." << endl;
-#ifndef APRILTAG_C_BACKEND
+#if !defined(APRILTAG_C_BACKEND) && !defined(ARUCO_LIVE_BACKEND)
     cout << "  --debug       enable live pipeline views and decode diagnostics"
             " (default: off)" << endl;
-#else
+#elif defined(APRILTAG_C_BACKEND)
     cout << "  --debug       dump one set of upstream debug images and enable"
             " detection logs" << endl;
+#else
+    cout << "  --debug       enable throttled detection logs; ArUco pipeline"
+            " images are unavailable" << endl;
 #endif
     cout << "  c             select CSI camera (default)" << endl;
     cout << "  u             select configured USB camera" << endl;
     cout << "  n             cycle luma denoise: off/median3/Gaussian3" << endl;
-#ifndef APRILTAG_C_BACKEND
+#if !defined(APRILTAG_C_BACKEND) && !defined(ARUCO_LIVE_BACKEND)
     cout << "  0..5          select pipeline view (requires --debug)" << endl;
 #endif
     cout << "  q             quit" << endl;
@@ -274,7 +314,7 @@ static void detect_proc(int video_device)
     }
 
     void* det = nullptr;
-#ifdef APRILTAG_C_BACKEND
+#if defined(APRILTAG_C_BACKEND) || defined(ARUCO_LIVE_BACKEND)
     det = apriltag_new(g_min_blob);
 #else
     det = create_configured_detector(g_min_blob, g_local_ccl_scratch,
@@ -292,6 +332,14 @@ static void detect_proc(int video_device)
                              g_c_refine_edges,
                              g_c_decode_sharpening) != 0) {
         cerr << "detect: cannot configure official C detector" << endl;
+        apriltag_free(det);
+        v4l2_drm_stop(&context);
+        return;
+    }
+#elif defined(ARUCO_LIVE_BACKEND)
+    if (aruco_live_configure(det, g_aruco_backend,
+                             g_aruco_tolerant ? 1 : 0) != 0) {
+        cerr << "detect: cannot configure ArUco detector" << endl;
         apriltag_free(det);
         v4l2_drm_stop(&context);
         return;
@@ -327,8 +375,12 @@ static void detect_proc(int video_device)
 
     while (!detect_stop) {
         const int selected_source = g_input_source.load();
+#ifdef ARUCO_LIVE_BACKEND
+        const int selected_debug_stage = 0;
+#else
         const int selected_debug_stage =
             g_debug_enabled ? g_debug_stage.load() : 0;
+#endif
         const bool use_lcd_fastpath =
             !g_no_display && selected_debug_stage == 0 && selected_source == 0 &&
             display->width < display->height;
@@ -855,14 +907,19 @@ static void parse_args(int argc, char* argv[])
         std::string scratch_error;
         const int scratch_option = parse_ccl_scratch_option(
             a,
-#ifdef APRILTAG_C_BACKEND
+#if defined(APRILTAG_C_BACKEND) || defined(ARUCO_LIVE_BACKEND)
             true,
 #else
             false,
 #endif
             g_local_ccl_scratch, scratch_error);
         if (scratch_option < 0) {
+#ifdef ARUCO_LIVE_BACKEND
+            cerr << "--local-ccl-scratch is only valid for apriltag_demo; "
+                    "aruco_demo does not use Rust CCL scratch" << endl;
+#else
             cerr << scratch_error << endl;
+#endif
             exit(2);
         } else if (scratch_option > 0) {
             continue;
@@ -870,6 +927,10 @@ static void parse_args(int argc, char* argv[])
 #ifdef APRILTAG_C_BACKEND
             cerr << "--rvv is only valid for apriltag_demo; "
                     "apriltag_c_demo uses the upstream C detector" << endl;
+            exit(2);
+#elif defined(ARUCO_LIVE_BACKEND)
+            cerr << "--rvv is only valid for apriltag_demo; "
+                    "aruco_demo has no RVV backend" << endl;
             exit(2);
 #else
             g_mode = 1;
@@ -903,6 +964,35 @@ static void parse_args(int argc, char* argv[])
             g_c_bits_corrected = 2;
             g_c_refine_edges = 1;
             g_c_decode_sharpening = 0.25;
+#elif defined(ARUCO_LIVE_BACKEND)
+        } else if (a == "--backend") {
+            if (i + 1 >= argc) {
+                cerr << "--backend requires nano or aruco2" << endl;
+                exit(2);
+            }
+            const std::string backend = argv[++i];
+            if (backend == "nano" || backend == "aruco-nano") {
+                g_aruco_backend = ARUCO_LIVE_BACKEND_NANO;
+            } else if (backend == "aruco2") {
+                g_aruco_backend = ARUCO_LIVE_BACKEND_ARUCO2;
+            } else {
+                cerr << "--backend must be nano or aruco2" << endl;
+                exit(2);
+            }
+        } else if (a == "--mode") {
+            if (i + 1 >= argc) {
+                cerr << "--mode requires strict or tolerant" << endl;
+                exit(2);
+            }
+            const std::string mode = argv[++i];
+            if (mode == "strict") {
+                g_aruco_tolerant = false;
+            } else if (mode == "tolerant") {
+                g_aruco_tolerant = true;
+            } else {
+                cerr << "--mode must be strict or tolerant" << endl;
+                exit(2);
+            }
 #endif
         } else if (a == "--factor" && i + 1 < argc) {
             std::string f = argv[++i];
@@ -919,8 +1009,19 @@ static void parse_args(int argc, char* argv[])
                 cerr << "--factor must be 1, 1.5, or 2" << endl;
                 exit(2);
             }
+#ifdef ARUCO_LIVE_BACKEND
+        } else if ((a == "--min-marker-size" || a == "--min-blob") &&
+                   i + 1 < argc) {
+            const int value = atoi(argv[++i]);
+            if (value < 1) {
+                cerr << "--min-marker-size must be at least 1" << endl;
+                exit(2);
+            }
+            g_min_blob = static_cast<uint32_t>(value);
+#else
         } else if (a == "--min-blob" && i + 1 < argc) {
             g_min_blob = (uint32_t)atoi(argv[++i]);
+#endif
         } else if (a == "--csi-size" && i + 1 < argc) {
             unsigned width = 0, height = 0;
             char trailing = '\0';
@@ -965,6 +1066,8 @@ int main(int argc, char* argv[])
 #ifdef APRILTAG_C_BACKEND
     cout << "apriltag_c_demo (AprilTag C " APRILTAG_C_VERSION
             ") built at " << __DATE__ << " " << __TIME__ << endl;
+#elif defined(ARUCO_LIVE_BACKEND)
+    cout << "aruco_demo built at " << __DATE__ << " " << __TIME__ << endl;
 #else
     cout << "apriltag_demo built at " << __DATE__ << " " << __TIME__ << endl;
 #endif
@@ -974,13 +1077,24 @@ int main(int argc, char* argv[])
          << " threads=" << g_c_threads
          << " bits_corrected=" << g_c_bits_corrected
          << " refine_edges=" << (g_c_refine_edges ? "on" : "off")
-         << " decode_sharpening=" << g_c_decode_sharpening
+         << " decode_sharpening=" << g_c_decode_sharpening;
+#elif defined(ARUCO_LIVE_BACKEND)
+    cout << "backend="
+         << (g_aruco_backend == ARUCO_LIVE_BACKEND_NANO
+                 ? "aruco-nano" : "aruco2")
+         << " mode=" << (g_aruco_tolerant ? "tolerant" : "strict")
+         << " error_correction_rate=" << (g_aruco_tolerant ? 1 : 0)
+         << " border_error_rate=" << (g_aruco_tolerant ? 1 : 0);
 #else
     cout << "mode=" << (g_mode ? "rvv" : "scalar")
-         << " ccl_scratch=" << ccl_scratch_mode_name(g_local_ccl_scratch)
+         << " ccl_scratch=" << ccl_scratch_mode_name(g_local_ccl_scratch);
 #endif
-         << " factor=" << g_factor_value
+    cout << " factor=" << g_factor_value
+#ifdef ARUCO_LIVE_BACKEND
+         << " min_marker_size=" << g_min_blob
+#else
          << " min_blob=" << g_min_blob
+#endif
          << " debug=" << (g_debug_enabled ? "on" : "off")
          << " input=CSI"
          << " csi_request=" << g_csi_width << "x" << g_csi_height
@@ -992,7 +1106,9 @@ int main(int argc, char* argv[])
     }
     cout << endl;
 
+#ifndef ARUCO_LIVE_BACKEND
     signal(SIGUSR1, handle_view_cycle_signal);
+#endif
 
     if (g_no_display) {
         fprintf(stderr, "[display] headless: no DRM output, no OSD, "
@@ -1065,6 +1181,9 @@ int main(int argc, char* argv[])
 #ifdef APRILTAG_C_BACKEND
             cerr << "\nlive pipeline views are available in apriltag_demo; "
                     "use --debug to dump one set of upstream C images" << endl;
+#elif defined(ARUCO_LIVE_BACKEND)
+            cerr << "\nArUco pipeline views are unavailable; detections remain "
+                    "visible in the normal camera overlay" << endl;
 #else
             if (!g_debug_enabled) {
                 cerr << "\npipeline views are disabled; restart with --debug"

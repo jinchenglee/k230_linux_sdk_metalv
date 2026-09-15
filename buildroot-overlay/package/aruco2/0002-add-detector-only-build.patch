@@ -1,0 +1,93 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: K230 Linux SDK <dev@example.com>
+Date: Mon, 14 Sep 2026 00:00:00 -0700
+Subject: [PATCH] cmake: add minimal detector-only library build
+
+The benchmark uses only detectFiducialMarkers. Exclude board, pose, diamond,
+fractal, drawing, and marker-generation APIs so the edge image does not need
+OpenCV highgui, calib3d, features2d, flann, or ml for ArUco2.
+---
+ CMakeLists.txt |  6 ++++++
+ src/aruco2.cpp | 14 +++++++++++++-
+ 2 files changed, 19 insertions(+), 1 deletion(-)
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -51,6 +51,12 @@ SET(SRCARUCO2  opencv2/objdetect/aruco2.hpp src/aruco2.cpp src/aruco_dictionary
+ )
+ 
+ option(ARUCO2_BUILD_UTILS "Build ArUco2 utility programs" ON)
++option(ARUCO2_DETECTOR_ONLY "Build only the fiducial detector API" OFF)
++
++if(ARUCO2_DETECTOR_ONLY)
++    list(REMOVE_ITEM SRCARUCO2 src/aruco2_fractal.cpp)
++    add_compile_definitions(ARUCO2_DETECTOR_ONLY=1)
++endif()
+ 
+ add_library(aruco2 STATIC ${SRCARUCO2})
+ target_include_directories(aruco2 PUBLIC
+diff --git a/src/aruco2.cpp b/src/aruco2.cpp
+--- a/src/aruco2.cpp
++++ b/src/aruco2.cpp
+@@ -6,13 +6,16 @@
+ #include "opencv2/objdetect/aruco2.hpp"
+ #include "aruco2_dictionary.hpp"
+ #include "opencv2/imgproc.hpp"
++#ifndef ARUCO2_DETECTOR_ONLY
+ #include "opencv2/flann.hpp"
++#include <opencv2/highgui.hpp>
++#endif
+ #include "opencv2/core/hal/intrin.hpp"
+ #include "opencv2/core/utils/logger.hpp"
+-#include <opencv2/highgui.hpp>
+ 
+ #include "opencl_kernels_aruco2.hpp"
+ 
++#ifndef ARUCO2_DETECTOR_ONLY
+ //IF OpenCV 5
+ #if CV_VERSION_MAJOR >= 5
+ #include <opencv2/3d.hpp>
+@@ -20,6 +23,7 @@
+ #elif CV_VERSION_MAJOR >= 4
+ #include <opencv2/calib3d.hpp>
+ #endif
++#endif
+ 
+ namespace {
+ using namespace cv;
+@@ -965,6 +969,7 @@ void MarkerDetector::thres255Adaptive(cv::Mat &in,cv::Mat &out,int off,int thre
+ }
+ 
+ 
++#ifndef ARUCO2_DETECTOR_ONLY
+ //////////////////////////////////// BOARD
+ 
+ std::vector<FiducialMarker> detect(DictionaryType dictionary, cv::Mat & src_gray,cv::Mat & thresImage,   int erosionIt,    const DetectionParameters &params){
+@@ -1263,6 +1268,7 @@ std::vector<std::pair<int,int>> getMarkerCornersFromGlobalCornerID( int gid,cv:
+ 
+     return result;
+ }
++#endif
+ 
+ }
+ 
+@@ -1280,6 +1286,8 @@ std::vector<FiducialMarker> detectFiducialMarkers(InputArray image,DictionaryTy
+     return detectFiducialMarkers(image,std::vector<DictionaryType>{dictionary},detectorParams);
+ }
+ 
++#ifndef ARUCO2_DETECTOR_ONLY
++
+ 
+ 
+ void getFiducialMarkerImage(OutputArray _img, DictionaryType dictionary, int id, int bitSize, bool externalBorder){
+@@ -1847,5 +1855,7 @@ void getGridBoardImage(OutputArray img, Size bSize, DictionaryType dictionary,
+ 
+    }
+ 
++#endif
++
+    } // namespace aruco2
+    } // namespace cv
+-- 
+2.43.0

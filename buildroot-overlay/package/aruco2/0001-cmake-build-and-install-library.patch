@@ -1,0 +1,48 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: K230 Linux SDK <dev@example.com>
+Date: Mon, 14 Sep 2026 00:00:00 -0700
+Subject: [PATCH] cmake: build and install reusable aruco2 library
+
+Upstream's standalone project builds each utility by compiling the complete
+source list into it. Expose those sources as a static library for Buildroot
+consumers and make the utility programs optional.
+---
+ CMakeLists.txt | 17 +++++++++++++++++
+ 1 file changed, 17 insertions(+)
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index e065ee8..f27ae12 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -48,6 +48,19 @@ SET(SRCARUCO2  opencv2/objdetect/aruco2.hpp src/aruco2.cpp src/aruco_dictionary
+     "${CMAKE_CURRENT_BINARY_DIR}/opencl_kernels_aruco2.cpp"
+ )
+ 
++option(ARUCO2_BUILD_UTILS "Build ArUco2 utility programs" ON)
++
++add_library(aruco2 STATIC ${SRCARUCO2})
++target_include_directories(aruco2 PUBLIC
++    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
++    $<INSTALL_INTERFACE:include>)
++target_link_libraries(aruco2 PUBLIC ${OpenCV_LIBS})
++install(TARGETS aruco2 ARCHIVE DESTINATION lib)
++install(FILES opencv2/objdetect/aruco2.hpp
++        DESTINATION include/opencv2/objdetect)
++
++if(ARUCO2_BUILD_UTILS)
++
+ # ---------------------------------------------------------------------------
+ # 5. Compiler warnings — pedantic, treat warnings as errors
+ # ---------------------------------------------------------------------------
+@@ -77,6 +90,8 @@ add_executable(aruco2_detect_raruco utils/aruco2_detect_raruco.cpp ${SRCARUCO2})
+ target_link_libraries(aruco2_detect_raruco PRIVATE ${OpenCV_LIBS})
+ 
+ 
++endif()
++
+ # ---------------------------------------------------------------------------
+ # 8. Status Printout
+ # ---------------------------------------------------------------------------
+-- 
+2.43.0
+

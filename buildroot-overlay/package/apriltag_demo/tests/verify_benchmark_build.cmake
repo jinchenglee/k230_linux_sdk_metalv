@@ -1,5 +1,6 @@
 if(NOT DEFINED PRODUCTION OR NOT DEFINED PROFILE OR NOT DEFINED SEQUENCE OR
-   NOT DEFINED WORKLOAD OR NOT DEFINED DEMO OR NOT DEFINED C_DEMO OR NOT DEFINED NM OR
+   NOT DEFINED WORKLOAD OR NOT DEFINED DEMO OR NOT DEFINED C_DEMO OR
+   NOT DEFINED ARUCO_DEMO OR NOT DEFINED NM OR
    NOT DEFINED STRINGS OR NOT DEFINED PRODUCTION_ID OR NOT DEFINED PROFILE_ID OR
    NOT DEFINED SEQUENCE_ID)
     message(FATAL_ERROR "benchmark build verification arguments are incomplete")
@@ -16,10 +17,12 @@ execute_process(COMMAND "${NM}" -g "${DEMO}" OUTPUT_VARIABLE demo_nm
                 RESULT_VARIABLE demo_nm_result)
 execute_process(COMMAND "${NM}" -g "${C_DEMO}" OUTPUT_VARIABLE c_demo_nm
                 RESULT_VARIABLE c_demo_nm_result)
+execute_process(COMMAND "${NM}" -g "${ARUCO_DEMO}" OUTPUT_VARIABLE aruco_demo_nm
+                RESULT_VARIABLE aruco_demo_nm_result)
 if(NOT production_nm_result EQUAL 0 OR NOT profile_nm_result EQUAL 0 OR
    NOT sequence_nm_result EQUAL 0 OR NOT workload_nm_result EQUAL 0 OR
    NOT demo_nm_result EQUAL 0 OR
-   NOT c_demo_nm_result EQUAL 0)
+   NOT c_demo_nm_result EQUAL 0 OR NOT aruco_demo_nm_result EQUAL 0)
     message(FATAL_ERROR "nm failed while verifying benchmark executables")
 endif()
 
@@ -44,7 +47,7 @@ nm_has_symbol("${sequence_nm}" apriltag_get_ccl_profile_v1 sequence_has_profile)
 nm_has_symbol("${production_nm}" apriltag_get_ccl_scratch_v1 production_has_scratch)
 nm_has_symbol("${profile_nm}" apriltag_get_ccl_scratch_v1 profile_has_scratch)
 nm_has_symbol("${sequence_nm}" apriltag_get_ccl_scratch_v1 sequence_has_scratch)
-foreach(output IN ITEMS production_nm profile_nm sequence_nm workload_nm demo_nm c_demo_nm)
+foreach(output IN ITEMS production_nm profile_nm sequence_nm workload_nm demo_nm c_demo_nm aruco_demo_nm)
     nm_has_symbol("${${output}}" apriltag_get_ccl_pending_profile_v1
                   ${output}_has_pending)
 endforeach()
@@ -64,12 +67,12 @@ if(NOT sequence_has_profile OR NOT sequence_has_scratch)
     message(FATAL_ERROR "sequence benchmark does not contain profile/scratch getters")
 endif()
 if(production_nm_has_pending OR workload_nm_has_pending OR demo_nm_has_pending OR
-   c_demo_nm_has_pending OR
+   c_demo_nm_has_pending OR aruco_demo_nm_has_pending OR
    NOT profile_nm_has_pending OR NOT sequence_nm_has_pending)
     message(FATAL_ERROR "pending profile getter is not isolated to profile consumers")
 endif()
 foreach(symbol IN ITEMS apriltag_get_ccl_grouping_profile_v1 apriltag_set_ccl_grouping_mode_v1)
-    foreach(output IN ITEMS production_nm profile_nm sequence_nm workload_nm demo_nm c_demo_nm)
+    foreach(output IN ITEMS production_nm profile_nm sequence_nm workload_nm demo_nm c_demo_nm aruco_demo_nm)
         nm_has_symbol("${${output}}" "${symbol}" has_obsolete_symbol)
         if(has_obsolete_symbol)
             message(FATAL_ERROR "executable contains obsolete grouping symbol ${symbol}")
@@ -81,6 +84,7 @@ nm_has_symbol("${profile_nm}" apriltag_set_ccl_scratch_mode_v1 profile_has_scrat
 nm_has_symbol("${sequence_nm}" apriltag_set_ccl_scratch_mode_v1 sequence_has_scratch_setter)
 nm_has_symbol("${demo_nm}" apriltag_set_ccl_scratch_mode_v1 demo_has_scratch_setter)
 nm_has_symbol("${c_demo_nm}" apriltag_set_ccl_scratch_mode_v1 c_demo_has_scratch_setter)
+nm_has_symbol("${aruco_demo_nm}" apriltag_set_ccl_scratch_mode_v1 aruco_demo_has_scratch_setter)
 if(NOT production_has_scratch_setter OR NOT profile_has_scratch_setter OR
    NOT sequence_has_scratch_setter)
     message(FATAL_ERROR "a Rust benchmark does not contain the production scratch setter")
@@ -88,8 +92,8 @@ endif()
 if(NOT demo_has_scratch_setter)
     message(FATAL_ERROR "Rust demo does not contain scratch mode setter")
 endif()
-if(c_demo_has_scratch_setter)
-    message(FATAL_ERROR "C demo contains Rust scratch mode setter")
+if(c_demo_has_scratch_setter OR aruco_demo_has_scratch_setter)
+    message(FATAL_ERROR "non-Rust demo contains Rust scratch mode setter")
 endif()
 execute_process(COMMAND "${STRINGS}" "${PRODUCTION}" OUTPUT_VARIABLE production_strings
                 RESULT_VARIABLE production_strings_result)
@@ -101,15 +105,24 @@ execute_process(COMMAND "${STRINGS}" "${DEMO}" OUTPUT_VARIABLE demo_strings
                 RESULT_VARIABLE demo_strings_result)
 execute_process(COMMAND "${STRINGS}" "${C_DEMO}" OUTPUT_VARIABLE c_demo_strings
                 RESULT_VARIABLE c_demo_strings_result)
+execute_process(COMMAND "${STRINGS}" "${ARUCO_DEMO}" OUTPUT_VARIABLE aruco_demo_strings
+                RESULT_VARIABLE aruco_demo_strings_result)
 if(NOT production_strings_result EQUAL 0 OR NOT profile_strings_result EQUAL 0 OR
    NOT sequence_strings_result EQUAL 0 OR NOT demo_strings_result EQUAL 0 OR
-   NOT c_demo_strings_result EQUAL 0)
+   NOT c_demo_strings_result EQUAL 0 OR NOT aruco_demo_strings_result EQUAL 0)
     message(FATAL_ERROR "strings failed while verifying benchmark executables")
 endif()
 if(NOT demo_strings MATCHES "--local-ccl-scratch" OR
    NOT demo_strings MATCHES "ccl_scratch=" OR
    NOT c_demo_strings MATCHES "--local-ccl-scratch is only valid for apriltag_demo")
     message(FATAL_ERROR "demo scratch CLI/startup strings are missing")
+endif()
+if(NOT aruco_demo_strings MATCHES "--backend" OR
+   NOT aruco_demo_strings MATCHES "nano" OR
+   NOT aruco_demo_strings MATCHES "aruco2" OR
+   NOT aruco_demo_strings MATCHES "strict" OR
+   NOT aruco_demo_strings MATCHES "tolerant")
+    message(FATAL_ERROR "ArUco live-demo selection strings are missing")
 endif()
 string(FIND "${production_strings}" "${PRODUCTION_ID}" production_id_at)
 string(FIND "${profile_strings}" "${PROFILE_ID}" profile_id_at)

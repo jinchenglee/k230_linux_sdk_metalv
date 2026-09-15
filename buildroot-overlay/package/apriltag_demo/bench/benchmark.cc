@@ -27,6 +27,30 @@ namespace {
 constexpr std::uint64_t kFnvOffset = 14695981039346656037ULL;
 constexpr std::uint64_t kFnvPrime = 1099511628211ULL;
 
+void write_json_string(std::ostream& out, const std::string& value)
+{
+    static constexpr char hex[] = "0123456789abcdef";
+    out << '"';
+    for (const unsigned char byte : value) {
+        switch (byte) {
+        case '"': out << "\\\""; break;
+        case '\\': out << "\\\\"; break;
+        case '\b': out << "\\b"; break;
+        case '\f': out << "\\f"; break;
+        case '\n': out << "\\n"; break;
+        case '\r': out << "\\r"; break;
+        case '\t': out << "\\t"; break;
+        default:
+            if (byte < 0x20) {
+                out << "\\u00" << hex[byte >> 4] << hex[byte & 0xf];
+            } else {
+                out << static_cast<char>(byte);
+            }
+        }
+    }
+    out << '"';
+}
+
 template <typename T>
 T parse_integer(const char* value, const char* option, T minimum)
 {
@@ -35,6 +59,20 @@ T parse_integer(const char* value, const char* option, T minimum)
     const auto result = std::from_chars(value, end, parsed);
     if (result.ec != std::errc() || result.ptr != end || parsed < minimum) {
         throw ArgumentError(std::string(option) + " has an invalid value: " + value);
+    }
+    return parsed;
+}
+
+
+double parse_rate(const char* value, const char* option)
+{
+    double parsed{};
+    const char* end = value + std::strlen(value);
+    const auto result = std::from_chars(value, end, parsed);
+    if (result.ec != std::errc() || result.ptr != end ||
+        !std::isfinite(parsed) || parsed < 0 || parsed > 1) {
+        throw ArgumentError(std::string(option) +
+                            " must be a finite value in [0,1]: " + value);
     }
     return parsed;
 }
@@ -223,16 +261,21 @@ BenchmarkConfig parse_args(int argc, const char* const argv[])
             const std::string value(require_value(argc, argv, i));
             if (value == "all") {
                 config.backends = {BackendKind::RustRvv, BackendKind::CReference,
-                                   BackendKind::RustScalar};
+                                   BackendKind::RustScalar, BackendKind::ArucoNano,
+                                   BackendKind::Aruco2};
             } else if (value == "rust-rvv") {
                 config.backends = {BackendKind::RustRvv};
             } else if (value == "rust-scalar") {
                 config.backends = {BackendKind::RustScalar};
             } else if (value == "c") {
                 config.backends = {BackendKind::CReference};
+            } else if (value == "aruco-nano") {
+                config.backends = {BackendKind::ArucoNano};
+            } else if (value == "aruco2") {
+                config.backends = {BackendKind::Aruco2};
             } else {
                 throw ArgumentError(
-                    "--backend must be all, rust-rvv, rust-scalar, or c");
+                    "--backend must be all, rust-rvv, rust-scalar, c, aruco-nano, or aruco2");
             }
         } else if (option == "--factor") {
             const std::string value(require_value(argc, argv, i));
@@ -267,6 +310,16 @@ BenchmarkConfig parse_args(int argc, const char* const argv[])
             config.dump_dir = require_value(argc, argv, i);
         } else if (option == "--no-dump") {
             config.dump_dir.clear();
+        } else if (option == "--detections-out") {
+            config.detections_out = require_value(argc, argv, i);
+        } else if (option == "--no-detections-out") {
+            config.detections_out.clear();
+        } else if (option == "--aruco-error-correction-rate") {
+            config.aruco_error_correction_rate = parse_rate(
+                require_value(argc, argv, i), option.c_str());
+        } else if (option == "--aruco-border-error-rate") {
+            config.aruco_border_error_rate = parse_rate(
+                require_value(argc, argv, i), option.c_str());
         } else if (option == "--help" || option == "-h") {
             config.help = true;
             return config;
@@ -284,10 +337,13 @@ BenchmarkConfig parse_args(int argc, const char* const argv[])
         throw ArgumentError("profile benchmark supports only rust-rvv");
 #endif
     if (config.rvv_mask_explicit) {
-        if (config.backends == std::vector<BackendKind>{BackendKind::RustRvv,
-                                                        BackendKind::CReference,
-                                                        BackendKind::RustScalar}) {
-            config.backends.pop_back();
+        if (config.backends.size() > 1) {
+            config.backends.erase(
+                std::remove_if(config.backends.begin(), config.backends.end(),
+                               [](BackendKind kind) {
+                                   return kind != BackendKind::RustRvv &&
+                                          kind != BackendKind::CReference;
+                               }), config.backends.end());
         }
         const bool has_rvv = std::find(config.backends.begin(), config.backends.end(),
                                        BackendKind::RustRvv) != config.backends.end();
@@ -502,6 +558,8 @@ const char* backend_key(BackendKind kind)
     case BackendKind::RustRvv: return "rust-rvv";
     case BackendKind::CReference: return "c-reference";
     case BackendKind::RustScalar: return "rust-scalar";
+    case BackendKind::ArucoNano: return "aruco-nano";
+    case BackendKind::Aruco2: return "aruco2";
     }
     return "unknown";
 }
@@ -512,8 +570,80 @@ const char* backend_name(BackendKind kind)
     case BackendKind::RustRvv: return "Rust RVV";
     case BackendKind::CReference: return "C reference";
     case BackendKind::RustScalar: return "Rust scalar";
+    case BackendKind::ArucoNano: return "ArUco Nano";
+    case BackendKind::Aruco2: return "ArUco2";
     }
     return "unknown";
+}
+
+
+void write_detection_json(const std::string& path,
+                          const BenchmarkConfig& config,
+                          const PreparedImage& image,
+                          std::uint64_t input_hash,
+                          const std::vector<VisualDump>& dumps)
+{
+    for (const VisualDump& dump : dumps) {
+        for (const Detection& detection : dump.detections) {
+            for (const double value : detection.center) {
+                if (!std::isfinite(value)) {
+                    throw std::runtime_error("cannot export non-finite detection center");
+                }
+            }
+            for (const double value : detection.corners) {
+                if (!std::isfinite(value)) {
+                    throw std::runtime_error("cannot export non-finite detection corner");
+                }
+            }
+        }
+    }
+
+    std::ofstream file(path, std::ios::binary | std::ios::trunc);
+    if (!file) throw std::runtime_error("cannot open detection JSON: " + path);
+    file << "{\n  \"schema\": 1,\n  \"build\": ";
+    write_json_string(file, APRILTAG_BENCH_BUILD_ID);
+    file << ",\n  \"input\": {\"path\": ";
+    write_json_string(file, config.input);
+    file << ", \"hash\": \"" << std::hex << std::setw(16)
+         << std::setfill('0') << input_hash << std::dec << std::setfill(' ')
+         << "\", \"width\": " << image.width
+         << ", \"height\": " << image.height << "},\n"
+         << "  \"factor\": " << std::setprecision(17) << config.factor_value
+         << ",\n  \"aruco_error_correction_rate\": "
+         << config.aruco_error_correction_rate
+         << ",\n  \"aruco_border_error_rate\": "
+         << config.aruco_border_error_rate
+         << ",\n  \"backends\": [\n";
+    for (std::size_t backend = 0; backend < dumps.size(); ++backend) {
+        const VisualDump& dump = dumps[backend];
+        file << "    {\"key\": ";
+        write_json_string(file, backend_key(dump.kind));
+        file << ", \"detections\": [";
+        for (std::size_t index = 0; index < dump.detections.size(); ++index) {
+            const Detection& detection = dump.detections[index];
+            if (index) file << ',';
+            file << "\n      {\"id\": " << detection.id << ", \"margin\": ";
+            if (std::isfinite(detection.margin)) {
+                file << std::setprecision(17) << detection.margin;
+            } else {
+                file << "null";
+            }
+            file << ", \"center\": [" << std::setprecision(17)
+                 << detection.center[0] << ", " << detection.center[1]
+                 << "], \"corners\": [";
+            for (int corner = 0; corner < 4; ++corner) {
+                if (corner) file << ", ";
+                file << '[' << detection.corners[corner * 2] << ", "
+                     << detection.corners[corner * 2 + 1] << ']';
+            }
+            file << "]}";
+        }
+        if (!dump.detections.empty()) file << '\n' << "    ";
+        file << "]}" << (backend + 1 == dumps.size() ? "\n" : ",\n");
+    }
+    file << "  ]\n}\n";
+    file.flush();
+    if (!file) throw std::runtime_error("cannot write detection JSON: " + path);
 }
 
 int run_benchmark(const BenchmarkConfig& config,
@@ -532,6 +662,9 @@ int run_benchmark(const BenchmarkConfig& config,
         << "Input hash  : " << std::hex << input_hash << std::dec << '\n'
         << "Factor      : " << config.factor_value << '\n'
         << "Min blob    : " << config.min_blob << '\n'
+        << "ArUco bits  : correction="
+        << config.aruco_error_correction_rate
+        << " border-error=" << config.aruco_border_error_rate << '\n'
         << "RVV stages  : " << (config.rvv_mask_explicit ? config.rvv_stages
                                                           : "uniform by backend") << '\n'
         << "Warmup      : " << config.warmup << " calls/backend\n"
@@ -546,6 +679,9 @@ int run_benchmark(const BenchmarkConfig& config,
 
     std::vector<DetectionResult> expected(backends.size());
     std::vector<std::vector<std::uint64_t>> samples(backends.size());
+    std::vector<std::vector<std::uint64_t>> scale_samples(backends.size());
+    std::vector<std::vector<std::uint64_t>> detector_samples(backends.size());
+    std::vector<bool> has_breakdown(backends.size(), false);
 #ifdef APRILTAG_BENCH_PROFILE
     std::vector<std::vector<apriltag_ccl_profile_t>> profiles(backends.size());
     std::vector<std::vector<apriltag_ccl_scratch_v1_t>> scratches(backends.size());
@@ -558,13 +694,19 @@ int run_benchmark(const BenchmarkConfig& config,
         expected[i] = detect_with_context(*backends[i], image, "validation call 1");
     }
     for (const auto& backend : backends) backend->set_capture_detections(false);
-    if (!config.dump_dir.empty()) {
+    if (!config.dump_dir.empty() || !config.detections_out.empty()) {
         std::vector<VisualDump> dumps;
         dumps.reserve(backends.size());
         for (const auto& backend : backends) {
             dumps.push_back({backend->kind(), backend->detections()});
         }
-        write_visual_dumps(config.dump_dir, image, dumps);
+        if (!config.dump_dir.empty()) {
+            write_visual_dumps(config.dump_dir, image, dumps);
+        }
+        if (!config.detections_out.empty()) {
+            write_detection_json(config.detections_out, config, image,
+                                 input_hash, dumps);
+        }
     }
     for (std::size_t i = 0; i < backends.size(); ++i) {
         out << "Warming up " << backends[i]->name() << " ... " << std::flush;
@@ -624,6 +766,14 @@ int run_benchmark(const BenchmarkConfig& config,
                 }
                 const std::uint64_t elapsed = finish - start;
                 samples[index].push_back(elapsed);
+                if (result.timing.available) {
+                    has_breakdown[index] = true;
+                    scale_samples[index].push_back(result.timing.input_scale_ns);
+                    detector_samples[index].push_back(result.timing.detector_ns);
+                } else if (has_breakdown[index]) {
+                    throw std::runtime_error(std::string(backends[index]->name()) +
+                                             " omitted a runtime breakdown");
+                }
                 batch_total += elapsed;
             }
             batch_means[batch][index] =
@@ -643,6 +793,23 @@ int run_benchmark(const BenchmarkConfig& config,
 
     std::vector<Statistics> stats;
     for (const auto& backend_samples : samples) stats.push_back(compute_stats(backend_samples));
+    std::vector<Statistics> scale_stats(backends.size());
+    std::vector<Statistics> detector_stats(backends.size());
+    for (std::size_t i = 0; i < backends.size(); ++i) {
+        if (has_breakdown[i]) {
+            if (config.factor_value == 1.0) {
+                if (std::any_of(scale_samples[i].begin(), scale_samples[i].end(),
+                                [](std::uint64_t sample) { return sample != 0; })) {
+                    throw std::runtime_error(std::string(backends[i]->name()) +
+                                             " reported input scaling at factor 1");
+                }
+                scale_stats[i].count = scale_samples[i].size();
+            } else {
+                scale_stats[i] = compute_stats(scale_samples[i]);
+            }
+            detector_stats[i] = compute_stats(detector_samples[i]);
+        }
+    }
     std::size_t baseline = backends.size();
     for (std::size_t i = 0; i < backends.size(); ++i) {
         if (backends[i]->kind() == BackendKind::CReference) baseline = i;
@@ -690,6 +857,26 @@ int run_benchmark(const BenchmarkConfig& config,
         std::ostringstream text; text << std::hex << expected[i].checksum; return text.str();
     });
 
+    const bool any_breakdown = std::any_of(
+        has_breakdown.begin(), has_breakdown.end(),
+        [](bool value) { return value; });
+    if (any_breakdown) {
+        out << "\nArUco runtime breakdown (mean per measured call)\n"
+            << "================================================\n";
+        for (std::size_t i = 0; i < backends.size(); ++i) {
+            if (!has_breakdown[i]) continue;
+            const double adapter_ms = std::max(
+                0.0, stats[i].mean_ms - scale_stats[i].mean_ms -
+                         detector_stats[i].mean_ms);
+            out << "  " << backends[i]->name()
+                << ": input_scale=" << milliseconds(scale_stats[i].mean_ms)
+                << ", detector=" << milliseconds(detector_stats[i].mean_ms)
+                << ", adapter=" << milliseconds(adapter_ms)
+                << ", end_to_end=" << milliseconds(stats[i].mean_ms) << '\n';
+        }
+        out << "  input_scale is explicitly zero when --factor 1 is used.\n";
+    }
+
     if (outputs_differ) {
         out << "\nWARNING: backend results differ\n";
         for (std::size_t i = 0; i < backends.size(); ++i) {
@@ -719,7 +906,9 @@ int run_benchmark(const BenchmarkConfig& config,
     for (std::size_t i = 0; i < backends.size(); ++i) {
         out << "RESULT backend=" << backend_key(backends[i]->kind())
             << " rvv_mask=";
-        if (backends[i]->kind() == BackendKind::CReference) out << "n/a stages=n/a";
+        if (backends[i]->kind() == BackendKind::CReference ||
+            backends[i]->kind() == BackendKind::ArucoNano ||
+            backends[i]->kind() == BackendKind::Aruco2) out << "n/a stages=n/a";
         else if (config.rvv_mask_explicit) out << "0x" << std::hex << config.rvv_mask
                                                << std::dec << " stages=" << config.rvv_stages;
         else out << (backends[i]->kind() == BackendKind::RustRvv ? "all stages=all"
@@ -736,6 +925,17 @@ int run_benchmark(const BenchmarkConfig& config,
             << std::setprecision(2)
             << " mean_fps=" << stats[i].mean_fps
             << " median_fps=" << stats[i].median_fps
+            << " breakdown=" << (has_breakdown[i] ? 1 : 0);
+        if (has_breakdown[i]) {
+            const double adapter_ms = std::max(
+                0.0, stats[i].mean_ms - scale_stats[i].mean_ms -
+                         detector_stats[i].mean_ms);
+            out << std::setprecision(3)
+                << " input_scale_mean_ms=" << scale_stats[i].mean_ms
+                << " detector_mean_ms=" << detector_stats[i].mean_ms
+                << " adapter_mean_ms=" << adapter_ms;
+        }
+        out
             << " detections=" << expected[i].count
             << " checksum=" << std::hex << expected[i].checksum
             << " input_hash=" << input_hash << std::dec
@@ -745,6 +945,10 @@ int run_benchmark(const BenchmarkConfig& config,
             << " bytes=" << image.pixels.size()
             << " factor=" << config.factor_value
             << " min_blob=" << config.min_blob
+            << " aruco_error_correction_rate="
+            << config.aruco_error_correction_rate
+            << " aruco_border_error_rate="
+            << config.aruco_border_error_rate
             << " warmup=" << config.warmup
             << " iterations=" << config.iterations
              << " batches=" << config.batches << '\n';
@@ -766,7 +970,7 @@ void print_usage(std::ostream& out, const char* program)
 #ifdef APRILTAG_BENCH_PROFILE
         << "  --backend BACKEND     rust-rvv only\n"
 #else
-        << "  --backend BACKEND     all, rust-rvv, rust-scalar, or c\n"
+        << "  --backend BACKEND     all, rust-rvv, rust-scalar, c, aruco-nano, or aruco2\n"
 #endif
         << "  --factor FACTOR       1, 1.5, or 2\n"
         << "  --rvv-stages STAGES   all, none, or comma-separated:\n"
@@ -777,6 +981,10 @@ void print_usage(std::ostream& out, const char* program)
         << "  --batches N           measured batches\n"
         << "  --dump-dir PATH       write visual validation images\n"
         << "  --no-dump             disable visual validation images\n"
+        << "  --detections-out PATH write exact validation detections as JSON\n"
+        << "  --no-detections-out   disable detection JSON output\n"
+        << "  --aruco-error-correction-rate RATE  payload correction [0,1]\n"
+        << "  --aruco-border-error-rate RATE      border tolerance [0,1]\n"
         << "  --help                 print this help\n";
 }
 
@@ -802,8 +1010,16 @@ int benchmark_main(int argc, const char* const argv[], std::ostream& out,
 #ifdef APRILTAG_BENCH_PROFILE
             backends.push_back(make_rust_backend(config, kind));
 #else
-            if (kind == BackendKind::CReference) backends.push_back(make_c_backend(config));
-            else backends.push_back(make_rust_backend(config, kind));
+            switch (kind) {
+            case BackendKind::CReference:
+                backends.push_back(make_c_backend(config)); break;
+            case BackendKind::ArucoNano:
+                backends.push_back(make_aruco_nano_backend(config)); break;
+            case BackendKind::Aruco2:
+                backends.push_back(make_aruco2_backend(config)); break;
+            default:
+                backends.push_back(make_rust_backend(config, kind)); break;
+            }
 #endif
         }
         return run_benchmark(config, std::move(backends), image, out);

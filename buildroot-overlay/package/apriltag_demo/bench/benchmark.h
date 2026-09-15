@@ -17,10 +17,16 @@
 
 namespace apriltag_bench {
 
-// Both backends support complete result sets of 0..4095 detections.
+// All backends support complete result sets of 0..4095 detections.
 constexpr int kMaxDetections = 4096;
 
-enum class BackendKind { RustRvv, CReference, RustScalar };
+enum class BackendKind {
+    RustRvv,
+    CReference,
+    RustScalar,
+    ArucoNano,
+    Aruco2,
+};
 enum class InputFormat { Auto, Raw, Jpeg };
 enum class ScratchMode { Reusable, Local };
 
@@ -39,7 +45,8 @@ struct BenchmarkConfig {
     ImageSize size = ImageSize::native_size();
     std::vector<BackendKind> backends = {
         BackendKind::RustRvv, BackendKind::CReference,
-        BackendKind::RustScalar};
+        BackendKind::RustScalar, BackendKind::ArucoNano,
+        BackendKind::Aruco2};
     int factor = 2;
     double factor_value = 2.0;
     std::uint32_t min_blob = 25;
@@ -47,6 +54,9 @@ struct BenchmarkConfig {
     int iterations = 100;
     int batches = 10;
     std::string dump_dir;
+    std::string detections_out;
+    double aruco_error_correction_rate = 0;
+    double aruco_border_error_rate = 0;
     bool rvv_mask_explicit = false;
     std::uint64_t rvv_mask = APRILTAG_KERNEL_ALL;
     std::string rvv_stages = "all";
@@ -67,9 +77,22 @@ struct Detection {
     double corners[8] = {};
 };
 
+struct BackendTiming {
+    bool available = false;
+    std::uint64_t input_scale_ns = 0;
+    std::uint64_t detector_ns = 0;
+};
+
 struct DetectionResult {
     int count = 0;
     std::uint64_t checksum = 0;
+    BackendTiming timing;
+
+    DetectionResult() = default;
+    DetectionResult(int detection_count, std::uint64_t detection_checksum,
+                    BackendTiming backend_timing = {})
+        : count(detection_count), checksum(detection_checksum),
+          timing(backend_timing) {}
 };
 
 struct VisualDump {
@@ -142,6 +165,8 @@ std::vector<std::size_t> batch_order(std::size_t backend_count,
 std::unique_ptr<Backend> make_rust_backend(const BenchmarkConfig& config,
                                            BackendKind kind);
 std::unique_ptr<Backend> make_c_backend(const BenchmarkConfig& config);
+std::unique_ptr<Backend> make_aruco_nano_backend(const BenchmarkConfig& config);
+std::unique_ptr<Backend> make_aruco2_backend(const BenchmarkConfig& config);
 int run_benchmark(const BenchmarkConfig& config,
                   std::vector<std::unique_ptr<Backend>> backends,
                   const PreparedImage& image, std::ostream& out);
@@ -166,6 +191,11 @@ void print_profile_report(const BenchmarkConfig& config, BackendKind kind,
 void write_visual_dumps(const std::string& directory,
                         const PreparedImage& image,
                         const std::vector<VisualDump>& dumps);
+void write_detection_json(const std::string& path,
+                          const BenchmarkConfig& config,
+                          const PreparedImage& image,
+                          std::uint64_t input_hash,
+                          const std::vector<VisualDump>& dumps);
 
 #ifdef APRILTAG_BENCH_NO_OPENCV
 inline void write_visual_dumps(const std::string&, const PreparedImage&,
