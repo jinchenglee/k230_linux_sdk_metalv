@@ -167,22 +167,16 @@ _Static_assert(K230_PAYLOAD_POOL_BASE + K230_PAYLOAD_POOL_SIZE <=
 	       K230_AMP_RESERVED_END,
 	       "payload pool exceeds the reserved AMP region");
 
-/*
- * Quick zero-copy camera prototype. Registration is generation-scoped and
- * deliberately accepts only these six canonical buffers. CAMERA_SUBMIT names
- * an already-registered ID; it never carries an arbitrary physical address.
- */
-#define K230_CAMERA_POOL_BASE        UINT64_C(0x1da00000)
-#define K230_CAMERA_BUFFER_SIZE      UINT64_C(0x00200000)
-#define K230_CAMERA_BUFFER_COUNT     UINT32_C(6)
-#define K230_CAMERA_POOL_SIZE \
-	(K230_CAMERA_BUFFER_SIZE * K230_CAMERA_BUFFER_COUNT)
+/* Registration is generation-scoped. remote_token is opaque to the protocol;
+ * the remote platform backend validates and resolves it once at registration.
+ * Per-frame submission uses only the registered ID. */
+#define AMP_RPMSG_CAMERA_BUFFER_MAX UINT32_C(16)
 
 struct k230_rpmsg_camera_register {
 	struct k230_rpmsg_protocol_header header;
 	uint32_t buffer_id;
 	uint32_t flags;
-	uint64_t physical;
+	uint64_t remote_token;
 	uint64_t capacity;
 };
 
@@ -212,14 +206,11 @@ static inline uint16_t
 k230_rpmsg_validate_camera_registration(
 	const struct k230_rpmsg_camera_register *request)
 {
-	uint64_t expected;
-
-	if (request->buffer_id >= K230_CAMERA_BUFFER_COUNT)
+	if (request->buffer_id >= AMP_RPMSG_CAMERA_BUFFER_MAX)
 		return K230_RPMSG_STATUS_INVALID_SLOT;
-	expected = K230_CAMERA_POOL_BASE +
-		   (uint64_t)request->buffer_id * K230_CAMERA_BUFFER_SIZE;
-	if (request->flags || request->physical != expected ||
-	    request->capacity != K230_CAMERA_BUFFER_SIZE)
+	if (request->flags || !request->capacity ||
+	    (request->remote_token % K230_PAYLOAD_CACHE_LINE) != 0 ||
+	    request->capacity < K230_PAYLOAD_CACHE_LINE)
 		return K230_RPMSG_STATUS_INVALID_RANGE;
 	return K230_RPMSG_STATUS_OK;
 }
@@ -230,11 +221,10 @@ k230_rpmsg_validate_camera_submit(
 {
 	uint64_t image_bytes;
 
-	if (request->buffer_id >= K230_CAMERA_BUFFER_COUNT)
+	if (request->buffer_id >= AMP_RPMSG_CAMERA_BUFFER_MAX)
 		return K230_RPMSG_STATUS_INVALID_SLOT;
 	if (request->flags || !request->data_length ||
 	    request->data_length > request->padded_length ||
-	    request->padded_length > K230_CAMERA_BUFFER_SIZE ||
 	    (request->padded_length % K230_PAYLOAD_CACHE_LINE) != 0)
 		return K230_RPMSG_STATUS_INVALID_RANGE;
 	if (request->format != K230_PAYLOAD_FORMAT_Y8 ||
@@ -260,8 +250,4 @@ _Static_assert(sizeof(struct k230_rpmsg_camera_submit) ==
 _Static_assert(sizeof(struct k230_rpmsg_camera_complete) ==
 	       K230_RPMSG_CAMERA_COMPLETE_SIZE,
 	       "K230 RPMsg camera-complete layout changed");
-_Static_assert(K230_CAMERA_POOL_BASE + K230_CAMERA_POOL_SIZE <=
-	       K230_AMP_RESERVED_END,
-	       "camera pool exceeds the reserved AMP region");
-
 #endif

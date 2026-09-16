@@ -52,7 +52,8 @@ $(V4L2_DMA_PROBE): v4l2_dma_probe.c
 	$(LINUX_CC) $(LINUX_CFLAGS) -o $@ v4l2_dma_probe.c
 
 $(RPMSG_ZERO_COPY_CAMERA): rpmsg_zero_copy_camera.c rpmsg_protocol.h
-	$(LINUX_CC) $(LINUX_CFLAGS) -o $@ rpmsg_zero_copy_camera.c
+	$(LINUX_CC) $(LINUX_CFLAGS) -o $@ \
+		rpmsg_zero_copy_camera.c -lv4l2-drm -lmmz
 
 $(HOST_SLOT_TEST): rpmsg_slot_test.c rpmsg_protocol.h rpmsg_slot_state.h
 	$(HOST_CC) -O2 -Wall -Wextra -Werror -o $@ rpmsg_slot_test.c
@@ -60,8 +61,10 @@ $(HOST_SLOT_TEST): rpmsg_slot_test.c rpmsg_protocol.h rpmsg_slot_state.h
 check: $(HOST_SLOT_TEST)
 	./$(HOST_SLOT_TEST) --self-test
 
+main.o: main.c amp_shm.h cache.h mailbox.h rpmsg_service.h uart3.h
+
 rpmsg_service.o: rpmsg_service.c rpmsg_service.h rpmsg_protocol.h \
-	rpmsg_slot_state.h
+	rpmsg_slot_state.h rpmsg_buffer_platform.h amp_shm.h cache.h
 
 %.o: %.c
 	$(CC) $(CFLAGS) -c -o $@ $<

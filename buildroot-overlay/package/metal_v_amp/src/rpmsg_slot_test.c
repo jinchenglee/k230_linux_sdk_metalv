@@ -276,17 +276,16 @@ static int run_self_test(void)
     failed |= k230_rpmsg_validate_slot(&request) !=
               K230_RPMSG_STATUS_BAD_FORMAT;
 
-    camera_register.buffer_id = K230_CAMERA_BUFFER_COUNT - 1U;
-    camera_register.physical = K230_CAMERA_POOL_BASE +
-        (K230_CAMERA_BUFFER_COUNT - 1U) * K230_CAMERA_BUFFER_SIZE;
-    camera_register.capacity = K230_CAMERA_BUFFER_SIZE;
+    camera_register.buffer_id = AMP_RPMSG_CAMERA_BUFFER_MAX - 1U;
+    camera_register.remote_token = UINT64_C(0x100000);
+    camera_register.capacity = UINT64_C(0x200000);
     failed |= k230_rpmsg_validate_camera_registration(&camera_register) !=
               K230_RPMSG_STATUS_OK;
-    ++camera_register.physical;
+    ++camera_register.remote_token;
     failed |= k230_rpmsg_validate_camera_registration(&camera_register) !=
               K230_RPMSG_STATUS_INVALID_RANGE;
 
-    camera_submit.buffer_id = K230_CAMERA_BUFFER_COUNT - 1U;
+    camera_submit.buffer_id = AMP_RPMSG_CAMERA_BUFFER_MAX - 1U;
     camera_submit.data_length = 1280U * 720U;
     camera_submit.padded_length = padded_length(camera_submit.data_length);
     camera_submit.format = K230_PAYLOAD_FORMAT_Y8;

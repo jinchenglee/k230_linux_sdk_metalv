@@ -118,16 +118,26 @@ _Static_assert(sizeof(struct amp_shm_publish) == AMP_SHM_CACHE_LINE,
 _Static_assert(sizeof(struct amp_shm_response) == AMP_SHM_CACHE_LINE,
 	       "AMP response must occupy one cache line");
 
+static inline uint32_t amp_crc32_bit(uint32_t crc)
+{
+	return (crc >> 1) ^
+	       (UINT32_C(0xedb88320) & (0U - (crc & 1U)));
+}
+
 static inline uint32_t amp_crc32(const uint8_t *data, uint32_t length)
 {
 	uint32_t crc = UINT32_C(0xffffffff);
-	uint32_t i;
 
 	while (length--) {
 		crc ^= *data++;
-		for (i = 0; i < 8; ++i)
-			crc = (crc >> 1) ^
-			      (UINT32_C(0xedb88320) & (0U - (crc & 1U)));
+		crc = amp_crc32_bit(crc);
+		crc = amp_crc32_bit(crc);
+		crc = amp_crc32_bit(crc);
+		crc = amp_crc32_bit(crc);
+		crc = amp_crc32_bit(crc);
+		crc = amp_crc32_bit(crc);
+		crc = amp_crc32_bit(crc);
+		crc = amp_crc32_bit(crc);
 	}
 	return ~crc;
 }

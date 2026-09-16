@@ -11,11 +11,13 @@
 #include <time.h>
 #include <unistd.h>
 
-#include <k230_amp_camera_pool.h>
+#include <amp_shared_buffer_pool.h>
+
+#define PROBE_BUFFER_COUNT 6U
 
 struct capture_buffer {
     int fd;
-    uint64_t physical;
+    uint64_t remote_token;
     uint64_t capacity;
 };
 
@@ -61,9 +63,9 @@ static void usage(const char *name)
 
 int main(int argc, char **argv)
 {
-    const char *pool_path = "/dev/k230-amp-camera-pool";
-    struct k230_amp_camera_pool_info pool_info = { 0 };
-    struct capture_buffer captures[K230_AMP_CAMERA_BUFFER_COUNT];
+    const char *pool_path = "/dev/amp-shared-buffer-pool";
+    struct amp_shared_buffer_pool_info pool_info = { 0 };
+    struct capture_buffer captures[PROBE_BUFFER_COUNT];
     struct v4l2_requestbuffers request = { 0 };
     struct v4l2_format format = { 0 };
     struct timespec started, finished;
@@ -80,7 +82,7 @@ int main(int argc, char **argv)
     int failed = 0;
     char video_path[64];
 
-    for (i = 0; i < K230_AMP_CAMERA_BUFFER_COUNT; ++i)
+    for (i = 0; i < PROBE_BUFFER_COUNT; ++i)
         captures[i].fd = -1;
     for (i = 1; i < (unsigned)argc; ++i) {
         if (!strcmp(argv[i], "--pool")) {
@@ -110,15 +112,15 @@ int main(int argc, char **argv)
         fprintf(stderr, "%s: %s\n", pool_path, strerror(errno));
         return 1;
     }
-    if (ioctl(pool_fd, K230_AMP_CAMERA_IOC_GET_INFO, &pool_info) < 0) {
+    if (ioctl(pool_fd, AMP_SHARED_BUFFER_IOC_GET_INFO, &pool_info) < 0) {
         fprintf(stderr, "camera-pool GET_INFO failed: %s\n", strerror(errno));
         failed = 1;
         goto out;
     }
-    if (pool_info.version != K230_AMP_CAMERA_POOL_ABI_VERSION ||
-        pool_info.buffer_count < K230_AMP_CAMERA_BUFFER_COUNT) {
-        fprintf(stderr, "camera-pool ABI/count mismatch: version=%u count=%u\n",
-                pool_info.version, pool_info.buffer_count);
+    if (pool_info.version != AMP_SHARED_BUFFER_POOL_ABI_VERSION ||
+        !(pool_info.capabilities & AMP_SHARED_BUFFER_CAP_CONTIGUOUS)) {
+        fprintf(stderr, "shared-pool ABI/capability mismatch: version=%u caps=0x%x\n",
+                pool_info.version, pool_info.capabilities);
         failed = 1;
         goto out;
     }
@@ -140,34 +142,34 @@ int main(int argc, char **argv)
         failed = 1;
         goto out;
     }
-    if (pool_info.buffer_size < format.fmt.pix.sizeimage) {
-        fprintf(stderr, "pool buffer too small: capacity=%" PRIu64
-                " sizeimage=%u\n", pool_info.buffer_size,
-                format.fmt.pix.sizeimage);
+    if (pool_info.pool_size < format.fmt.pix.sizeimage * PROBE_BUFFER_COUNT) {
+        fprintf(stderr, "pool too small: capacity=%" PRIu64
+                " requested=%" PRIu64 "\n", pool_info.pool_size,
+                (uint64_t)format.fmt.pix.sizeimage * PROBE_BUFFER_COUNT);
         failed = 1;
         goto out;
     }
 
     request.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     request.memory = V4L2_MEMORY_DMABUF;
-    request.count = K230_AMP_CAMERA_BUFFER_COUNT;
+    request.count = PROBE_BUFFER_COUNT;
     if (ioctl(video_fd, VIDIOC_REQBUFS, &request) < 0) {
         fprintf(stderr, "VIDIOC_REQBUFS(DMABUF) failed: %s\n",
                 strerror(errno));
         failed = 1;
         goto out;
     }
-    if (request.count < K230_AMP_CAMERA_BUFFER_COUNT) {
+    if (request.count < PROBE_BUFFER_COUNT) {
         fprintf(stderr, "V4L2 returned only %u buffer slots\n", request.count);
         failed = 1;
         goto out;
     }
 
-    printf("K230 fixed-pool V4L2 DMA-BUF probe\n");
-    printf("pool=%s base=0x%" PRIx64 " size=%" PRIu64
-           " buffers=%u buffer-size=%" PRIu64 "\n",
-           pool_path, pool_info.physical_base, pool_info.pool_size,
-           pool_info.buffer_count, pool_info.buffer_size);
+    printf("AMP shared-pool V4L2 DMA-BUF probe\n");
+    printf("pool=%s remote-base=0x%" PRIx64 " size=%" PRIu64
+           " alignment=%" PRIu64 " buffers=%u\n",
+           pool_path, pool_info.remote_base, pool_info.pool_size,
+           pool_info.minimum_alignment, PROBE_BUFFER_COUNT);
     printf("camera=%s format=%c%c%c%c geometry=%ux%u stride=%u "
            "sizeimage=%u\n", video_path,
            format.fmt.pix.pixelformat & 0xff,
@@ -177,22 +179,26 @@ int main(int argc, char **argv)
            format.fmt.pix.width, format.fmt.pix.height,
            format.fmt.pix.bytesperline, format.fmt.pix.sizeimage);
 
-    for (i = 0; i < K230_AMP_CAMERA_BUFFER_COUNT; ++i) {
-        struct k230_amp_camera_pool_buffer get = { .id = i };
+    for (i = 0; i < PROBE_BUFFER_COUNT; ++i) {
+        struct amp_shared_buffer_alloc allocation = {
+            .capacity = format.fmt.pix.sizeimage,
+            .alignment = pool_info.minimum_alignment,
+        };
 
-        if (ioctl(pool_fd, K230_AMP_CAMERA_IOC_GET_BUFFER, &get) < 0) {
-            fprintf(stderr, "GET_BUFFER[%u] failed: %s\n", i,
+        if (ioctl(pool_fd, AMP_SHARED_BUFFER_IOC_ALLOC, &allocation) < 0) {
+            fprintf(stderr, "ALLOC[%u] failed: %s\n", i,
                     strerror(errno));
             failed = 1;
             goto out;
         }
-        captures[i].fd = get.fd;
-        captures[i].physical = get.physical;
-        captures[i].capacity = get.capacity;
+        captures[i].fd = allocation.fd;
+        captures[i].remote_token = allocation.remote_token;
+        captures[i].capacity = allocation.capacity;
         ++exported;
-        printf("buffer[%u]: dmabuf-fd=%d phys=0x%" PRIx64
-               " capacity=%" PRIu64 "\n", i, get.fd, get.physical,
-               get.capacity);
+        printf("buffer[%u]: dmabuf-fd=%d remote-token=0x%" PRIx64
+               " capacity=%" PRIu64 " allocation=%" PRIu64 "\n",
+               i, allocation.fd, allocation.remote_token,
+               allocation.capacity, allocation.allocation_id);
         if (queue_buffer(video_fd, i, &captures[i]) < 0) {
             fprintf(stderr, "VIDIOC_QBUF[%u] failed: %s\n", i,
                     strerror(errno));
@@ -234,7 +240,7 @@ int main(int argc, char **argv)
             failed = 1;
             break;
         }
-        if (buffer.index >= K230_AMP_CAMERA_BUFFER_COUNT) {
+        if (buffer.index >= PROBE_BUFFER_COUNT) {
             fprintf(stderr, "invalid dequeued index %u\n", buffer.index);
             failed = 1;
             break;
@@ -278,7 +284,7 @@ out:
         close(captures[i].fd);
     if (pool_fd >= 0)
         close(pool_fd);
-    printf("%s fixed-pool DMA-BUF capture: exported=%u queued=%u "
+    printf("%s shared-pool DMA-BUF capture: exported=%u queued=%u "
            "captured=%u\n", failed ? "FAIL" : "PASS", exported, queued,
            captured);
     return failed ? 1 : 0;

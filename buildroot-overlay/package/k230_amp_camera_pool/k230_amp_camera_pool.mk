@@ -10,8 +10,8 @@ K230_AMP_CAMERA_POOL_SUPPORTS_IN_SOURCE_BUILD = NO
 K230_AMP_CAMERA_POOL_INSTALL_STAGING = YES
 
 define K230_AMP_CAMERA_POOL_INSTALL_STAGING_CMDS
-	$(INSTALL) -D -m 0644 $(@D)/k230_amp_camera_pool.h \
-		$(STAGING_DIR)/usr/include/k230_amp_camera_pool.h
+	$(INSTALL) -D -m 0644 $(@D)/amp_shared_buffer_pool.h \
+		$(STAGING_DIR)/usr/include/amp_shared_buffer_pool.h
 endef
 
 define K230_AMP_CAMERA_POOL_INSTALL_INIT_SYSV

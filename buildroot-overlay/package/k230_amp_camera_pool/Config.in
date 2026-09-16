@@ -1,8 +1,8 @@
 config BR2_PACKAGE_K230_AMP_CAMERA_POOL
-	bool "K230 AMP fixed camera DMA-BUF pool"
+	bool "AMP reserved-memory shared DMA-BUF pool"
 	depends on BR2_LINUX_KERNEL
 	help
-	  Export six fixed 2 MiB buffers from the AMP reserved-memory
-	  carveout as DMA-BUF file descriptors. Small-core userspace can
-	  queue these buffers directly to V4L2 and register their stable
-	  physical addresses with the big-core firmware.
+	  Allocate variable-size pinned buffers from a configurable no-map
+	  AMP reserved-memory region and export them as DMA-BUF file
+	  descriptors plus opaque remote-visible tokens. The K230 build uses
+	  its AMP camera carveout as the first platform backend.

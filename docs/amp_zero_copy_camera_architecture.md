@@ -1,8 +1,10 @@
 # Portable AMP zero-copy camera architecture
 
-Status: architectural follow-up to the validated K230 fixed-pool prototype.
-The K230 result is the executable reference, not the intended cross-platform
-ABI.
+Status: the portable UAPI, allocator, remote-token protocol, and remote
+platform-operation layers are implemented and target-validated on K230. The
+K230 backend remains an executable reference, not the cross-platform ABI. The
+Device Tree provider nodes are built for the next image; the no-reflash target
+run used the provider's clearly labelled legacy module-parameter fallback.
 
 ## Proven invariant
 
@@ -81,28 +83,45 @@ must perform the required maintenance.
 | Linux cache policy | Declared by provider | Write-combine diagnostic map; no production map |
 | Remote cache policy | Platform operation | 64-byte RISC-V invalidate plus acquire fence |
 | Device completion | DMA writes globally visible before ownership publication | VVCAM DQBUF assumption, CRC-validated on target |
-| Buffer shape | Provider metadata, not protocol constants | Six 2 MiB buffers at `0x1da00000` |
+| Buffer shape | Provider metadata, not protocol constants | Six runtime allocations from a 12 MiB pool; 1,384,448 bytes each for the validated NV12 mode |
 
 K230 additionally requires reserved pages to retain valid `struct page`
 metadata because its exporter builds a one-entry SG table with
 `pfn_to_page()`. That is not universal. A platform without such metadata needs
 a different provider backend rather than weakening this check.
 
-## Migration sequence
+Sensor timing is also a producer-platform concern, not part of the buffer or
+wire ABI. On K230, setting the V4L2 output to 1280x720 does not change the
+OV5647 source mode. The application must request 1280x720 at 60 fps through
+the VVCAM scene/mode control before `STREAMON`; otherwise it inherits the
+nominal 30 fps source and delivers only about 28 fps. The application retains
+1920x1080 at 30 fps as a compatibility fallback.
 
-1. Preserve the fixed K230 implementation and its two hardware logs as the
-   regression baseline.
-2. Introduce a generic pool UAPI using `remote_token`; retain source aliases
-   for the existing K230 test during migration.
-3. Move pool geometry into a Device Tree provider node and bind a platform
-   driver to its `memory-region`. Keep a clearly labelled K230 legacy fallback
-   only until the new DT image boots.
-4. Change the wire ABI from canonical K230 camera addresses to pool
-   registration plus buffer ID/offset, with a K230 firmware validator backend.
-5. Run the direct DMA-BUF probe, cross-core CRC test, no-Linux-read throughput
-   test, endpoint-restart test, and original Phase 4/5 regression suite.
-6. Remove the legacy constants only after the DT-backed K230 path reproduces
-   28 FPS, zero CRC mismatches, and zero ownership leaks.
+## Target validation checkpoint (2026-09-15)
 
-This sequence keeps the proven low-latency path runnable while each portable
-boundary is introduced and independently tested.
+The portable provider UAPI allocated six page-rounded 1,384,448-byte DMA-BUFs
+from the 12 MiB pool. VVCAM imported all six directly, and the big core read
+the 921,600-byte Y plane in place. The tested sensor selection reported
+1280x720 at 60 fps; this V4L2 driver does not implement `VIDIOC_G_PARM`, so
+measured delivery is the authoritative rate.
+
+- Production-path run, with remote full-frame CRC retained as representative
+  work and the redundant Linux CRC disabled: 564 captures, submissions, and
+  completions in 10.017 seconds (56.30 fps), zero supersessions, zero copies,
+  15.057 ms average big-core CRC, and 17.036 ms maximum remote hold.
+- Integrity run, with the intentionally expensive scalar Linux CRC enabled:
+  50/50 matching CRCs, zero mismatches, zero copies, and 18.309 ms maximum
+  remote hold. Linux CRC averaged 190.191 ms, so 121 newer pending frames were
+  deliberately superseded; this is diagnostic overhead, not production-path
+  throughput.
+- The capability library now declares its own `libm` dependency. This matters
+  because it is loaded with `dlopen()`; larger demo processes had previously
+  hidden the missing dependency by loading `libm` indirectly.
+
+## Remaining K230 closure
+
+Boot the next image containing the provider Device Tree nodes, confirm that
+the module does not announce its legacy fallback, and repeat the production
+and integrity runs. Then remove the temporary legacy module parameters. The
+firmware's fixed K230 address allowlist remains a platform-backend policy,
+while the application and wire protocol continue to use opaque remote tokens.

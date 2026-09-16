@@ -3,6 +3,7 @@
 
 #include "cache.h"
 #include "rpmsg_config.h"
+#include "rpmsg_buffer_platform.h"
 #include "rpmsg_lite.h"
 #include "rpmsg_ns.h"
 #include "rpmsg_platform.h"
@@ -81,6 +82,9 @@ static unsigned long camera_submitted;
 static unsigned long camera_completed;
 static unsigned long camera_rejected;
 static unsigned long camera_dropped_restart;
+static uint64_t camera_remote_token[AMP_RPMSG_CAMERA_BUFFER_MAX];
+static uint64_t camera_capacity[AMP_RPMSG_CAMERA_BUFFER_MAX];
+static uintptr_t camera_local_address[AMP_RPMSG_CAMERA_BUFFER_MAX];
 
 struct k230_slot_job {
     struct k230_rpmsg_slot_submit request;
@@ -98,7 +102,7 @@ struct k230_camera_job {
     uint32_t processed;
 };
 
-static struct k230_camera_job camera_queue[K230_CAMERA_BUFFER_COUNT];
+static struct k230_camera_job camera_queue[AMP_RPMSG_CAMERA_BUFFER_MAX];
 
 static int32_t echo_rx(void *payload, uint32_t payload_len, uint32_t src,
                        void *priv);
@@ -109,6 +113,15 @@ static inline uint64_t read_cycle(void)
 
     __asm__ volatile ("rdcycle %0" : "=r"(value));
     return value;
+}
+
+/* Keep this large, per-frame loop out of the service poller's register
+ * allocation. A single canonical copy also prevents unrelated protocol
+ * changes from changing CRC loop code generation. */
+static __attribute__((noinline)) uint32_t rpmsg_crc32(
+    const uint8_t *data, uint32_t length)
+{
+    return amp_crc32(data, length);
 }
 
 /*
@@ -291,6 +304,9 @@ static void reset_camera_queue(void)
     camera_queue_head = 0;
     camera_queue_tail = 0;
     camera_queue_depth = 0;
+    memset(camera_remote_token, 0, sizeof(camera_remote_token));
+    memset(camera_capacity, 0, sizeof(camera_capacity));
+    memset(camera_local_address, 0, sizeof(camera_local_address));
 }
 
 static int32_t register_camera_buffer(
@@ -300,6 +316,8 @@ static int32_t register_camera_buffer(
     struct k230_rpmsg_camera_register request;
     struct k230_rpmsg_camera_register reply;
     uint32_t bit;
+    uint32_t i;
+    uintptr_t local_address;
     uint16_t status;
 
     if (header->generation != protocol_generation) {
@@ -319,9 +337,36 @@ static int32_t register_camera_buffer(
         return send_protocol_error(src, header, status);
     }
     bit = UINT32_C(1) << request.buffer_id;
-    /* Registration is idempotent for this fixed canonical table. This lets a
-     * new Linux process attach within the same protocol generation without
-     * requiring an otherwise-unnecessary endpoint restart. */
+    if (camera_busy_mask & bit) {
+        ++camera_rejected;
+        return send_protocol_error(src, header,
+                                   K230_RPMSG_STATUS_SLOT_BUSY);
+    }
+    status = rpmsg_platform_resolve_buffer(
+        request.remote_token, request.capacity, &local_address);
+    if (status != K230_RPMSG_STATUS_OK) {
+        ++camera_rejected;
+        return send_protocol_error(src, header, status);
+    }
+    for (i = 0; i < AMP_RPMSG_CAMERA_BUFFER_MAX; ++i) {
+        uint64_t existing_end;
+        uint64_t request_end;
+
+        if (i == request.buffer_id ||
+            !(camera_registered_mask & (UINT32_C(1) << i)))
+            continue;
+        existing_end = camera_remote_token[i] + camera_capacity[i];
+        request_end = request.remote_token + request.capacity;
+        if (request.remote_token < existing_end &&
+            camera_remote_token[i] < request_end) {
+            ++camera_rejected;
+            return send_protocol_error(src, header,
+                                       K230_RPMSG_STATUS_INVALID_RANGE);
+        }
+    }
+    camera_remote_token[request.buffer_id] = request.remote_token;
+    camera_capacity[request.buffer_id] = request.capacity;
+    camera_local_address[request.buffer_id] = local_address;
     camera_registered_mask |= bit;
     reply = request;
     protocol_reply_header(&reply.header, header,
@@ -367,7 +412,12 @@ static int32_t enqueue_camera_request(
         return send_protocol_error(src, header,
                                    K230_RPMSG_STATUS_SLOT_BUSY);
     }
-    if (camera_queue_depth >= K230_CAMERA_BUFFER_COUNT) {
+    if (request.padded_length > camera_capacity[request.buffer_id]) {
+        ++camera_rejected;
+        return send_protocol_error(src, header,
+                                   K230_RPMSG_STATUS_INVALID_RANGE);
+    }
+    if (camera_queue_depth >= AMP_RPMSG_CAMERA_BUFFER_MAX) {
         ++camera_rejected;
         return send_protocol_error(src, header,
                                    K230_RPMSG_STATUS_QUEUE_FULL);
@@ -378,7 +428,7 @@ static int32_t enqueue_camera_request(
     job->request = request;
     job->src = src;
     camera_queue_tail =
-        (camera_queue_tail + 1U) % K230_CAMERA_BUFFER_COUNT;
+        (camera_queue_tail + 1U) % AMP_RPMSG_CAMERA_BUFFER_MAX;
     ++camera_queue_depth;
     if (camera_queue_depth > camera_queue_high_water)
         camera_queue_high_water = camera_queue_depth;
@@ -414,7 +464,7 @@ static void process_slot_queue(void)
         job->response.invalidate_cycles = read_cycle() - started;
         started = read_cycle();
         job->response.observed_crc =
-            amp_crc32(payload, job->request.data_length);
+            rpmsg_crc32(payload, job->request.data_length);
         job->response.crc_cycles = read_cycle() - started;
         status = job->response.observed_crc == job->request.expected_crc ?
             K230_RPMSG_STATUS_OK : K230_RPMSG_STATUS_CRC_MISMATCH;
@@ -441,9 +491,8 @@ static void process_camera_queue(void)
         return;
     job = &camera_queue[camera_queue_head];
     if (!job->processed) {
-        payload = (const uint8_t *)(uintptr_t)
-            (K230_CAMERA_POOL_BASE +
-             (uint64_t)job->request.buffer_id * K230_CAMERA_BUFFER_SIZE);
+        payload = (const uint8_t *)
+            camera_local_address[job->request.buffer_id];
         protocol_reply_header(&job->response.header, &job->request.header,
                               K230_RPMSG_MSG_CAMERA_COMPLETE,
                               K230_RPMSG_STATUS_OK,
@@ -453,12 +502,12 @@ static void process_camera_queue(void)
         job->response.data_length = job->request.data_length;
 
         started = read_cycle();
-        cache_invalidate_range(payload, job->request.padded_length);
-        amp_acquire_fence();
+        rpmsg_platform_acquire_buffer(payload,
+                                      job->request.padded_length);
         job->response.invalidate_cycles = read_cycle() - started;
         started = read_cycle();
         job->response.observed_crc =
-            amp_crc32(payload, job->request.data_length);
+            rpmsg_crc32(payload, job->request.data_length);
         job->response.crc_cycles = read_cycle() - started;
         job->processed = 1;
     }
@@ -467,7 +516,7 @@ static void process_camera_queue(void)
         return;
     camera_busy_mask &= ~(UINT32_C(1) << job->request.buffer_id);
     camera_queue_head =
-        (camera_queue_head + 1U) % K230_CAMERA_BUFFER_COUNT;
+        (camera_queue_head + 1U) % AMP_RPMSG_CAMERA_BUFFER_MAX;
     --camera_queue_depth;
     ++camera_completed;
 }

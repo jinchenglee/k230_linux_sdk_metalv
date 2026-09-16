@@ -61,6 +61,7 @@ set(CAPABILITIES_SOURCES ${SOURCES})
 list(REMOVE_ITEM CAPABILITIES_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/src/lib.c")
 add_library(vvcam-capabilities SHARED ${CAPABILITIES_SOURCES})
 target_include_directories(vvcam-capabilities PUBLIC include)
+target_link_libraries(vvcam-capabilities PRIVATE m)
 
 add_subdirectory(v4l2-drm)
 

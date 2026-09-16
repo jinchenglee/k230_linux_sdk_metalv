@@ -13,12 +13,15 @@
 #include <time.h>
 #include <unistd.h>
 
-#include <k230_amp_camera_pool.h>
+#include <amp_shared_buffer_pool.h>
+#include <mmz.h>
+#include <v4l2-drm.h>
 
 #include "rpmsg_protocol.h"
 
 #define RPMSG_MAX_PAYLOAD 496U
 #define BIG_CORE_HZ 1600000000.0
+#define CAMERA_BUFFER_COUNT 6U
 
 enum buffer_state {
     BUFFER_EXPORTED,
@@ -29,7 +32,7 @@ enum buffer_state {
 
 struct capture_buffer {
     int fd;
-    uint64_t physical;
+    uint64_t remote_token;
     uint64_t capacity;
     uint8_t *mapping;
     enum buffer_state state;
@@ -193,7 +196,7 @@ static int register_buffer(int rpmsg_fd, uint64_t generation,
     request_header(&request.header, K230_RPMSG_MSG_CAMERA_REGISTER,
                    generation, sequence, 0, sizeof(request));
     request.buffer_id = id;
-    request.physical = buffer->physical;
+    request.remote_token = buffer->remote_token;
     request.capacity = buffer->capacity;
     if (send_request(rpmsg_fd, &request, sizeof(request)) ||
         receive_reply(rpmsg_fd, data, &length, timeout_ms) ||
@@ -209,7 +212,8 @@ static int register_buffer(int rpmsg_fd, uint64_t generation,
         return -1;
     }
     memcpy(&reply, data, sizeof(reply));
-    if (reply.buffer_id != id || reply.physical != buffer->physical ||
+    if (reply.buffer_id != id ||
+        reply.remote_token != buffer->remote_token ||
         reply.capacity != buffer->capacity) {
         fprintf(stderr, "buffer[%u] registration reply mismatch\n", id);
         return -1;
@@ -320,16 +324,17 @@ static void usage(const char *name)
     fprintf(stderr,
             "usage: %s [--seconds N] [--timeout-ms N] "
             "[--video-device N] [--pool PATH] [--rpmsg PATH] "
+            "[--allocation-capacity N] "
             "[--no-verify-crc]\n",
             name);
 }
 
 int main(int argc, char **argv)
 {
-    const char *pool_path = "/dev/k230-amp-camera-pool";
+    const char *pool_path = "/dev/amp-shared-buffer-pool";
     const char *rpmsg_path = "/dev/rpmsg0";
-    struct k230_amp_camera_pool_info pool_info = { 0 };
-    struct capture_buffer buffers[K230_AMP_CAMERA_BUFFER_COUNT];
+    struct amp_shared_buffer_pool_info pool_info = { 0 };
+    struct capture_buffer buffers[CAMERA_BUFFER_COUNT];
     struct v4l2_requestbuffers request = { 0 };
     struct v4l2_format format = { 0 };
     struct timespec started, deadline, now;
@@ -337,9 +342,11 @@ int main(int argc, char **argv)
     uint64_t sequence = 1;
     unsigned seconds = 10;
     unsigned timeout_ms = 5000;
-    unsigned video_device = 2;
+    unsigned video_device = UINT32_MAX;
+    unsigned sensor_device;
     unsigned exported = 0;
     unsigned captured = 0;
+    unsigned allocation_capacity = 0;
     unsigned submitted = 0;
     unsigned completed = 0;
     unsigned superseded = 0;
@@ -365,7 +372,7 @@ int main(int argc, char **argv)
     char video_path[64];
 
     memset(buffers, 0, sizeof(buffers));
-    for (i = 0; i < K230_AMP_CAMERA_BUFFER_COUNT; ++i) {
+    for (i = 0; i < CAMERA_BUFFER_COUNT; ++i) {
         buffers[i].fd = -1;
         buffers[i].mapping = MAP_FAILED;
     }
@@ -380,10 +387,13 @@ int main(int argc, char **argv)
             *target = argv[i];
         } else if (!strcmp(argv[i], "--seconds") ||
                    !strcmp(argv[i], "--timeout-ms") ||
-                   !strcmp(argv[i], "--video-device")) {
+                   !strcmp(argv[i], "--video-device") ||
+                   !strcmp(argv[i], "--allocation-capacity")) {
             unsigned *target = !strcmp(argv[i], "--seconds") ? &seconds :
                                !strcmp(argv[i], "--timeout-ms") ?
-                               &timeout_ms : &video_device;
+                               &timeout_ms :
+                               !strcmp(argv[i], "--video-device") ?
+                               &video_device : &allocation_capacity;
             if (++i >= (unsigned)argc || parse_unsigned(argv[i], target) ||
                 (target != &video_device && !*target)) {
                 usage(argv[0]);
@@ -397,6 +407,31 @@ int main(int argc, char **argv)
         }
     }
 
+    sensor_device = (unsigned)kd_mpi_get_vvcam_video00();
+    if (video_device == UINT32_MAX)
+        video_device = sensor_device + 1U;
+
+    {
+        uint16_t sensor_width = 0;
+        uint16_t sensor_height = 0;
+        uint32_t sensor_fps = 0;
+        int sensor_mode_result = v4l2_drm_request_sensor_mode(
+            sensor_device,
+            1280, 720, 60,
+            1920, 1080, 30,
+            &sensor_width, &sensor_height, &sensor_fps);
+
+        if (sensor_mode_result < 0) {
+            fprintf(stderr,
+                    "camera supports neither 1280x720@60 nor "
+                    "1920x1080@30\n");
+            return 1;
+        }
+        printf("sensor=/dev/video%u selected=%ux%u@%u%s\n",
+               sensor_device, sensor_width, sensor_height, sensor_fps,
+               sensor_mode_result == 0 ? " (preferred)" : " (fallback)");
+    }
+
     rpmsg_fd = open(rpmsg_path, O_RDWR | O_CLOEXEC);
     if (rpmsg_fd < 0) {
         fprintf(stderr, "%s: %s\n", rpmsg_path, strerror(errno));
@@ -408,16 +443,15 @@ int main(int argc, char **argv)
     }
     pool_fd = open(pool_path, O_RDONLY | O_CLOEXEC);
     if (pool_fd < 0 ||
-        ioctl(pool_fd, K230_AMP_CAMERA_IOC_GET_INFO, &pool_info) < 0) {
+        ioctl(pool_fd, AMP_SHARED_BUFFER_IOC_GET_INFO, &pool_info) < 0) {
         fprintf(stderr, "%s: %s\n", pool_path, strerror(errno));
         failed = 1;
         goto out;
     }
-    if (pool_info.version != K230_AMP_CAMERA_POOL_ABI_VERSION ||
-        pool_info.buffer_count != K230_AMP_CAMERA_BUFFER_COUNT ||
-        pool_info.physical_base != K230_CAMERA_POOL_BASE ||
-        pool_info.buffer_size != K230_CAMERA_BUFFER_SIZE) {
-        fprintf(stderr, "camera pool does not match firmware ABI\n");
+    if (pool_info.version != AMP_SHARED_BUFFER_POOL_ABI_VERSION ||
+        !(pool_info.capabilities & AMP_SHARED_BUFFER_CAP_CONTIGUOUS) ||
+        !(pool_info.capabilities & AMP_SHARED_BUFFER_CAP_REMOTE_LINEAR)) {
+        fprintf(stderr, "shared buffer pool lacks required capabilities\n");
         failed = 1;
         goto out;
     }
@@ -449,40 +483,52 @@ int main(int argc, char **argv)
         goto out;
     }
     data_length = stride * height;
-    if (format.fmt.pix.sizeimage > pool_info.buffer_size ||
-        padded_length(data_length) > pool_info.buffer_size) {
-        fprintf(stderr, "camera image does not fit fixed buffer\n");
+    if (!allocation_capacity)
+        allocation_capacity = format.fmt.pix.sizeimage;
+    if (allocation_capacity < format.fmt.pix.sizeimage ||
+        (uint64_t)allocation_capacity * CAMERA_BUFFER_COUNT >
+        pool_info.pool_size) {
+        fprintf(stderr, "allocation capacity does not fit image/pool\n");
+        failed = 1;
+        goto out;
+    }
+    if (format.fmt.pix.sizeimage > pool_info.pool_size ||
+        padded_length(data_length) > pool_info.pool_size) {
+        fprintf(stderr, "camera image does not fit shared pool\n");
         failed = 1;
         goto out;
     }
     request.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     request.memory = V4L2_MEMORY_DMABUF;
-    request.count = K230_AMP_CAMERA_BUFFER_COUNT;
+    request.count = CAMERA_BUFFER_COUNT;
     if (ioctl(video_fd, VIDIOC_REQBUFS, &request) < 0 ||
-        request.count < K230_AMP_CAMERA_BUFFER_COUNT) {
+        request.count < CAMERA_BUFFER_COUNT) {
         fprintf(stderr, "VIDIOC_REQBUFS(DMABUF) failed: %s\n",
                 strerror(errno));
         failed = 1;
         goto out;
     }
 
-    for (i = 0; i < K230_AMP_CAMERA_BUFFER_COUNT; ++i) {
-        struct k230_amp_camera_pool_buffer get = { .id = i };
+    for (i = 0; i < CAMERA_BUFFER_COUNT; ++i) {
+        struct amp_shared_buffer_alloc allocation = {
+            .capacity = allocation_capacity,
+            .alignment = pool_info.minimum_alignment,
+        };
 
-        if (ioctl(pool_fd, K230_AMP_CAMERA_IOC_GET_BUFFER, &get) < 0) {
-            fprintf(stderr, "GET_BUFFER[%u] failed: %s\n", i,
+        if (ioctl(pool_fd, AMP_SHARED_BUFFER_IOC_ALLOC, &allocation) < 0) {
+            fprintf(stderr, "ALLOC[%u] failed: %s\n", i,
                     strerror(errno));
             failed = 1;
             goto out;
         }
-        buffers[i].fd = get.fd;
-        buffers[i].physical = get.physical;
-        buffers[i].capacity = get.capacity;
+        buffers[i].fd = allocation.fd;
+        buffers[i].remote_token = allocation.remote_token;
+        buffers[i].capacity = allocation.capacity;
         buffers[i].state = BUFFER_EXPORTED;
         ++exported;
         if (verify_crc) {
-            buffers[i].mapping = mmap(NULL, get.capacity, PROT_READ,
-                                      MAP_SHARED, get.fd, 0);
+            buffers[i].mapping = mmap(NULL, allocation.capacity, PROT_READ,
+                                      MAP_SHARED, allocation.fd, 0);
             if (buffers[i].mapping == MAP_FAILED) {
                 fprintf(stderr, "mmap buffer[%u] failed: %s\n", i,
                         strerror(errno));
@@ -504,10 +550,10 @@ int main(int argc, char **argv)
     }
 
     printf("K230 RPMsg zero-copy camera integrity test\n");
-    printf("generation=%" PRIu64 " pool=0x%" PRIx64
-           " buffers=%u x %" PRIu64 "\n",
-           generation, pool_info.physical_base, pool_info.buffer_count,
-           pool_info.buffer_size);
+    printf("generation=%" PRIu64 " remote-base=0x%" PRIx64
+           " pool-size=%" PRIu64 " buffers=%u allocation=%" PRIu64 "\n",
+           generation, pool_info.remote_base, pool_info.pool_size,
+           CAMERA_BUFFER_COUNT, buffers[0].capacity);
     printf("camera=%s NV12 %ux%u stride=%u sizeimage=%u Y-bytes=%u "
            "duration=%us diagnostic-crc=%s\n",
            video_path, width, height, stride, format.fmt.pix.sizeimage,
@@ -523,6 +569,21 @@ int main(int argc, char **argv)
         }
     }
     streaming = 1;
+    {
+        struct v4l2_streamparm parm = { 0 };
+
+        parm.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        if (ioctl(video_fd, VIDIOC_G_PARM, &parm) == 0 &&
+            parm.parm.capture.timeperframe.numerator != 0) {
+            const struct v4l2_fract *tpf =
+                &parm.parm.capture.timeperframe;
+            printf("capture interval=%u/%u s (%.2f fps)\n",
+                   tpf->numerator, tpf->denominator,
+                   (double)tpf->denominator / tpf->numerator);
+        } else {
+            printf("capture interval=unreported by V4L2 driver\n");
+        }
+    }
     clock_gettime(CLOCK_MONOTONIC, &started);
     deadline = started;
     deadline.tv_sec += seconds;
@@ -643,7 +704,7 @@ int main(int argc, char **argv)
                 failed = 1;
                 break;
             }
-            if (buffer.index >= K230_AMP_CAMERA_BUFFER_COUNT ||
+            if (buffer.index >= CAMERA_BUFFER_COUNT ||
                 buffers[buffer.index].state != BUFFER_VI_QUEUED) {
                 fprintf(stderr, "invalid dequeued buffer index/state %u/%u\n",
                         buffer.index, buffers[buffer.index].state);

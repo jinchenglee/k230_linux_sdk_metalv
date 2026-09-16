@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0
+#include <linux/bitmap.h>
 #include <linux/dma-buf.h>
 #include <linux/dma-mapping.h>
 #include <linux/file.h>
@@ -7,41 +8,70 @@
 #include <linux/mm.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
+#include <linux/of.h>
+#include <linux/of_reserved_mem.h>
 #include <linux/scatterlist.h>
 #include <linux/slab.h>
 #include <linux/uaccess.h>
 
-#include "k230_amp_camera_pool.h"
+#include "amp_shared_buffer_pool.h"
 
-struct k230_amp_camera_pool;
+#define K230_LEGACY_POOL_BASE   0x1da00000ULL
+#define K230_LEGACY_POOL_SIZE   0x00c00000ULL
+#define K230_LEGACY_REMOTE_BASE K230_LEGACY_POOL_BASE
 
-struct k230_amp_camera_buffer {
-	struct k230_amp_camera_pool *pool;
-	struct dma_buf *dmabuf;
+struct amp_shared_buffer_pool;
+
+struct amp_shared_buffer {
+	struct amp_shared_buffer_pool *pool;
 	phys_addr_t physical;
+	u64 remote_token;
+	u64 allocation_id;
 	size_t capacity;
-	u32 id;
+	unsigned long first_page;
+	unsigned long page_count;
 };
 
-struct k230_amp_camera_attachment {
+struct amp_shared_buffer_attachment {
 	struct sg_table table;
 	bool mapped;
 	enum dma_data_direction direction;
 };
 
-struct k230_amp_camera_pool {
+struct amp_shared_buffer_pool {
 	struct miscdevice miscdev;
 	struct mutex lock;
-	unsigned long exported_mask;
+	unsigned long *allocation_map;
+	phys_addr_t physical_base;
+	u64 remote_base;
+	size_t pool_size;
+	size_t minimum_alignment;
+	unsigned long page_count;
+	u64 next_allocation_id;
 };
 
-static struct k230_amp_camera_pool camera_pool;
+static struct amp_shared_buffer_pool shared_pool;
 
-static int k230_amp_camera_attach(struct dma_buf *dmabuf,
-				  struct dma_buf_attachment *attachment)
+static unsigned long legacy_pool_base = K230_LEGACY_POOL_BASE;
+module_param(legacy_pool_base, ulong, 0444);
+MODULE_PARM_DESC(legacy_pool_base,
+	"temporary fallback physical base when no Device Tree provider exists");
+
+static unsigned long legacy_pool_size = K230_LEGACY_POOL_SIZE;
+module_param(legacy_pool_size, ulong, 0444);
+MODULE_PARM_DESC(legacy_pool_size,
+	"temporary fallback pool size when no Device Tree provider exists");
+
+static unsigned long legacy_remote_base = K230_LEGACY_REMOTE_BASE;
+module_param(legacy_remote_base, ulong, 0444);
+MODULE_PARM_DESC(legacy_remote_base,
+	"temporary fallback remote-visible base when no Device Tree provider exists");
+
+static int amp_shared_buffer_attach(struct dma_buf *dmabuf,
+				    struct dma_buf_attachment *attachment)
 {
-	struct k230_amp_camera_buffer *buffer = dmabuf->priv;
-	struct k230_amp_camera_attachment *state;
+	struct amp_shared_buffer *buffer = dmabuf->priv;
+	struct amp_shared_buffer_attachment *state;
 	int ret;
 
 	state = kzalloc(sizeof(*state), GFP_KERNEL);
@@ -58,10 +88,10 @@ static int k230_amp_camera_attach(struct dma_buf *dmabuf,
 	return 0;
 }
 
-static void k230_amp_camera_detach(struct dma_buf *dmabuf,
-				   struct dma_buf_attachment *attachment)
+static void amp_shared_buffer_detach(struct dma_buf *dmabuf,
+				     struct dma_buf_attachment *attachment)
 {
-	struct k230_amp_camera_attachment *state = attachment->priv;
+	struct amp_shared_buffer_attachment *state = attachment->priv;
 
 	if (state->mapped)
 		dma_unmap_sgtable(attachment->dev, &state->table,
@@ -71,10 +101,10 @@ static void k230_amp_camera_detach(struct dma_buf *dmabuf,
 }
 
 static struct sg_table *
-k230_amp_camera_map(struct dma_buf_attachment *attachment,
-		    enum dma_data_direction direction)
+amp_shared_buffer_map(struct dma_buf_attachment *attachment,
+		      enum dma_data_direction direction)
 {
-	struct k230_amp_camera_attachment *state = attachment->priv;
+	struct amp_shared_buffer_attachment *state = attachment->priv;
 	int ret;
 
 	if (state->mapped) {
@@ -82,8 +112,8 @@ k230_amp_camera_map(struct dma_buf_attachment *attachment,
 			return ERR_PTR(-EBUSY);
 		return &state->table;
 	}
-	/* The carveout has no cached Linux mapping. Avoid phys_to_virt cache
-	 * maintenance on its no-map pages; VI is the sole writer while queued. */
+	/* This backend exports no-map reserved memory with no cached Linux
+	 * mapping. Other cache policies belong in separate provider backends. */
 	ret = dma_map_sgtable(attachment->dev, &state->table, direction,
 			      DMA_ATTR_SKIP_CPU_SYNC);
 	if (ret)
@@ -99,11 +129,11 @@ k230_amp_camera_map(struct dma_buf_attachment *attachment,
 	return &state->table;
 }
 
-static void k230_amp_camera_unmap(struct dma_buf_attachment *attachment,
-				  struct sg_table *table,
-				  enum dma_data_direction direction)
+static void amp_shared_buffer_unmap(struct dma_buf_attachment *attachment,
+				    struct sg_table *table,
+				    enum dma_data_direction direction)
 {
-	struct k230_amp_camera_attachment *state = attachment->priv;
+	struct amp_shared_buffer_attachment *state = attachment->priv;
 
 	if (!state->mapped)
 		return;
@@ -112,29 +142,24 @@ static void k230_amp_camera_unmap(struct dma_buf_attachment *attachment,
 	state->mapped = false;
 }
 
-static int k230_amp_camera_begin_cpu_access(struct dma_buf *dmabuf,
-					    enum dma_data_direction direction)
+static int amp_shared_buffer_begin_cpu_access(
+	struct dma_buf *dmabuf, enum dma_data_direction direction)
 {
-	/* DQBUF/device completion is the ownership token. Order every following
-	 * CPU/control-plane operation after the device's completed DMA writes.
-	 * Cache maintenance is intentionally absent: the pool has no cached
-	 * Linux mapping and the remote invalidates its own cache before reading. */
 	dma_rmb();
 	return 0;
 }
 
-static int k230_amp_camera_end_cpu_access(struct dma_buf *dmabuf,
-					  enum dma_data_direction direction)
+static int amp_shared_buffer_end_cpu_access(
+	struct dma_buf *dmabuf, enum dma_data_direction direction)
 {
-	/* Order ownership publication before a subsequent device submission. */
 	dma_wmb();
 	return 0;
 }
 
-static int k230_amp_camera_mmap(struct dma_buf *dmabuf,
-				struct vm_area_struct *vma)
+static int amp_shared_buffer_mmap(struct dma_buf *dmabuf,
+				  struct vm_area_struct *vma)
 {
-	struct k230_amp_camera_buffer *buffer = dmabuf->priv;
+	struct amp_shared_buffer *buffer = dmabuf->priv;
 	unsigned long offset = vma->vm_pgoff << PAGE_SHIFT;
 	unsigned long length = vma->vm_end - vma->vm_start;
 	phys_addr_t physical;
@@ -148,158 +173,268 @@ static int k230_amp_camera_mmap(struct dma_buf *dmabuf,
 			       vma->vm_page_prot);
 }
 
-static void k230_amp_camera_release(struct dma_buf *dmabuf)
+static void amp_shared_buffer_release(struct dma_buf *dmabuf)
 {
-	struct k230_amp_camera_buffer *buffer = dmabuf->priv;
+	struct amp_shared_buffer *buffer = dmabuf->priv;
+	struct amp_shared_buffer_pool *pool = buffer->pool;
 
-	mutex_lock(&buffer->pool->lock);
-	clear_bit(buffer->id, &buffer->pool->exported_mask);
-	mutex_unlock(&buffer->pool->lock);
+	mutex_lock(&pool->lock);
+	bitmap_clear(pool->allocation_map, buffer->first_page,
+		     buffer->page_count);
+	mutex_unlock(&pool->lock);
 	kfree(buffer);
 }
 
-static const struct dma_buf_ops k230_amp_camera_dmabuf_ops = {
-	.attach = k230_amp_camera_attach,
-	.detach = k230_amp_camera_detach,
-	.map_dma_buf = k230_amp_camera_map,
-	.unmap_dma_buf = k230_amp_camera_unmap,
-	.begin_cpu_access = k230_amp_camera_begin_cpu_access,
-	.end_cpu_access = k230_amp_camera_end_cpu_access,
-	.mmap = k230_amp_camera_mmap,
-	.release = k230_amp_camera_release,
+static const struct dma_buf_ops amp_shared_buffer_ops = {
+	.attach = amp_shared_buffer_attach,
+	.detach = amp_shared_buffer_detach,
+	.map_dma_buf = amp_shared_buffer_map,
+	.unmap_dma_buf = amp_shared_buffer_unmap,
+	.begin_cpu_access = amp_shared_buffer_begin_cpu_access,
+	.end_cpu_access = amp_shared_buffer_end_cpu_access,
+	.mmap = amp_shared_buffer_mmap,
+	.release = amp_shared_buffer_release,
 };
 
-static long k230_amp_camera_ioctl(struct file *file, unsigned int command,
-				  unsigned long argument)
+static int amp_shared_buffer_allocate(
+	struct amp_shared_buffer_pool *pool,
+	struct amp_shared_buffer_alloc *request, struct dma_buf **result)
 {
+	struct amp_shared_buffer *buffer;
+	DEFINE_DMA_BUF_EXPORT_INFO(export_info);
+	struct dma_buf *dmabuf;
+	unsigned long capacity;
+	unsigned long alignment;
+	unsigned long needed_pages;
+	unsigned long alignment_pages;
+	unsigned long first_page;
+	int fd;
+
+	if (request->flags || !request->capacity)
+		return -EINVAL;
+	if (request->capacity > pool->pool_size)
+		return -E2BIG;
+	alignment = request->alignment ? request->alignment :
+		    pool->minimum_alignment;
+	if (alignment < pool->minimum_alignment ||
+	    !is_power_of_2(alignment) || !IS_ALIGNED(alignment, PAGE_SIZE))
+		return -EINVAL;
+	capacity = PAGE_ALIGN(request->capacity);
+	needed_pages = capacity >> PAGE_SHIFT;
+	alignment_pages = alignment >> PAGE_SHIFT;
+
+	buffer = kzalloc(sizeof(*buffer), GFP_KERNEL);
+	if (!buffer)
+		return -ENOMEM;
+	mutex_lock(&pool->lock);
+	first_page = bitmap_find_next_zero_area_off(
+		pool->allocation_map, pool->page_count, 0, needed_pages,
+		alignment_pages - 1UL,
+		(unsigned long)(pool->physical_base >> PAGE_SHIFT));
+	if (first_page >= pool->page_count) {
+		mutex_unlock(&pool->lock);
+		kfree(buffer);
+		return -ENOSPC;
+	}
+	bitmap_set(pool->allocation_map, first_page, needed_pages);
+	buffer->allocation_id = ++pool->next_allocation_id;
+	if (!buffer->allocation_id)
+		buffer->allocation_id = ++pool->next_allocation_id;
+	mutex_unlock(&pool->lock);
+
+	buffer->pool = pool;
+	buffer->first_page = first_page;
+	buffer->page_count = needed_pages;
+	buffer->capacity = capacity;
+	buffer->physical = pool->physical_base +
+			   ((phys_addr_t)first_page << PAGE_SHIFT);
+	buffer->remote_token = pool->remote_base +
+			       ((u64)first_page << PAGE_SHIFT);
+	export_info.exp_name = "amp-shared-buffer-pool";
+	export_info.owner = THIS_MODULE;
+	export_info.ops = &amp_shared_buffer_ops;
+	export_info.size = buffer->capacity;
+	export_info.flags = O_RDWR;
+	export_info.priv = buffer;
+	dmabuf = dma_buf_export(&export_info);
+	if (IS_ERR(dmabuf)) {
+		int ret = PTR_ERR(dmabuf);
+
+		mutex_lock(&pool->lock);
+		bitmap_clear(pool->allocation_map, first_page, needed_pages);
+		mutex_unlock(&pool->lock);
+		kfree(buffer);
+		return ret;
+	}
+	fd = get_unused_fd_flags(O_CLOEXEC);
+	if (fd < 0) {
+		dma_buf_put(dmabuf);
+		return fd;
+	}
+	request->capacity = buffer->capacity;
+	request->alignment = alignment;
+	request->remote_token = buffer->remote_token;
+	request->allocation_id = buffer->allocation_id;
+	request->fd = fd;
+	request->flags = 0;
+	*result = dmabuf;
+	return 0;
+}
+
+static long amp_shared_buffer_ioctl(struct file *file, unsigned int command,
+				    unsigned long argument)
+{
+	struct amp_shared_buffer_pool *pool = &shared_pool;
 	void __user *user = (void __user *)argument;
 
-	if (command == K230_AMP_CAMERA_IOC_GET_INFO) {
-		const struct k230_amp_camera_pool_info info = {
-			.version = K230_AMP_CAMERA_POOL_ABI_VERSION,
-			.buffer_count = K230_AMP_CAMERA_BUFFER_COUNT,
-			.buffer_size = K230_AMP_CAMERA_BUFFER_SIZE,
-			.physical_base = K230_AMP_CAMERA_POOL_BASE,
-			.pool_size = K230_AMP_CAMERA_POOL_SIZE,
+	if (command == AMP_SHARED_BUFFER_IOC_GET_INFO) {
+		const struct amp_shared_buffer_pool_info info = {
+			.version = AMP_SHARED_BUFFER_POOL_ABI_VERSION,
+			.capabilities = AMP_SHARED_BUFFER_CAP_CONTIGUOUS |
+				AMP_SHARED_BUFFER_CAP_REMOTE_LINEAR |
+				AMP_SHARED_BUFFER_CAP_CPU_MMAP_WC |
+				AMP_SHARED_BUFFER_CAP_NO_CPU_SYNC,
+			.pool_size = pool->pool_size,
+			.minimum_alignment = pool->minimum_alignment,
+			.remote_base = pool->remote_base,
 		};
 
 		return copy_to_user(user, &info, sizeof(info)) ? -EFAULT : 0;
 	}
-	if (command == K230_AMP_CAMERA_IOC_GET_BUFFER) {
-		struct k230_amp_camera_pool_buffer request;
-		struct k230_amp_camera_buffer *buffer;
-		DEFINE_DMA_BUF_EXPORT_INFO(export_info);
+	if (command == AMP_SHARED_BUFFER_IOC_ALLOC) {
+		struct amp_shared_buffer_alloc request;
 		struct dma_buf *dmabuf;
-		int fd;
+		int ret;
 
 		if (copy_from_user(&request, user, sizeof(request)))
 			return -EFAULT;
-		if (request.id >= K230_AMP_CAMERA_BUFFER_COUNT || request.flags)
-			return -EINVAL;
-		mutex_lock(&camera_pool.lock);
-		if (test_bit(request.id, &camera_pool.exported_mask)) {
-			mutex_unlock(&camera_pool.lock);
-			return -EBUSY;
-		}
-		buffer = kzalloc(sizeof(*buffer), GFP_KERNEL);
-		if (!buffer) {
-			mutex_unlock(&camera_pool.lock);
-			return -ENOMEM;
-		}
-		buffer->pool = &camera_pool;
-		buffer->id = request.id;
-		buffer->physical = K230_AMP_CAMERA_POOL_BASE +
-				   request.id * K230_AMP_CAMERA_BUFFER_SIZE;
-		buffer->capacity = K230_AMP_CAMERA_BUFFER_SIZE;
-		export_info.exp_name = "k230-amp-camera-pool";
-		export_info.owner = THIS_MODULE;
-		export_info.ops = &k230_amp_camera_dmabuf_ops;
-		export_info.size = buffer->capacity;
-		export_info.flags = O_RDWR;
-		export_info.priv = buffer;
-		dmabuf = dma_buf_export(&export_info);
-		if (IS_ERR(dmabuf)) {
-			int ret = PTR_ERR(dmabuf);
-
-			kfree(buffer);
-			mutex_unlock(&camera_pool.lock);
+		ret = amp_shared_buffer_allocate(pool, &request, &dmabuf);
+		if (ret)
 			return ret;
-		}
-		set_bit(request.id, &camera_pool.exported_mask);
-		mutex_unlock(&camera_pool.lock);
-
-		fd = get_unused_fd_flags(O_CLOEXEC);
-		if (fd < 0)
-			goto put_dmabuf;
-		request.physical = buffer->physical;
-		request.capacity = buffer->capacity;
-		request.fd = fd;
-		request.reserved = 0;
 		if (copy_to_user(user, &request, sizeof(request))) {
-			put_unused_fd(fd);
-			fd = -EFAULT;
-			goto put_dmabuf;
+			put_unused_fd(request.fd);
+			dma_buf_put(dmabuf);
+			return -EFAULT;
 		}
-		fd_install(fd, dmabuf->file);
+		fd_install(request.fd, dmabuf->file);
 		return 0;
-
-put_dmabuf:
-		dma_buf_put(dmabuf);
-		return fd;
 	}
 	return -ENOTTY;
 }
 
-static const struct file_operations k230_amp_camera_fops = {
+static const struct file_operations amp_shared_buffer_fops = {
 	.owner = THIS_MODULE,
-	.unlocked_ioctl = k230_amp_camera_ioctl,
+	.unlocked_ioctl = amp_shared_buffer_ioctl,
 	.llseek = no_llseek,
 };
 
-static int __init k230_amp_camera_pool_init(void)
+static int amp_shared_buffer_configure(struct amp_shared_buffer_pool *pool)
 {
-	unsigned long first_pfn = PHYS_PFN(K230_AMP_CAMERA_POOL_BASE);
-	unsigned long page_count = K230_AMP_CAMERA_POOL_SIZE >> PAGE_SHIFT;
+	struct device_node *provider;
+	struct device_node *memory;
+	struct reserved_mem *reserved;
+	u64 remote_base;
+	u32 minimum_alignment;
+
+	provider = of_find_compatible_node(
+		NULL, NULL, "metalv,amp-shared-buffer-pool");
+	if (!provider) {
+		pool->physical_base = legacy_pool_base;
+		pool->pool_size = legacy_pool_size;
+		pool->remote_base = legacy_remote_base;
+		pool->minimum_alignment = PAGE_SIZE;
+		pr_warn("amp_shared_buffer_pool: using legacy module parameters; add the Device Tree provider\n");
+		return 0;
+	}
+	memory = of_parse_phandle(provider, "memory-region", 0);
+	if (!memory) {
+		of_node_put(provider);
+		return -EINVAL;
+	}
+	reserved = of_reserved_mem_lookup(memory);
+	of_node_put(memory);
+	if (!reserved) {
+		of_node_put(provider);
+		return -ENODEV;
+	}
+	if (of_property_read_u64(provider, "metalv,remote-base", &remote_base))
+		remote_base = reserved->base;
+	if (of_property_read_u32(provider, "metalv,minimum-alignment",
+				 &minimum_alignment))
+		minimum_alignment = PAGE_SIZE;
+	if (!of_property_read_bool(provider, "metalv,no-cpu-cache")) {
+		of_node_put(provider);
+		pr_err("amp_shared_buffer_pool: reserved backend requires metalv,no-cpu-cache\n");
+		return -EINVAL;
+	}
+	of_node_put(provider);
+	pool->physical_base = reserved->base;
+	pool->pool_size = reserved->size;
+	pool->remote_base = remote_base;
+	pool->minimum_alignment = minimum_alignment;
+	return 0;
+}
+
+static int __init amp_shared_buffer_pool_init(void)
+{
+	struct amp_shared_buffer_pool *pool = &shared_pool;
+	unsigned long first_pfn;
 	unsigned long page;
 	int ret;
 
-	if (!IS_ALIGNED(K230_AMP_CAMERA_POOL_BASE, PAGE_SIZE) ||
-	    !IS_ALIGNED(K230_AMP_CAMERA_BUFFER_SIZE, PAGE_SIZE))
+	ret = amp_shared_buffer_configure(pool);
+	if (ret)
+		return ret;
+	if (!pool->pool_size || !IS_ALIGNED(pool->physical_base, PAGE_SIZE) ||
+	    !IS_ALIGNED(pool->pool_size, PAGE_SIZE) ||
+	    pool->pool_size > SIZE_MAX - pool->physical_base ||
+	    pool->pool_size > U64_MAX - pool->remote_base ||
+	    pool->minimum_alignment < PAGE_SIZE ||
+	    !is_power_of_2(pool->minimum_alignment) ||
+	    !IS_ALIGNED(pool->minimum_alignment, PAGE_SIZE))
 		return -EINVAL;
-	for (page = 0; page < page_count; ++page) {
+	pool->page_count = pool->pool_size >> PAGE_SHIFT;
+	first_pfn = PHYS_PFN(pool->physical_base);
+	for (page = 0; page < pool->page_count; ++page) {
 		if (!pfn_valid(first_pfn + page)) {
-			pr_err("k230_amp_camera_pool: invalid reserved PFN 0x%lx\n",
+			pr_err("amp_shared_buffer_pool: invalid reserved PFN 0x%lx\n",
 			       first_pfn + page);
 			return -ENXIO;
 		}
 		if (!PageReserved(pfn_to_page(first_pfn + page))) {
-			pr_err("k230_amp_camera_pool: PFN 0x%lx is not reserved\n",
+			pr_err("amp_shared_buffer_pool: PFN 0x%lx is not reserved\n",
 			       first_pfn + page);
 			return -EBUSY;
 		}
 	}
-	mutex_init(&camera_pool.lock);
-	camera_pool.miscdev.minor = MISC_DYNAMIC_MINOR;
-	camera_pool.miscdev.name = "k230-amp-camera-pool";
-	camera_pool.miscdev.fops = &k230_amp_camera_fops;
-	camera_pool.miscdev.mode = 0600;
-	ret = misc_register(&camera_pool.miscdev);
-	if (ret)
+	pool->allocation_map = bitmap_zalloc(pool->page_count, GFP_KERNEL);
+	if (!pool->allocation_map)
+		return -ENOMEM;
+	mutex_init(&pool->lock);
+	pool->miscdev.minor = MISC_DYNAMIC_MINOR;
+	pool->miscdev.name = "amp-shared-buffer-pool";
+	pool->miscdev.fops = &amp_shared_buffer_fops;
+	pool->miscdev.mode = 0600;
+	ret = misc_register(&pool->miscdev);
+	if (ret) {
+		bitmap_free(pool->allocation_map);
 		return ret;
-	pr_info("k230_amp_camera_pool: %u x %llu-byte DMA-BUF slots at 0x%llx\n",
-		K230_AMP_CAMERA_BUFFER_COUNT, K230_AMP_CAMERA_BUFFER_SIZE,
-		K230_AMP_CAMERA_POOL_BASE);
+	}
+	pr_info("amp_shared_buffer_pool: %zu-byte pool at %pa, remote 0x%llx, alignment %zu\n",
+		pool->pool_size, &pool->physical_base, pool->remote_base,
+		pool->minimum_alignment);
 	return 0;
 }
 
-static void __exit k230_amp_camera_pool_exit(void)
+static void __exit amp_shared_buffer_pool_exit(void)
 {
-	misc_deregister(&camera_pool.miscdev);
+	misc_deregister(&shared_pool.miscdev);
+	bitmap_free(shared_pool.allocation_map);
 }
 
-module_init(k230_amp_camera_pool_init);
-module_exit(k230_amp_camera_pool_exit);
+module_init(amp_shared_buffer_pool_init);
+module_exit(amp_shared_buffer_pool_exit);
 
 MODULE_IMPORT_NS(DMA_BUF);
-MODULE_DESCRIPTION("K230 AMP fixed camera DMA-BUF pool");
+MODULE_DESCRIPTION("Reserved-memory AMP shared DMA-BUF pool");
 MODULE_LICENSE("GPL");

@@ -23,7 +23,7 @@ diff --git a/arch/riscv/boot/dts/canaan/k230.dtsi b/arch/riscv/boot/dts/canaan/k
 diff --git a/arch/riscv/boot/dts/canaan/k230-canmv.dts b/arch/riscv/boot/dts/canaan/k230-canmv.dts
 --- a/arch/riscv/boot/dts/canaan/k230-canmv.dts
 +++ b/arch/riscv/boot/dts/canaan/k230-canmv.dts
-@@ -24,6 +24,22 @@
+@@ -24,6 +24,40 @@
  		device_type = "memory";
  		reg = <0x0 0x0 0x0 0x20000000>;
  	};
@@ -39,9 +39,27 @@ diff --git a/arch/riscv/boot/dts/canaan/k230-canmv.dts b/arch/riscv/boot/dts/can
 +		};
 +
 +		amp_shared_memory: amp-shared-memory@1d000000 {
-+			reg = <0x0 0x1d000000 0x0 0x03000000>;
++			reg = <0x0 0x1d000000 0x0 0x00a00000>;
 +			no-map;
 +		};
++
++		amp_camera_memory: amp-camera-memory@1da00000 {
++			reg = <0x0 0x1da00000 0x0 0x00c00000>;
++			no-map;
++		};
++
++		amp_shared_memory_tail: amp-shared-memory@1e600000 {
++			reg = <0x0 0x1e600000 0x0 0x01a00000>;
++			no-map;
++		};
++	};
++
++	amp-shared-buffer-pool {
++		compatible = "metalv,amp-shared-buffer-pool";
++		memory-region = <&amp_camera_memory>;
++		metalv,remote-base = /bits/ 64 <0x1da00000>;
++		metalv,minimum-alignment = <0x1000>;
++		metalv,no-cpu-cache;
 +	};
  
  	sound {
