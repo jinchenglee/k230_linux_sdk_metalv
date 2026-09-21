@@ -402,6 +402,25 @@ configuration.
 
 ## Implementation phases and acceptance gates
 
+Current roadmap status (2026-09-21):
+
+| Phase | Status |
+|---|---|
+| 0: baseline | Complete |
+| 1: small-core Linux | Complete |
+| 1b: CanMV-K230 V3 | Complete |
+| 2: minimal big-core payload | Complete |
+| 3: shared memory/cache maintenance | Complete |
+| 4: RPMsg-Lite transport | Complete |
+| 5: shared slots and zero-copy camera | Complete; DT-backed 720p60 path validated |
+| 6: AprilTag offload | Next major phase; not started |
+| 7: small-core nncase/KPU | Functionally complete; soak/recovery testing open |
+| 8: TinyTag ROI offload | Not started |
+| 9: measurement-driven optimization | Not started |
+
+There are ten principal phases, numbered 0 through 9. Phase 1b is an
+additional board-support milestone rather than a separate principal phase.
+
 ### Phase 0: freeze the current baseline
 
 - Commit current TinyTag and scalar-nncase work on `dev`.
@@ -679,12 +698,26 @@ uncached shared-slot write and expected CRC while holding the VI buffer, so
 maximum VI hold was 71.894 ms. That high latency is accepted as a functionality
 baseline, not as the final camera architecture.
 
-The low-latency follow-up will test VI DMA directly into a rotating shared
-capture pool with latest-complete publication and explicit exclusion of the
-one buffer remotely owned by the big core. A cached staging copy is explicitly
-not being added to the baseline because it would introduce a second full-frame
-copy. Direct capture requires NV12-sized shared buffers and driver support for
-queuing the reserved memory, so it remains a distinct experiment.
+The low-latency follow-up is complete. VVCAM now imports six application-owned
+DMA-BUFs allocated at runtime from a 12 MiB AMP pool. VI writes directly into
+those buffers; Linux sends only generation-scoped IDs and opaque remote tokens
+over RPMsg; the big core invalidates and reads the Y plane in place. The
+ownership state machine permits one remote-owned frame and one newest pending
+frame while every other buffer remains queued to VI. No frame copy was added.
+
+The reflashed DT-backed image selected OV5647 1280x720 at 60 fps and completed
+565/565 remote CRC jobs in 10.024 seconds (56.37 fps), with zero supersessions,
+zero copies, and a 16.633 ms maximum remote hold. The diagnostic run verified
+50/50 Linux-versus-big-core CRCs with zero mismatches and zero copies. Boot
+logging confirmed that the pool came from its Device Tree provider rather than
+the temporary module-parameter fallback. The fallback was then removed; the
+no-fallback module hot-load completed 169/169 jobs in 3.026 seconds (55.85 fps)
+with zero supersessions and zero copies, making the provider mandatory. See
+`docs/amp_zero_copy_camera_architecture.md` and
+`docs/notes/k230_amp_zero_copy_camera.md`.
+
+Phase 5 is therefore closed. Phase 6 is the next major phase, but no Phase 6
+implementation is part of this closure change.
 
 ### Phase 6: AprilTag offload
 
@@ -816,25 +849,18 @@ the current scene.
 
 ## Immediate next actions
 
-The original list here (rebuild with the `vdev0buffer` carveout, verify
-descriptor addresses, repeat the echo test) is complete and has been folded into
-the Phase 4 status above.
+Phase 5, including the DT-backed zero-copy camera follow-up, is closed. Phase 6
+is the next major phase but has not started.
 
-Items 2, 3 and 4 of the previous list are done or decided (see the Phase 2, 3
-and 7 statuses). Phase 3 is now closed outright. What remains:
-
-1. Preserve the sealed **Phase 5 shared payload-slot/camera baseline**, then
-   prototype zero-copy VI DMA into a rotating shared capture pool. Publish the
-   latest complete frame, exclude the remotely owned buffer from VI reuse, and
-   measure capture-to-completion latency and drop behavior.
-2. **Phase 7 stress testing** remains independently open: repeated inference,
+1. Preserve the sealed Phase 5 copied-slot and zero-copy baselines as regression
+   tests while Phase 6 is designed.
+2. Phase 7 stress testing remains independently open: repeated inference,
    device re-initialization and recovery on the small core. The functional work
    is done; only the soak is missing.
-3. Keep RPMsg limited to control and descriptors. The 2026-09-06 measurements
-   make this quantitative rather than stylistic -- a 20 us notification round
-   trip against 1.86 MB/s for bulk copies through the shared window.
+3. Keep RPMsg limited to control and descriptors, and retain opaque remote
+   tokens and the ownership state machine as stable interfaces.
 
-Design rules established 2026-09-06, to be honoured by Phase 5's slot code:
+Design rules established by Phase 5 and required by later phases:
 
 - Slot offsets and padded lengths are multiples of `AMP_SHM_CACHE_LINE`; no
   cache line is shared by two differently owned regions. Asserted at compile

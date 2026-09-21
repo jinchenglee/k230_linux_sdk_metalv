@@ -3,8 +3,8 @@
 Status: the portable UAPI, allocator, remote-token protocol, and remote
 platform-operation layers are implemented and target-validated on K230. The
 K230 backend remains an executable reference, not the cross-platform ABI. The
-Device Tree provider nodes are built for the next image; the no-reflash target
-run used the provider's clearly labelled legacy module-parameter fallback.
+reflashed image has validated the Device Tree provider path, and the temporary
+module-parameter fallback has been removed.
 
 ## Proven invariant
 
@@ -118,10 +118,17 @@ measured delivery is the authoritative rate.
   because it is loaded with `dlopen()`; larger demo processes had previously
   hidden the missing dependency by loading `libm` indirectly.
 
-## Remaining K230 closure
+## K230 Device Tree closure (2026-09-21)
 
-Boot the next image containing the provider Device Tree nodes, confirm that
-the module does not announce its legacy fallback, and repeat the production
-and integrity runs. Then remove the temporary legacy module parameters. The
-firmware's fixed K230 address allowlist remains a platform-backend policy,
-while the application and wire protocol continue to use opaque remote tokens.
+The reflashed image initialized the 12 MiB pool from its Device Tree provider
+without a legacy-fallback warning. Its production run completed 565/565 frames
+in 10.024 seconds (56.37 fps), with zero supersessions, zero copies, and a
+16.633 ms maximum remote hold. The integrity run verified 50/50 CRCs with zero
+mismatches and zero copies.
+
+The temporary module parameters were then removed, making absence of the
+provider a hard module-load error. The rebuilt module exposed no parameter
+directory and completed a final 169/169-frame hot-load test in 3.026 seconds
+(55.85 fps), with zero supersessions and zero copies. The firmware's fixed K230
+address allowlist remains a platform-backend policy, while the application and
+wire protocol continue to use opaque remote tokens.

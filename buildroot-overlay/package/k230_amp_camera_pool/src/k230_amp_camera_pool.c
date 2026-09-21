@@ -16,10 +16,6 @@
 
 #include "amp_shared_buffer_pool.h"
 
-#define K230_LEGACY_POOL_BASE   0x1da00000ULL
-#define K230_LEGACY_POOL_SIZE   0x00c00000ULL
-#define K230_LEGACY_REMOTE_BASE K230_LEGACY_POOL_BASE
-
 struct amp_shared_buffer_pool;
 
 struct amp_shared_buffer {
@@ -51,21 +47,6 @@ struct amp_shared_buffer_pool {
 };
 
 static struct amp_shared_buffer_pool shared_pool;
-
-static unsigned long legacy_pool_base = K230_LEGACY_POOL_BASE;
-module_param(legacy_pool_base, ulong, 0444);
-MODULE_PARM_DESC(legacy_pool_base,
-	"temporary fallback physical base when no Device Tree provider exists");
-
-static unsigned long legacy_pool_size = K230_LEGACY_POOL_SIZE;
-module_param(legacy_pool_size, ulong, 0444);
-MODULE_PARM_DESC(legacy_pool_size,
-	"temporary fallback pool size when no Device Tree provider exists");
-
-static unsigned long legacy_remote_base = K230_LEGACY_REMOTE_BASE;
-module_param(legacy_remote_base, ulong, 0444);
-MODULE_PARM_DESC(legacy_remote_base,
-	"temporary fallback remote-visible base when no Device Tree provider exists");
 
 static int amp_shared_buffer_attach(struct dma_buf *dmabuf,
 				    struct dma_buf_attachment *attachment)
@@ -339,12 +320,8 @@ static int amp_shared_buffer_configure(struct amp_shared_buffer_pool *pool)
 	provider = of_find_compatible_node(
 		NULL, NULL, "metalv,amp-shared-buffer-pool");
 	if (!provider) {
-		pool->physical_base = legacy_pool_base;
-		pool->pool_size = legacy_pool_size;
-		pool->remote_base = legacy_remote_base;
-		pool->minimum_alignment = PAGE_SIZE;
-		pr_warn("amp_shared_buffer_pool: using legacy module parameters; add the Device Tree provider\n");
-		return 0;
+		pr_err("amp_shared_buffer_pool: Device Tree provider is required\n");
+		return -ENODEV;
 	}
 	memory = of_parse_phandle(provider, "memory-region", 0);
 	if (!memory) {

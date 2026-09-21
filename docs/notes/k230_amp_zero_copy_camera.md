@@ -1,7 +1,9 @@
 # K230 AMP zero-copy camera experiment
 
-Status: fixed-pool DMA-BUF exporter and direct V4L2 import validated on target;
-cross-core in-place CRC validation passed on target.
+Status: historical fixed-pool prototype. Its DMA-BUF import and cross-core
+in-place CRC gates passed on target. The production implementation now uses a
+runtime-allocated generic AMP pool, opaque remote tokens, and a mandatory
+Device Tree provider; see `docs/amp_zero_copy_camera_architecture.md`.
 
 ## Goal
 
@@ -196,12 +198,17 @@ remote-owned slot, so the latest-pending path never had to supersede a frame.
 The preceding diagnostic run supplies the integrity evidence; `verified=0` is
 expected here because this path deliberately performs no Linux frame read.
 
-## Portability follow-up
+## Portability follow-up (completed)
 
-After the K230 path works end to end, refactor the exporter into a generic
-reserved-memory AMP DMA-BUF pool. Device Tree or module parameters will supply
-the memory region, remote-visible base, cache policy, and minimum alignment;
-userspace will select buffer count, size, and alignment. The wire protocol
-will prefer pool ID plus offset over a raw K230 physical address. Platform
-documentation must separately state DMABUF-import, IOMMU/address-translation,
-DMA reachability, completion-ordering, and cache-maintenance requirements.
+The fixed exporter was refactored into a runtime allocator with a stable pool
+UAPI. Userspace selects buffer count, size, and alignment, while the wire
+protocol uses pool/buffer IDs and opaque remote tokens instead of exposing a
+K230 address as its generic contract. Remote address translation, bounds, and
+cache maintenance are platform operations.
+
+The K230 backend obtains its reserved memory and remote-visible base from a
+Device Tree provider. The reflashed image validated this path at 1280x720/60,
+and the temporary fixed-address module-parameter fallback was removed on
+2026-09-21. Platform-specific DMA-BUF import, IOMMU/address translation, DMA
+reachability, completion ordering, and cache maintenance remain documented
+separately in `docs/amp_zero_copy_camera_architecture.md`.
